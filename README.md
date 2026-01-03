@@ -1,18 +1,16 @@
 # ⏳ Recursive Time & Stability-First AI
 
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
-
 A collection of experiments exploring memory, catastrophic forgetting, and temporal modularity in neural networks.
 
-**Author**: Vitali Sialedchyk
+**Author:** Vitali Sialedchyk
 
 ---
 
 ## 🧠 Core Thesis
 
-Modern AI systems exist in "instantaneous time" — optimizing only for the current data batch. This project implements the **Stability-First** hypothesis:
+Modern AI systems exist in "instantaneous time" — optimizing only for the current data batch. This project implements the **Stability-First hypothesis**:
 
-> **Time in an AI system is defined by structural inertia.** By treating weight stability as "System Time", we can prevent catastrophic forgetting and achieve modular, reversible learning.
+> **Time in an AI system is defined by structural inertia. By treating weight stability as "System Time", we can prevent catastrophic forgetting and achieve modular, reversible learning.**
 
 ---
 
@@ -26,6 +24,29 @@ Modern AI systems exist in "instantaneous time" — optimizing only for the curr
 | **04** | Reversibility | Lazarus Effect | Memory is often latent, not erased. We recovered "forgotten" tasks from 0% to **94.65%** accuracy. | ✅ Complete |
 | **05** | Full Suite | Benchmarking | Comparative analysis of 5 strategies (Fractal Time, Adaptive Pain, Dream Replay). | ✅ Complete |
 | **06** | Subjective Time | Metacognition | **Novel**: A system with a "Critic" that automatically regulates its plasticity based on "surprise" (Surprise). | ✅ Complete |
+| **07** | Stability-First (CIFAR-10) | Lazarus Project | **Breakthrough**: Data-free model recovery (93.9% recovery after damage, 85.3% after 80% pruning). | 🏆 **New** |
+| **08** | Stability-First (ImageNet) | Large-Scale | Testing Stability-First on ImageNet/CIFAR-100 with ResNet backbone. | ✅ New |
+
+---
+
+## 🏆 The Lazarus Project (Project 07)
+
+**Revolutionary discovery:** Neural networks can recover from damage without training data using **"Architectural Immunity"**.
+
+### Key Findings:
+
+- **V-Shape Recovery:** Restored **93.9%** of accuracy lost to noise damage using only random noise inputs.
+- **Surgical Pruning:** Recovered **85.3%** of accuracy lost after removing 80% of weights (5× compression).
+- **Frozen Mask > Regrowth:** We proved that maintaining the "skeleton" (sparse topology) is more effective than trying to regrow connections with noise.
+- **Zero Data:** No original images were used. The model uses its own structure as a filter to reject chaos.
+
+**Full documentation & Graphs:** [07-stability-first-cifar10/docs/LAZARUS_FINAL_MANIFESTO.md](07-stability-first-cifar10/docs/LAZARUS_FINAL_MANIFESTO.md)
+
+![Recovery Curve](07-stability-first-cifar10/results/lazarus_recovery_curve.png)
+*V-shape recovery pattern for weight noise damage*
+
+![Pruning Curve](07-stability-first-cifar10/results/pruning_curve_comparison.png)
+*Pruning curve comparison: Frozen Mask vs Regrow*
 
 ---
 
@@ -52,19 +73,19 @@ Watch as the model automatically learns to route "To code or not to code" to the
 
 We proved that even when model accuracy on Task A drops to **0.00%** after training on Task B, knowledge remains encoded in the backbone.
 
-**Recovery**: **94.65%** accuracy recovered with just 50 examples.
+**Recovery:** **94.65%** accuracy recovered with just 50 examples.
 
 ### 2. Time Mixer Accuracy (GPT-2)
 
 In our Temporal LoRA experiment, the gating network successfully learned to distinguish semantic epochs.
 
-**Router accuracy**: **100.0%** after contrastive calibration.
+**Router accuracy:** **100.0%** after contrastive calibration.
 
-### 3. Subjective Time (The Critic)
+### 3. Pruning & Compression
 
-In experiment #6, we showed how a system can autonomously regulate its learning rate (λ) based on prediction error (Surprise). This mimics dopamine function in the brain.
+We demonstrated that Frozen Mask stability optimization allows for massive compression without retraining.
 
-**Result**: Lambda dynamically adapts from 1805 (high Surprise) to 2647 (low Surprise).
+**Result:** **+1.62%** accuracy gain on an 80% pruned model using the Lazarus Protocol.
 
 ---
 
@@ -75,160 +96,53 @@ D:\new\
 ├── README.md                          # This file
 ├── requirements.txt                   # Common dependencies
 │
-├── 01-active-sleep-mnist/             # Project 1: Active Sleep (MNIST)
-│   ├── active_sleep.py
-│   ├── README.md
-│   └── requirements.txt
+├── 07-stability-first-cifar10/        # 🏆 The Lazarus Project
+│   ├── experiments/
+│   │   ├── noise/
+│   │   │   ├── experiment_cifar10.py          # V-Shape Recovery
+│   │   │   ├── experiment_analysis.py        # Recovery Curve Analysis
+│   │   │   └── experiment_statistical_significance.py
+│   │   └── pruning/
+│   │       ├── experiment_pruning.py         # Pruning Recovery
+│   │       └── experiment_pruning_curve.py   # Pruning Curve
+│   ├── docs/
+│   │   ├── LAZARUS_FINAL_MANIFESTO.md        # Full Scientific Report
+│   │   ├── LAZARUS_MANIFESTO.md              # Complete Documentation
+│   │   └── RESULTS_VISUALIZATION.md          # Visualizations
+│   ├── results/
+│   │   ├── lazarus_recovery_curve.png        # Visual Proof
+│   │   └── pruning_curve_comparison.png       # Frozen vs Regrow Chart
+│   └── README.md
 │
-├── 02-temporal-lora-gpt2/            # Project 2: Temporal LoRA (GPT-2) 🌟
+├── 02-temporal-lora-gpt2/             # 🌟 Temporal LoRA (GPT-2)
 │   ├── temporal_lora.py
-│   ├── TEMPORAL_LORA_README.md
-│   ├── ACTIVE_SLEEP_FOR_MIXER.md
-│   ├── temporal_lora_mixer_weights.png
-│   ├── README.md
-│   └── requirements.txt
+│   └── README.md
 │
-├── 03-stability-first-basic/          # Project 3: Stability-First (Basic)
-│   ├── run_demo.py
-│   ├── src/
-│   ├── README.md
-│   └── requirements.txt
-│
-├── 04-stability-first-reversibility/  # Project 4: Stability-First (Reversibility)
-│   ├── run_demo.py
-│   ├── run_double_reversibility.py
-│   ├── src/
-│   ├── README.md
-│   └── requirements.txt
-│
-├── 05-recursive-time-full-suite/      # Project 5: Full Experiment Suite
-│   ├── run_split_suite.py
-│   ├── run_double_reversibility.py
-│   ├── src/
-│   ├── README.md
-│   └── requirements.txt
-│
-├── 06-subjective-time-critic/         # Project 6: Subjective Time (The Critic)
+├── 06-subjective-time-critic/         # Metacognition
 │   ├── demo_6_subjective_time.py
-│   ├── subjective_time.png
-│   ├── README.md
-│   └── requirements.txt
+│   └── README.md
 │
-├── docs/                               # Documentation
-│   ├── README.md                      # Full documentation
-│   ├── QUICK_START.md                  # Quick start
-│   └── INDEX.md                        # Navigation
-│
-└── logs/                               # Experiment logs
-    ├── 01-active-sleep-mnist.log
-    ├── 02-temporal-lora-gpt2.log
-    ├── 03-stability-first-basic.log
-    ├── 04-stability-first-reversibility.log
-    ├── 05-recursive-time-full-suite.log
-    ├── 06-subjective-time-critic.log
+└── docs/                              # Documentation
     └── RESULTS_SUMMARY.md             # Final report
 ```
-
----
-
-## 🚀 Running All Experiments
-
-### Project 1: Active Sleep (MNIST)
-```bash
-cd 01-active-sleep-mnist
-pip install -r requirements.txt
-python active_sleep.py
-```
-**Result**: Task A retention: **96.30%** ✅
-
-### Project 2: Temporal LoRA (GPT-2) 🌟 **HERO**
-```bash
-cd 02-temporal-lora-gpt2
-pip install -r requirements.txt
-python temporal_lora.py
-```
-**Result**: Router Accuracy: **100.0%** ✅
-
-### Project 3: Stability-First (Basic)
-```bash
-cd 03-stability-first-basic
-pip install -r requirements.txt
-python run_demo.py
-```
-**Result**: Task A retention: **93.52%** ✅
-
-### Project 4: Stability-First (Reversibility)
-```bash
-cd 04-stability-first-reversibility
-pip install -r requirements.txt
-python run_demo.py
-python run_double_reversibility.py
-```
-**Result**: Task A retention: **94.65%** ✅
-
-### Project 5: Recursive-Time (Full Suite)
-```bash
-cd 05-recursive-time-full-suite
-pip install -r requirements.txt
-python run_split_suite.py
-```
-**Result**: All methods show **94-95%** retention ✅
-
-### Project 6: Subjective Time (The Critic)
-```bash
-cd 06-subjective-time-critic
-pip install -r requirements.txt
-python demo_6_subjective_time.py
-```
-**Result**: Lambda adapts dynamically (1805 → 2647) ✅
-
----
-
-## 📈 Results Comparison Table
-
-| Project | Method | Retention/Accuracy | Status |
-|---------|--------|-------------------|--------|
-| 01-active-sleep-mnist | Generative Replay | **96.30%** | ✅ |
-| 02-temporal-lora-gpt2 | Time Mixer | Router: **100%** | ✅ **Success** |
-| 03-stability-first-basic | Stability-First | **93.52%** | ✅ |
-| 04-stability-first-reversibility | Stability-First | **94.65%** | ✅ |
-| 05-recursive-time-full-suite | Multiple Methods | **94-95%** | ✅ |
-| 06-subjective-time-critic | Adaptive Lambda | Lambda: 1805→2647 | ✅ |
-
----
-
-## 🎯 Key Takeaways
-
-1. ✅ **Fractal nature of forgetting**: Forgetting occurs at all levels (adapters, routers)
-2. ✅ **Stability-First is effective**: 93-95% retention vs 0% baseline
-3. ✅ **Time Mixer works**: 100% accuracy after calibration
-4. ✅ **Backbone features are critical**: Using hidden_states from GPT-2 solves the problem
-5. ✅ **Subjective time works**: Lambda dynamically adapts based on Surprise
 
 ---
 
 ## 🔧 Technical Details
 
 ### Windows Fixes
-- ✅ `num_workers=0`, `pin_memory=False` in DataLoader
-- ✅ Unicode symbols (Δ, λ) replaced with ASCII
-- ✅ All scripts have `if __name__ == "__main__"`
+
+✅ `num_workers=0`, `pin_memory=False` in DataLoader  
+✅ Unicode symbols (Δ, λ) replaced with ASCII  
+✅ All scripts have `if __name__ == "__main__"`
 
 ### Dependencies
-- torch
-- torchvision
-- numpy
-- transformers (for project 2)
-- matplotlib
 
----
-
-## 📚 Documentation
-
-- **[docs/README.md](docs/README.md)** - Full documentation of all projects
-- **[docs/QUICK_START.md](docs/QUICK_START.md)** - Quick start and overview
-- **[docs/INDEX.md](docs/INDEX.md)** - Project navigation
-- **[logs/RESULTS_SUMMARY.md](logs/RESULTS_SUMMARY.md)** - Final report of all experiments
+- `torch`
+- `torchvision`
+- `numpy`
+- `transformers` (for project 2)
+- `matplotlib`
 
 ---
 
@@ -253,25 +167,17 @@ If you find this research useful, please use the following citation:
 
 This project is licensed under the **Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)**.
 
-* ✅ **Free for:** Academic research, education, personal testing, and non-profit use.
-* ❌ **Not allowed:** Commercial products, paid services, or corporate R&D without a separate agreement.
+✅ **Free for:** Academic research, education, personal testing, and non-profit use.  
+❌ **Not allowed:** Commercial products, paid services, or corporate R&D without a separate agreement.
 
-**Want to use Stability-First AI in your product?**
+### Want to use Stability-First AI in your product?
+
 We offer commercial licensing options including support and architectural consulting.
+
 📩 **Contact:** vitali@agdgroup.pl or via GitHub Issues.
 
-See the [LICENSE](LICENSE) file for full terms and conditions.
+See the LICENSE file for full terms and conditions.
 
 ---
 
-## 🏆 Achievements
-
-1. ✅ Solved Time Mixer inversion problem (Router: 100% accuracy)
-2. ✅ Proved Stability-First effectiveness (92-95% retention vs 0% baseline)
-3. ✅ Demonstrated fractal nature of forgetting
-4. ✅ Scaled to LLM (GPT-2) with LoRA adapters
-5. ✅ Implemented subjective time with metacognitive regulator
-
----
-
-**Last updated**: 2026
+**Last updated:** January 2026
