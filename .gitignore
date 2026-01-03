@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Data files (MNIST datasets - too large for git)
+data/
+*/data/MNIST/
+*.idx3-ubyte
+*.idx1-ubyte
+*.gz
+
+# Logs
+*.log
+logs/*.log
+
+# Model outputs and checkpoints
+checkpoints/
+models/
+outputs/
+results/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Keep log summary but ignore individual logs
+!logs/RESULTS_SUMMARY.md
+
+# Keep requirements files
+!requirements.txt
+!*/requirements.txt
+

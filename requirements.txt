@@ -1,0 +1,8 @@
+# Common dependencies for all projects
+# For specific project dependencies, see requirements.txt in project directory
+
+torch
+torchvision
+numpy
+transformers
+matplotlib
