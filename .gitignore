@@ -59,6 +59,9 @@ checkpoints/
 models/
 outputs/
 results/
+# But allow visualization graphs for documentation
+!07-stability-first-cifar10/results/*.png
+!07-stability-first-cifar10/results/*.md
 
 # Temporary files
 *.tmp
@@ -75,4 +78,5 @@ Thumbs.db
 # Keep requirements files
 !requirements.txt
 !*/requirements.txt
+
 
