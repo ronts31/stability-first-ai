@@ -240,7 +240,7 @@ If you find this research useful, please use the following citation:
 @misc{stability_first_ai,
   author = {Vitali Sialedchyk},
   title = {Stability-First AI: Memory and Recursive Stability as System Time},
-  year = {2024},
+  year = {2026},
   publisher = {GitHub},
   journal = {GitHub repository},
   howpublished = {\url{https://github.com/vitali-sialedchyk/stability-first-ai}}
