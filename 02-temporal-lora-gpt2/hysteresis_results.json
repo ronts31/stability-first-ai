@@ -1,0 +1,28 @@
+{
+  "test_aba": {
+    "switch_lag_AB": 0,
+    "switch_lag_BA": 9,
+    "switching_asymmetry": 9,
+    "return_gap_cosine_distance": 9.614229384169448e-06,
+    "return_gap_euclidean": 0.004346350872947369,
+    "return_gap_dtw": 0.04346350872947369,
+    "segment_lengths": {
+      "A1": 10,
+      "B": 3,
+      "A2": 10
+    }
+  },
+  "test_amixba": {
+    "switch_lag_mixA": 16,
+    "return_gap_cosine_distance": 0.19091370701789856,
+    "return_gap_euclidean": 0.27302346968936037,
+    "return_gap_dtw": 2.730234693910461,
+    "avg_mix_entropy": 0.679324746131897,
+    "mix_balance": 0.7154374122619629,
+    "segment_lengths": {
+      "A1": 10,
+      "Mix": 1,
+      "A2": 10
+    }
+  }
+}

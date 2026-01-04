@@ -1025,6 +1025,19 @@ if __name__ == "__main__":
     phase3_time = time.time() - phase3_start
     print(f"[OK] PHASE 3 completed in {phase3_time:.1f} seconds", flush=True)
     
+    # Сохраняем веса модели для использования в тестах
+    print("\n>>> Сохранение весов модели...", flush=True)
+    try:
+        checkpoint = {
+            'adapters': {name: adapter.state_dict() for name, adapter in model.adapters.items()},
+            'time_mixer': model.time_mixer.state_dict() if model.time_mixer is not None else None,
+            'adapter_names': model.adapter_names
+        }
+        torch.save(checkpoint, 'temporal_lora_checkpoint.pt')
+        print(f"[OK] Веса сохранены: temporal_lora_checkpoint.pt", flush=True)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить веса: {e}", flush=True)
+    
     print("\n" + "="*80)
     print("TESTING: Generation with Time Mixer (after calibration)")
     print("="*80)
