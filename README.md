@@ -26,6 +26,7 @@ Modern AI systems exist in "instantaneous time" — optimizing only for the curr
 | **06** | Subjective Time | Metacognition | **Novel**: A system with a "Critic" that automatically regulates its plasticity based on "surprise" (Surprise). | ✅ Complete |
 | **07** | Stability-First (CIFAR-10) | Lazarus Project | **Breakthrough**: Data-free model recovery (93.9% recovery after damage, 85.3% after 80% pruning). | 🏆 **New** |
 | **08** | Stability-First (ImageNet) | Large-Scale | Testing Stability-First on ImageNet/CIFAR-100 with ResNet backbone. | ✅ New |
+| **10** | Recursive Time Depth | Subjective Time | **Novel**: Subjective "time" measured by depth of stable recursive transformations. p90/p99 percentile-based stopping, 5-7x speedup, CKA ~0.98 with growing amplitude. | ✅ Ready |
 
 ---
 
@@ -47,6 +48,22 @@ Modern AI systems exist in "instantaneous time" — optimizing only for the curr
 
 ![Pruning Curve](07-stability-first-cifar10/results/pruning_curve_comparison.png)
 *Pruning curve comparison: Frozen Mask vs Regrow*
+
+---
+
+## ⏳ Recursive Time Depth (Project 10)
+
+**Novel contribution:** Subjective "time" in neural networks measured by depth of stable recursive transformations.
+
+### Key Findings:
+
+- **p90/p99 Percentile-Based Stopping**: Convergence detected via internal activation stability (percentiles of relative change norm) rather than output entropy.
+- **Attractor-Entry Effect**: Recursion drives activations into a stable representational regime without additional training data.
+- **Time as Order Parameter**: Recursion depth required for stability provides an operational internal "time" measure; high CKA (~0.98) supports stabilization consistent with attractor-like dynamics.
+- **Efficiency**: 5-7x speedup over self-consistency at comparable compute budget.
+- **Condensation Without Degradation**: CKA ~0.98 with growing amplitude (||h_t||: 1322 → 12291) indicates stable representational regime (non-collapse stability).
+
+**Full documentation:** [10-recursive-time-depth/README.md](10-recursive-time-depth/README.md)
 
 ---
 
@@ -120,6 +137,12 @@ D:\new\
 │
 ├── 06-subjective-time-critic/         # Metacognition
 │   ├── demo_6_subjective_time.py
+│   └── README.md
+│
+├── 10-recursive-time-depth/           # ⏳ Recursive Time Depth
+│   ├── recursive_time_depth.py       # Main experiment
+│   ├── strict_validation_tests.py    # 5 validation tests
+│   ├── TEST_RESULTS_FINAL.md         # Final results
 │   └── README.md
 │
 └── docs/                              # Documentation
