@@ -1038,6 +1038,16 @@ if __name__ == "__main__":
         "class Model(nn.Module):"
     ]
     
+    # Test hybrid example: Python in Shakespearean style
+    hybrid_prompts = [
+        "# The Tragedy of Errors (A Play in One Act)",
+        "class Fate:",
+        "def __init__(self, star_crossed=True):",
+        "sound_and_fury = lambda tale: nothing",
+        "to = lambda be: be or not be",
+        "from this import s as serpent  # The serpent that did sting thy father"
+    ]
+    
     for prompt in test_prompts:
         print(f"\n{'-'*60}")
         print(f"Prompt: '{prompt}'")
@@ -1057,6 +1067,66 @@ if __name__ == "__main__":
                 percentage = prompt_weights[i].item() * 100
                 bar = "#" * int(percentage / 2)
                 print(f"  {name:12s}: {prompt_weights[i]:.3f} ({percentage:5.1f}%) {bar}")
+    
+    # Test hybrid example: Python in Shakespearean style
+    print("\n" + "="*80)
+    print("HYBRID TEST: Python in Shakespearean Style")
+    print("="*80)
+    print("Testing router on hybrid code that combines both domains...")
+    
+    hybrid_results = []
+    for prompt in hybrid_prompts:
+        print(f"\n{'-'*60}")
+        print(f"Prompt: '{prompt[:60]}...'")
+        print(f"{'-'*60}")
+        
+        text_with_mixer, weights_with_mixer = generate_with_mixer(
+            model, tokenizer, prompt, max_length=20, use_mixer=True
+        )
+        
+        if weights_with_mixer is not None and len(weights_with_mixer) > 0:
+            prompt_weights = weights_with_mixer[0]
+            shakespeare_weight = prompt_weights[0].item()
+            python_weight = prompt_weights[1].item()
+            
+            print(f"Generated: {text_with_mixer[:80]}...")
+            print(f"\nRouter weights:")
+            for i, name in enumerate(model.adapter_names):
+                percentage = prompt_weights[i].item() * 100
+                bar = "#" * int(percentage / 2)
+                print(f"  {name:12s}: {prompt_weights[i]:.3f} ({percentage:5.1f}%) {bar}")
+            
+            # Check if hybrid (both domains significant)
+            is_hybrid = 0.3 < shakespeare_weight < 0.7
+            if is_hybrid:
+                print(f"  -> HYBRID CASE: Router blends both domains!")
+            elif shakespeare_weight > 0.7:
+                print(f"  -> Shakespeare dominant")
+            else:
+                print(f"  -> Python dominant")
+            
+            hybrid_results.append({
+                'prompt': prompt,
+                'shakespeare': shakespeare_weight,
+                'python': python_weight,
+                'is_hybrid': is_hybrid
+            })
+    
+    # Summary of hybrid test
+    if hybrid_results:
+        hybrid_count = sum(1 for r in hybrid_results if r['is_hybrid'])
+        avg_shakespeare = sum(r['shakespeare'] for r in hybrid_results) / len(hybrid_results)
+        avg_python = sum(r['python'] for r in hybrid_results) / len(hybrid_results)
+        
+        print(f"\n{'-'*60}")
+        print(f"Hybrid Test Summary:")
+        print(f"  Total prompts: {len(hybrid_results)}")
+        print(f"  Hybrid cases: {hybrid_count} ({hybrid_count/len(hybrid_results)*100:.1f}%)")
+        print(f"  Avg weights: Shakespeare={avg_shakespeare:.3f}, Python={avg_python:.3f}")
+        print(f"\n[KEY INSIGHT]")
+        print(f"Router acts as a GATE (outputs weights), not a CLASSIFIER (outputs label).")
+        print(f"This allows hybrid cases to preserve both domains through weighted mixing.")
+        print(f"{'-'*60}")
     
     # Visualization for one example
     print("\n" + "="*80)
