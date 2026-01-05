@@ -62,6 +62,9 @@ results/
 # But allow visualization graphs for documentation
 !07-stability-first-cifar10/results/*.png
 !07-stability-first-cifar10/results/*.md
+# Allow LLaMA-3 test results
+!11-llama3-8b-runpod/results/*.json
+!11-llama3-8b-runpod/results/*.png
 
 # Temporary files
 *.tmp
