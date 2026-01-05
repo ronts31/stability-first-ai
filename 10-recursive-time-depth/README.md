@@ -178,3 +178,12 @@ This experiment is related to:
 - Attractor theory in neural networks
 - Recursive neural networks
 - Reasoning in language models
+
+## 📚 Publication
+
+This work is part of a larger research program on Stability-First AI:
+
+**Published Paper:**  
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18148080.svg)](https://doi.org/10.5281/zenodo.18148080)
+
+Sialedchyk, V. (2026). *Stability-First AI: Completed Experimental Studies and the Physics of Learning Time*. Zenodo. https://doi.org/10.5281/zenodo.18148080

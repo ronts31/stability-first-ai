@@ -1,0 +1,228 @@
+{
+  "summary": {
+    "total": 8,
+    "passed": 3,
+    "failed": 0,
+    "warnings": 4,
+    "errors": 1
+  },
+  "results": [
+    {
+      "project_name": "01-active-sleep-mnist",
+      "status": "warning",
+      "expected_values": {
+        "task_a_after_sleep": 96.3,
+        "task_b_after_sleep": 84.12,
+        "backbone_probe": 91.58
+      },
+      "actual_values": {
+        "task_a_after_sleep": 99.12,
+        "task_b_after_sleep": 0.0,
+        "backbone_probe": 0.0
+      },
+      "differences": {
+        "task_a_after_sleep": 2.8200000000000074,
+        "task_b_after_sleep": -84.12,
+        "backbone_probe": -91.58
+      },
+      "warnings": [
+        "Отклонение для task_a_after_sleep: 99.12% (ожидалось 96.30%, разница: 2.82%)",
+        "Отклонение для task_b_after_sleep: 0.00% (ожидалось 84.12%, разница: 84.12%)",
+        "Отклонение для backbone_probe: 0.00% (ожидалось 91.58%, разница: 91.58%)"
+      ],
+      "errors": [],
+      "execution_time": 150.28289651870728,
+      "log_file": null
+    },
+    {
+      "project_name": "02-temporal-lora-gpt2",
+      "status": "warning",
+      "expected_values": {
+        "router_accuracy": 100.0,
+        "shakespeare_routing": 97.2,
+        "python_routing": 99.5
+      },
+      "actual_values": {
+        "shakespeare_routing": 98.3,
+        "python_routing": 1.7
+      },
+      "differences": {
+        "shakespeare_routing": 1.0999999999999943,
+        "python_routing": -97.8
+      },
+      "warnings": [
+        "Не найдено значение для router_accuracy",
+        "Отклонение для shakespeare_routing: 98.30% (ожидалось 97.20%, разница: 1.10%)",
+        "Отклонение для python_routing: 1.70% (ожидалось 99.50%, разница: 97.80%)"
+      ],
+      "errors": [],
+      "execution_time": 60.14430642127991,
+      "log_file": null
+    },
+    {
+      "project_name": "03-stability-first-basic",
+      "status": "passed",
+      "expected_values": {
+        "task_a_before_b": 99.12,
+        "task_b_after_b_baseline": 98.56,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": 82.02,
+        "task_a_after_b_stability": 93.52
+      },
+      "actual_values": {
+        "task_a_before_b": 98.77,
+        "task_b_after_b_baseline": 98.25,
+        "task_b_after_b_stability": 80.46,
+        "task_a_after_b_baseline": 0.0,
+        "task_a_after_b_stability": 93.62
+      },
+      "differences": {
+        "task_a_before_b": -0.3500000000000085,
+        "task_b_after_b_baseline": -0.3100000000000023,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": -1.5600000000000023,
+        "task_a_after_b_stability": 0.10000000000000853
+      },
+      "warnings": [],
+      "errors": [],
+      "execution_time": 48.94041728973389,
+      "log_file": null
+    },
+    {
+      "project_name": "04-stability-first-reversibility",
+      "status": "passed",
+      "expected_values": {
+        "task_a_before_b": 99.12,
+        "task_b_after_b_baseline": 98.11,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": 84.32,
+        "task_a_after_b_stability": 94.65
+      },
+      "actual_values": {
+        "task_a_before_b": 99.12,
+        "task_b_after_b_baseline": 98.11,
+        "task_b_after_b_stability": 84.32,
+        "task_a_after_b_baseline": 0.0,
+        "task_a_after_b_stability": 94.65
+      },
+      "differences": {
+        "task_a_before_b": 0.0,
+        "task_b_after_b_baseline": 0.0,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": 0.0,
+        "task_a_after_b_stability": 0.0
+      },
+      "warnings": [],
+      "errors": [],
+      "execution_time": 50.00048112869263,
+      "log_file": null
+    },
+    {
+      "project_name": "05-recursive-time-full-suite",
+      "status": "passed",
+      "expected_values": {
+        "task_a_before_b": 99.12,
+        "task_a_after_b_baseline": 0.0,
+        "task_a_after_b_fixed": 94.65,
+        "task_a_after_b_fractal": 94.71,
+        "task_a_after_b_adaptive": 94.34,
+        "task_a_after_b_dream": 94.24
+      },
+      "actual_values": {
+        "task_a_before_b": 99.12,
+        "task_a_after_b_baseline": 0.0,
+        "task_a_after_b_fixed": 94.65,
+        "task_a_after_b_fractal": 94.71,
+        "task_a_after_b_adaptive": 94.34,
+        "task_a_after_b_dream": 94.24
+      },
+      "differences": {
+        "task_a_before_b": 0.0,
+        "task_a_after_b_baseline": 0.0,
+        "task_a_after_b_fixed": 0.0,
+        "task_a_after_b_fractal": 0.0,
+        "task_a_after_b_adaptive": 0.0,
+        "task_a_after_b_dream": 0.0
+      },
+      "warnings": [],
+      "errors": [],
+      "execution_time": 136.24193120002747,
+      "log_file": null
+    },
+    {
+      "project_name": "06-subjective-time-critic",
+      "status": "warning",
+      "expected_values": {
+        "lambda_start": 1805.0,
+        "lambda_end": 2647.0
+      },
+      "actual_values": {
+        "lambda_start": 0.0,
+        "lambda_end": 2647.5
+      },
+      "differences": {
+        "lambda_start": -1805.0,
+        "lambda_end": 0.5
+      },
+      "warnings": [
+        "Отклонение для lambda_start: 0.00% (ожидалось 1805.00%, разница: 1805.00%)",
+        "Подозрительно высокий результат для lambda_end: 2647.50% (возможно переобучение)"
+      ],
+      "errors": [],
+      "execution_time": 52.942986726760864,
+      "log_file": null
+    },
+    {
+      "project_name": "07-stability-first-cifar10",
+      "status": "warning",
+      "expected_values": {
+        "task_a_before_b": 85.0,
+        "task_b_after_b_baseline": 85.0,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": 80.0,
+        "task_a_after_b_stability": 75.0
+      },
+      "actual_values": {
+        "task_a_before_b": 87.42,
+        "task_b_after_b_baseline": 92.76,
+        "task_b_after_b_stability": 48.58,
+        "task_a_after_b_baseline": 0.0,
+        "task_a_after_b_stability": 70.82
+      },
+      "differences": {
+        "task_a_before_b": 2.4200000000000017,
+        "task_b_after_b_baseline": 7.760000000000005,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": -31.42,
+        "task_a_after_b_stability": -4.180000000000007
+      },
+      "warnings": [
+        "Отклонение для task_b_after_b_baseline: 92.76% (ожидалось 85.00%, разница: 7.76%)",
+        "Отклонение для task_b_after_b_stability: 48.58% (ожидалось 80.00%, разница: 31.42%)",
+        "Отклонение для task_a_after_b_stability: 70.82% (ожидалось 75.00%, разница: 4.18%)"
+      ],
+      "errors": [],
+      "execution_time": 1092.75599193573,
+      "log_file": null
+    },
+    {
+      "project_name": "08-stability-first-imagenet",
+      "status": "error",
+      "expected_values": {
+        "task_a_before_b": 65.0,
+        "task_b_after_b_baseline": 65.0,
+        "task_a_after_b_baseline": 0.0,
+        "task_b_after_b_stability": 60.0,
+        "task_a_after_b_stability": 55.0
+      },
+      "actual_values": {},
+      "differences": {},
+      "warnings": [],
+      "errors": [
+        "Превышено время ожидания (10 минут)"
+      ],
+      "execution_time": 1800.072783946991,
+      "log_file": null
+    }
+  ]
+}

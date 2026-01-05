@@ -392,5 +392,5 @@ Forgetting occurs recursively:
 
 ---
 
-**Last updated**: 2024  
+**Last updated**: 2026  
 **Status**: All projects work on Windows, fixed multiprocessing and encoding issues.
