@@ -514,7 +514,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     print("\n>>> Loading model...", flush=True)
-    model = TemporalLoRALlama3Model(
+    model = TemporalLoRAModel(
         model_name=model_name,
         lora_rank=8,
         lora_alpha=16.0,

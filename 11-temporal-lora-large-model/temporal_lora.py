@@ -148,7 +148,7 @@ class TimeMixer(nn.Module):
             domain_logits = None
             if hasattr(self, 'gate'):
                 weights = self.gate(hidden_states)
-                # Привести к dtype hidden_states
+                # Convert to hidden_states dtype
                 weights = weights.to(hidden_states.dtype)
             else:
                 # Uniform weights if no gate
@@ -157,7 +157,7 @@ class TimeMixer(nn.Module):
                 weights = weights / self.num_adapters
         
         # Weighted combination of adapter deltas (Δ)
-        # Привести weights к dtype hidden_states для совместимости
+        # Convert weights to hidden_states dtype for compatibility
         weights = weights.to(hidden_states.dtype)
         mixed_delta = torch.zeros_like(hidden_states)
         for i, adapter_delta in enumerate(adapter_outputs):
@@ -187,7 +187,7 @@ class TemporalLoRAModel(nn.Module):
     ):
         super().__init__()
         
-        # Определяем dtype для B200
+        # Determine dtype for B200
         if torch_dtype is None:
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                 torch_dtype = torch.bfloat16
@@ -295,7 +295,7 @@ class TemporalLoRAModel(nn.Module):
         # This ensures all parameters (position_embeddings, etc.) are processed correctly
         inputs_embeds = self.backbone.model.embed_tokens(input_ids)
         
-        # Создаем position_ids для RoPE
+        # Create position_ids for RoPE
         seq_len = inputs_embeds.size(1)
         batch_size = inputs_embeds.size(0)
         position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
@@ -308,7 +308,7 @@ class TemporalLoRAModel(nn.Module):
         def make_hook(layer_idx):
             def pre_hook(module, input_tuple):
                 # input_tuple содержит (hidden_states, attention_mask, position_ids, ...)
-                # Для Mistral/LLaMA первый аргумент - это hidden_states
+                # For Mistral/LLaMA first argument is hidden_states
                 if not isinstance(input_tuple, tuple) or len(input_tuple) == 0:
                     return input_tuple
                 
