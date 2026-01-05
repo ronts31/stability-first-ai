@@ -232,6 +232,15 @@ class TemporalLoRALlama3Model(nn.Module):
             name=name
         )
         
+        # Переместить адаптер на то же устройство что и backbone
+        try:
+            device = next(self.backbone.parameters()).device
+            adapter = adapter.to(device)
+        except StopIteration:
+            # Если backbone не имеет параметров (не должно случиться), используем CUDA
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            adapter = adapter.to(device)
+        
         self.adapters[name] = adapter
         self.adapter_names.append(name)
         
@@ -244,6 +253,8 @@ class TemporalLoRALlama3Model(nn.Module):
                 vocab_size=vocab_size,
                 strategy="gating"
             )
+            # Переместить Time Mixer на правильное устройство
+            self.time_mixer = self.time_mixer.to(device)
         
         # Update Time Mixer for new number of adapters
         if len(self.adapters) > 1:
@@ -253,6 +264,8 @@ class TemporalLoRALlama3Model(nn.Module):
                 vocab_size=vocab_size,
                 strategy="gating"
             )
+            # Переместить Time Mixer на правильное устройство
+            self.time_mixer = self.time_mixer.to(device)
         
         print(f"[OK] Added adapter '{name}' ({epoch_description})", flush=True)
     

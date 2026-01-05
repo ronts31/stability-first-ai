@@ -100,6 +100,12 @@ def main():
     model.add_adapter("shakespeare", "Renaissance Era (Shakespeare)")
     model.add_adapter("python", "IT Era (Python)")
     
+    # Убедиться, что все адаптеры и Time Mixer на правильном устройстве
+    for adapter in model.adapters.values():
+        adapter = adapter.to(DEVICE)
+    if model.time_mixer is not None:
+        model.time_mixer = model.time_mixer.to(DEVICE)
+    
     # 2. Генерация данных
     print("\n" + "="*80, flush=True)
     print("PHASE 2: Data Generation", flush=True)
