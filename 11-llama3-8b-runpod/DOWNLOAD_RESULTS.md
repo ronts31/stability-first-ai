@@ -48,24 +48,63 @@ scp -P 11773 root@66.92.198.130:/workspace/stability-first-ai/11-llama3-8b-runpo
 ## Вариант 2: Через веб-терминал Runpod
 
 1. Откройте веб-терминал в Runpod: https://console.runpod.io/pods?id=y68lflk0zivqns
-2. Выполните команды для создания архива:
+2. **Сначала найдите файлы результатов:**
 
 ```bash
-cd /workspace/stability-first-ai/11-llama3-8b-runpod
+# Перейдите в корень репозитория
+cd /workspace/stability-first-ai
 
-# Создайте архив с результатами (без чекпоинта, он большой)
+# Найдите все файлы результатов
+find . -name "full_suite_results_llama3.json" -o \
+       -name "hysteresis_results_llama3.json" -o \
+       -name "fatigue_results_llama3.json" -o \
+       -name "fatigue_analysis_llama3.png" -o \
+       -name "hysteresis_analysis_llama3.png" -o \
+       -name "temporal_lora_checkpoint_llama3.pt"
+
+# Или просто проверьте корневую директорию
+ls -lh *.json *.png *.pt 2>/dev/null
+
+# Или проверьте в поддиректории
+ls -lh 11-llama3-8b-runpod/*.json 11-llama3-8b-runpod/*.png 11-llama3-8b-runpod/*.pt 2>/dev/null
+```
+
+3. **Создайте архив с результатами:**
+
+```bash
+# Если файлы в корне репозитория
+cd /workspace/stability-first-ai
 tar -czf results.tar.gz \
     full_suite_results_llama3.json \
     hysteresis_results_llama3.json \
     fatigue_results_llama3.json \
     fatigue_analysis_llama3.png \
-    hysteresis_analysis_llama3.png
+    hysteresis_analysis_llama3.png 2>/dev/null
+
+# Или если файлы в поддиректории
+cd /workspace/stability-first-ai/11-llama3-8b-runpod
+tar -czf ../results.tar.gz \
+    full_suite_results_llama3.json \
+    hysteresis_results_llama3.json \
+    fatigue_results_llama3.json \
+    fatigue_analysis_llama3.png \
+    hysteresis_analysis_llama3.png 2>/dev/null
 
 # Проверьте размер
 ls -lh results.tar.gz
 ```
 
-3. Скачайте архив через веб-интерфейс Runpod (если доступен) или через HTTP сервис
+4. **Скопируйте содержимое JSON файлов** (если архив не работает):
+
+```bash
+# Покажите содержимое файлов для копирования
+cat full_suite_results_llama3.json
+# Скопируйте весь вывод и создайте файл локально
+
+# Или используйте base64 для передачи бинарных файлов
+base64 fatigue_analysis_llama3.png
+# Скопируйте вывод, затем локально: base64 -d > fatigue_analysis_llama3.png
+```
 
 ## Вариант 3: Через HTTP сервис (если настроен)
 
