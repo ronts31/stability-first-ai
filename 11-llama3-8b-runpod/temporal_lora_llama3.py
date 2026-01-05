@@ -47,16 +47,18 @@ class LoRAAdapter(nn.Module):
     LoRA adapter for one temporal domain.
     Implements low-rank adaptation: W' = W + alpha * (A @ B)
     """
-    def __init__(self, base_dim: int, rank: int = 8, alpha: float = 16.0, name: str = ""):
+    def __init__(self, base_dim: int, rank: int = 8, alpha: float = 16.0, name: str = "", dtype: Optional[torch.dtype] = None):
         super().__init__()
         self.name = name
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
         
-        # LoRA matrices (low-rank decomposition)
-        self.lora_A = nn.Parameter(torch.randn(rank, base_dim) * 0.02)
-        self.lora_B = nn.Parameter(torch.zeros(base_dim, rank))
+        # LoRA matrices (low-rank decomposition) с правильным dtype
+        if dtype is None:
+            dtype = torch.float32
+        self.lora_A = nn.Parameter(torch.randn(rank, base_dim, dtype=dtype) * 0.02)
+        self.lora_B = nn.Parameter(torch.zeros(base_dim, rank, dtype=dtype))
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -146,12 +148,17 @@ class TimeMixer(nn.Module):
             domain_logits = None
             if hasattr(self, 'gate'):
                 weights = self.gate(hidden_states)
+                # Привести к dtype hidden_states
+                weights = weights.to(hidden_states.dtype)
             else:
                 # Uniform weights if no gate
-                weights = torch.ones(batch_size, seq_len, self.num_adapters, device=hidden_states.device)
+                weights = torch.ones(batch_size, seq_len, self.num_adapters, 
+                                   device=hidden_states.device, dtype=hidden_states.dtype)
                 weights = weights / self.num_adapters
         
         # Weighted combination of adapter deltas (Δ)
+        # Привести weights к dtype hidden_states для совместимости
+        weights = weights.to(hidden_states.dtype)
         mixed_delta = torch.zeros_like(hidden_states)
         for i, adapter_delta in enumerate(adapter_outputs):
             # Weight each adapter's delta by its domain probability
@@ -208,6 +215,7 @@ class TemporalLoRALlama3Model(nn.Module):
         self.hidden_dim = getattr(self.config, 'hidden_size', getattr(self.config, 'n_embd', 4096))
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.model_dtype = torch_dtype  # Сохранить dtype модели для адаптеров
         
         # Dictionary of LoRA adapters for different epochs
         self.adapters: Dict[str, LoRAAdapter] = nn.ModuleDict()
@@ -224,12 +232,13 @@ class TemporalLoRALlama3Model(nn.Module):
             print(f"[WARN] Adapter '{name}' already exists", flush=True)
             return
         
-        # Create adapters for each transformer layer
+        # Create adapters for each transformer layer с правильным dtype
         adapter = LoRAAdapter(
             base_dim=self.hidden_dim,
             rank=self.lora_rank,
             alpha=self.lora_alpha,
-            name=name
+            name=name,
+            dtype=self.model_dtype  # Использовать тот же dtype что и модель
         )
         
         # Переместить адаптер на то же устройство что и backbone
