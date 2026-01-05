@@ -333,20 +333,39 @@ class TemporalLoRALlama3Model(nn.Module):
             # Mistral/LLaMA blocks use RoPE and need proper kwargs
             # Create position_ids if not provided
             seq_len = hidden_states.size(1)
-            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.size(0), -1)
+            batch_size = hidden_states.size(0)
+            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
             
             # Prepare kwargs for block forward
+            # Mistral/LLaMA blocks need use_cache=False and past_key_value=None for training
             block_kwargs = {
                 "position_ids": position_ids,
+                "use_cache": False,
+                "past_key_value": None,
+                "output_attentions": False,
             }
             if attention_mask is not None:
                 block_kwargs["attention_mask"] = attention_mask
             
             # Call block with proper arguments
-            # Mistral/LLaMA blocks return tuple (hidden_states, ...)
-            block_output = block(hidden_states, **block_kwargs)
+            # Mistral/LLaMA blocks return tuple (hidden_states, ...) or BaseModelOutput
+            # Используем стандартный вызов блока - он сам обработает RoPE через rotary_emb
+            block_output = block(
+                hidden_states,
+                attention_mask=block_kwargs.get("attention_mask"),
+                position_ids=position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+            )
+            
+            # Extract hidden_states from output
             if isinstance(block_output, tuple):
                 hidden_states = block_output[0]
+            elif hasattr(block_output, 'last_hidden_state'):
+                hidden_states = block_output.last_hidden_state
+            elif hasattr(block_output, 'hidden_states'):
+                hidden_states = block_output.hidden_states
             else:
                 hidden_states = block_output
         
