@@ -1,9 +1,9 @@
 # =========================
-# Temporal LoRA: Scaling to LLaMA-3-8B with Time Mixer
+# Temporal LoRA: Scaling to Large Language Models with Time Mixer
 # =========================
 """
-Recursive time theory для LLaMA-3-8B:
-- Backbone (LLaMA-3-8B): "Eternity" - frozen
+Recursive time theory for large language models:
+- Backbone (LLaMA-3, Mistral, etc.): "Eternity" - frozen
 - LoRA A (Shakespeare): "Renaissance Era"
 - LoRA B (Python): "IT Era"
 - Time Mixer: Dynamic switching between epochs
@@ -77,7 +77,7 @@ class LoRAAdapter(nn.Module):
 class TimeMixer(nn.Module):
     """
     Time Mixer v2: Uses input embeddings to determine domain.
-    Адаптирован для LLaMA-3 (больший vocab_size).
+    Adapted for large language models (larger vocab_size).
     """
     def __init__(self, hidden_dim: int, num_adapters: int, vocab_size: int = 128256, strategy: str = "gating"):
         super().__init__()
@@ -169,11 +169,12 @@ class TimeMixer(nn.Module):
         return mixed_delta, weights
 
 # -------------------------
-# Temporal LoRA Model для LLaMA-3
+# Temporal LoRA Model for Large Language Models
 # -------------------------
-class TemporalLoRALlama3Model(nn.Module):
+class TemporalLoRAModel(nn.Module):
     """
-    Main model with frozen LLaMA-3 backbone and multiple LoRA adapters.
+    Main model with frozen large language model backbone and multiple LoRA adapters.
+    Supports LLaMA-3, Mistral, and other transformer architectures.
     """
     def __init__(
         self,
@@ -196,7 +197,7 @@ class TemporalLoRALlama3Model(nn.Module):
                 torch_dtype = torch.float32
         
         # Load base model
-        print(f"[INFO] Loading LLaMA-3 model: {model_name}", flush=True)
+        print(f"[INFO] Loading model: {model_name}", flush=True)
         self.config = AutoConfig.from_pretrained(model_name)
         self.backbone = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -211,11 +212,11 @@ class TemporalLoRALlama3Model(nn.Module):
                 param.requires_grad = False
             print("[OK] Backbone frozen (Eternity)", flush=True)
         
-        # LLaMA-3 uses config.hidden_size instead of n_embd
+        # Large models use config.hidden_size instead of n_embd
         self.hidden_dim = getattr(self.config, 'hidden_size', getattr(self.config, 'n_embd', 4096))
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.model_dtype = torch_dtype  # Сохранить dtype модели для адаптеров
+        self.model_dtype = torch_dtype  # Save model dtype for adapters
         
         # Dictionary of LoRA adapters for different epochs
         self.adapters: Dict[str, LoRAAdapter] = nn.ModuleDict()
@@ -241,12 +242,12 @@ class TemporalLoRALlama3Model(nn.Module):
             dtype=self.model_dtype  # Использовать тот же dtype что и модель
         )
         
-        # Переместить адаптер на то же устройство что и backbone
+        # Move adapter to same device as backbone
         try:
             device = next(self.backbone.parameters()).device
             adapter = adapter.to(device)
         except StopIteration:
-            # Если backbone не имеет параметров (не должно случиться), используем CUDA
+            # If backbone has no parameters (shouldn't happen), use CUDA
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             adapter = adapter.to(device)
         
@@ -254,7 +255,7 @@ class TemporalLoRALlama3Model(nn.Module):
         self.adapter_names.append(name)
         
         # Initialize Time Mixer after first adapter
-        vocab_size = getattr(self.config, 'vocab_size', 128256)  # LLaMA-3 vocab_size
+        vocab_size = getattr(self.config, 'vocab_size', 128256)  # Large model vocab_size
         if self.time_mixer is None:
             self.time_mixer = TimeMixer(
                 hidden_dim=self.hidden_dim,
@@ -262,7 +263,7 @@ class TemporalLoRALlama3Model(nn.Module):
                 vocab_size=vocab_size,
                 strategy="gating"
             )
-            # Переместить Time Mixer на правильное устройство
+            # Move Time Mixer to correct device
             self.time_mixer = self.time_mixer.to(device)
         
         # Update Time Mixer for new number of adapters
@@ -273,7 +274,7 @@ class TemporalLoRALlama3Model(nn.Module):
                 vocab_size=vocab_size,
                 strategy="gating"
             )
-            # Переместить Time Mixer на правильное устройство
+            # Move Time Mixer to correct device
             self.time_mixer = self.time_mixer.to(device)
         
         print(f"[OK] Added adapter '{name}' ({epoch_description})", flush=True)
@@ -288,10 +289,10 @@ class TemporalLoRALlama3Model(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with LoRA adapters and Time Mixer applied.
-        Адаптирован для LLaMA-3 архитектуры.
+        Adapted for large transformer architectures (LLaMA, Mistral, etc.).
         """
-        # Используем стандартный forward модели для правильной обработки RoPE
-        # Это гарантирует, что все параметры (position_embeddings, etc.) обрабатываются правильно
+        # Use standard model forward for proper RoPE handling
+        # This ensures all parameters (position_embeddings, etc.) are processed correctly
         inputs_embeds = self.backbone.model.embed_tokens(input_ids)
         
         # Создаем position_ids для RoPE
@@ -302,8 +303,8 @@ class TemporalLoRALlama3Model(nn.Module):
         # Collect Time Mixer weights for each layer
         all_mixer_weights = []
         
-        # Используем pre_hook для применения LoRA перед каждым блоком
-        # Это позволяет модифицировать hidden_states до того, как блок их обработает
+        # Use pre_hook to apply LoRA before each block
+        # This allows modifying hidden_states before the block processes them
         def make_hook(layer_idx):
             def pre_hook(module, input_tuple):
                 # input_tuple содержит (hidden_states, attention_mask, position_ids, ...)
@@ -365,7 +366,7 @@ class TemporalLoRALlama3Model(nn.Module):
             for hook in hooks:
                 hook.remove()
         
-        # LLaMA-3 uses model.norm before lm_head
+        # Large models use model.norm before lm_head
         if hasattr(self.backbone.model, 'norm'):
             hidden_states = self.backbone.model.norm(hidden_states)
         
@@ -490,7 +491,7 @@ def generate_python_data(n_samples: int = 100) -> List[str]:
 # Training
 # -------------------------
 def train_adapter(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     dataset: DomainDataset,
     adapter_name: str,
@@ -578,7 +579,7 @@ def train_adapter(
                 ignore_index=tokenizer.pad_token_id
             )
             
-            # Active Sleep for Time Mixer (simplified for LLaMA-3)
+            # Active Sleep for Time Mixer (simplified for large models)
             mixer_distill_loss = 0.0
             if (use_active_sleep and teacher_mixer is not None and 
                 previous_iterators is not None and len(previous_iterators) > 0 and
@@ -650,7 +651,7 @@ def train_adapter(
 # Phase 3: Time Mixer Calibration
 # -------------------------
 def calibrate_mixer(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     datasetA: DomainDataset,
     datasetB: DomainDataset,

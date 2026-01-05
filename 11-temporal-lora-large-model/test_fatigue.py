@@ -1,8 +1,8 @@
 # =========================
-# Router Fatigue Test для LLaMA-3-8B: Deep Crystallization
+# Router Fatigue Test: Deep Crystallization
 # =========================
 """
-Check of inertia dependence on domain stay length для LLaMA-3-8B.
+Check of inertia dependence on domain stay length for large language models.
 
 Hypothesis: the longer the model stays in one mode (domain),
 the harder it is to "persuade" it to return to another domain.
@@ -15,7 +15,7 @@ import os
 import json
 from typing import List, Dict, Tuple, Optional, Any
 from transformers import AutoTokenizer
-from temporal_lora_llama3 import TemporalLoRALlama3Model, DEVICE
+from temporal_lora import TemporalLoRAModel, DEVICE
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cosine
 
@@ -35,7 +35,7 @@ def convert_to_python_types(obj: Any) -> Any:
         return obj
 
 def generate_with_token_weights(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     prompt: str,
     max_length: int = 100,
@@ -168,7 +168,7 @@ def compute_return_gap(weights_A1: List[torch.Tensor], weights_A2: List[torch.Te
     return 0.0
 
 def test_fatigue(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     prompt_A: str,
     python_block_length: int,
@@ -280,7 +280,7 @@ def test_fatigue(
     return results
 
 def test_fatigue_sweep(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     prompt_A: str,
     python_lengths: List[int] = [10, 50, 100, 200, 500],
@@ -373,8 +373,8 @@ Tests Completed: {len(all_results)}/{len(python_lengths)}
         ax4.text(0.1, 0.5, summary_text, fontsize=12, verticalalignment='center', family='monospace')
         
         plt.tight_layout()
-        plt.savefig("fatigue_analysis_llama3.png", dpi=150)
-        print(f"\n[OK] Plot saved: fatigue_analysis_llama3.png", flush=True)
+        plt.savefig("fatigue_analysis.png", dpi=150)
+        print(f"\n[OK] Plot saved: fatigue_analysis.png", flush=True)
     except Exception as e:
         print(f"[WARN] Failed to create visualization: {e}", flush=True)
     
@@ -389,7 +389,7 @@ Tests Completed: {len(all_results)}/{len(python_lengths)}
         }
     }
     
-    json_path = "fatigue_results_llama3.json"
+    json_path = "fatigue_results.json"
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(convert_to_python_types(results_summary), f, indent=2, ensure_ascii=False)
     print(f"\n[OK] Results saved to: {json_path}", flush=True)
@@ -399,7 +399,7 @@ Tests Completed: {len(all_results)}/{len(python_lengths)}
 def main():
     """Main function to run fatigue tests."""
     print("\n" + "="*80, flush=True)
-    print("ROUTER FATIGUE TEST: Deep Crystallization (LLaMA-3-8B)", flush=True)
+    print("ROUTER FATIGUE TEST: Deep Crystallization", flush=True)
     print("="*80, flush=True)
     
     model_name = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
@@ -421,7 +421,7 @@ def main():
     model.add_adapter("shakespeare", "Renaissance Era (Shakespeare)")
     model.add_adapter("python", "IT Era (Python)")
     
-    checkpoint_path = "temporal_lora_checkpoint_llama3.pt"
+    checkpoint_path = "temporal_lora_checkpoint.pt"
     try:
         if os.path.exists(checkpoint_path):
             print(f"\n>>> Loading weights from {checkpoint_path}...", flush=True)

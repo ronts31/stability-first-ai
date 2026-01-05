@@ -1,8 +1,8 @@
 # =========================
-# Router Hysteresis Test для LLaMA-3-8B: Time Crystallization
+# Router Hysteresis Test: Time Crystallization
 # =========================
 """
-Router hysteresis (crystallization as "epoch inertia") для LLaMA-3-8B
+Router hysteresis (crystallization as "epoch inertia") for large language models.
 
 Test sequences:
 - A → B → A
@@ -20,7 +20,7 @@ import os
 import json
 from typing import List, Dict, Tuple, Optional, Any
 from transformers import AutoTokenizer
-from temporal_lora_llama3 import TemporalLoRALlama3Model, DEVICE
+from temporal_lora import TemporalLoRAModel, DEVICE
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cosine, euclidean
 
@@ -40,7 +40,7 @@ def convert_to_python_types(obj: Any) -> Any:
         return obj
 
 def generate_with_token_weights(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     prompt: str,
     max_length: int = 100,
@@ -171,7 +171,7 @@ def compute_return_gap(
         raise ValueError(f"Unknown method: {method}")
 
 def test_sequence_aba(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     prompt_A: str,
     prompt_B: str,
@@ -288,7 +288,7 @@ def test_sequence_aba(
     return results
 
 def test_sequence_amixba(
-    model: TemporalLoRALlama3Model,
+    model: TemporalLoRAModel,
     tokenizer,
     prompt_A: str,
     prompt_mix: str,
@@ -414,7 +414,7 @@ def test_sequence_amixba(
     
     return results
 
-def visualize_hysteresis(results_aba: Dict, results_amixba: Dict, adapter_names: List[str], save_path: str = "hysteresis_analysis_llama3.png"):
+def visualize_hysteresis(results_aba: Dict, results_amixba: Dict, adapter_names: List[str], save_path: str = "hysteresis_analysis.png"):
     """Visualizes hysteresis test results."""
     try:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -504,7 +504,7 @@ def visualize_hysteresis(results_aba: Dict, results_amixba: Dict, adapter_names:
 def main():
     """Main function to run hysteresis tests."""
     print("\n" + "="*80, flush=True)
-    print("ROUTER HYSTERESIS TEST: Time Crystallization (LLaMA-3-8B)", flush=True)
+    print("ROUTER HYSTERESIS TEST: Time Crystallization", flush=True)
     print("="*80, flush=True)
     
     model_name = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
@@ -526,7 +526,7 @@ def main():
     model.add_adapter("shakespeare", "Renaissance Era (Shakespeare)")
     model.add_adapter("python", "IT Era (Python)")
     
-    checkpoint_path = "temporal_lora_checkpoint_llama3.pt"
+    checkpoint_path = "temporal_lora_checkpoint.pt"
     try:
         if os.path.exists(checkpoint_path):
             print(f"\n>>> Loading weights from {checkpoint_path}...", flush=True)
@@ -579,7 +579,7 @@ def main():
         visualize_hysteresis(
             results_aba, results_amixba,
             adapter_names=model.adapter_names,
-            save_path="hysteresis_analysis_llama3.png"
+            save_path="hysteresis_analysis.png"
         )
     except Exception as e:
         print(f"[WARN] Failed to create visualization: {e}", flush=True)
@@ -605,7 +605,7 @@ def main():
         }
     }
     
-    json_path = "hysteresis_results_llama3.json"
+    json_path = "hysteresis_results.json"
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(convert_to_python_types(results_summary), f, indent=2, ensure_ascii=False)
     print(f"\n[OK] Results saved to: {json_path}", flush=True)

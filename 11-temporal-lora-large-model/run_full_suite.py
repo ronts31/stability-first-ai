@@ -1,15 +1,15 @@
 # =========================
-# Полный Suite для проверки всех теорий на LLaMA-3-8B
+# Full Test Suite for TemporalLoRA on Large Language Models
 # =========================
 """
-Главный скрипт для полной проверки всех теорий TemporalLoRA на LLaMA-3-8B:
-1. Проверка среды (PyTorch 2.8+, CUDA, BF16)
-2. Загрузка модели LLaMA-3-8B
-3. Обучение адаптеров (Shakespeare, Python)
-4. Калибровка Time Mixer
-5. Тесты гистерезиса (A→B→A, A→Mix→A)
-6. Тесты fatigue (deep crystallization)
-7. Вывод всех результатов и метрик
+Main script for complete validation of all TemporalLoRA theories on large language models:
+1. Environment check (PyTorch 2.8+, CUDA, BF16)
+2. Model loading (LLaMA-3, Mistral, etc.)
+3. Adapter training (Shakespeare, Python)
+4. Time Mixer calibration
+5. Hysteresis tests (A→B→A, A→Mix→A)
+6. Fatigue tests (deep crystallization)
+7. Output all results and metrics
 """
 
 import os
@@ -21,23 +21,23 @@ import numpy as np
 from transformers import AutoTokenizer
 
 # Импорты из наших модулей
-from temporal_lora_llama3 import (
-    TemporalLoRALlama3Model, DEVICE,
+from temporal_lora import (
+    TemporalLoRAModel, DEVICE,
     DomainDataset, generate_shakespeare_data, generate_python_data,
     train_adapter, calibrate_mixer
 )
-from test_hysteresis_llama3 import test_sequence_aba, test_sequence_amixba
-from test_fatigue_llama3 import test_fatigue_sweep
+from test_hysteresis import test_sequence_aba, test_sequence_amixba
+from test_fatigue import test_fatigue_sweep
 
 def parse_version(v: str):
-    """Преобразует строку версии torch в кортеж."""
+    """Convert torch version string to tuple."""
     base = v.split("+")[0]
     parts = base.split(".")
     parts = (parts + ["0", "0", "0"])[:3]
     return tuple(int(x) for x in parts)
 
 def check_environment():
-    """Проверка среды выполнения."""
+    """Check execution environment."""
     print("="*80, flush=True)
     print("PHASE 0: Environment Check", flush=True)
     print("="*80, flush=True)
@@ -45,10 +45,10 @@ def check_environment():
     print(f"torch.__version__ = {torch.__version__}", flush=True)
     v = parse_version(torch.__version__)
     if v < (2, 8, 0):
-        raise RuntimeError("Нужен PyTorch >= 2.8.0 для B200!")
+        raise RuntimeError("PyTorch >= 2.8.0 required for B200!")
     
     if not torch.cuda.is_available():
-        print("[WARN] CUDA недоступен, тест будет на CPU (НЕ B200).", flush=True)
+        print("[WARN] CUDA not available, test will run on CPU (NOT B200).", flush=True)
     else:
         print(f"CUDA device count: {torch.cuda.device_count()}", flush=True)
         print(f"CUDA device name: {torch.cuda.get_device_name(torch.cuda.current_device())}", flush=True)
@@ -62,7 +62,7 @@ def check_environment():
 def main():
     """Главная функция полного suite."""
     print("\n" + "="*80, flush=True)
-    print("FULL SUITE: TemporalLoRA Theory Tests на LLaMA-3-8B", flush=True)
+    print("FULL SUITE: TemporalLoRA Theory Tests on Large Language Models", flush=True)
     print("="*80, flush=True)
     
     # Параметры
@@ -72,10 +72,10 @@ def main():
     print(f"\nModel: {model_name}", flush=True)
     print(f"Fast mode: {fast_mode}", flush=True)
     
-    # 0. Проверка среды
+    # 0. Environment check
     check_environment()
     
-    # 1. Загрузка модели и токенизатора
+    # 1. Load model and tokenizer
     print("\n" + "="*80, flush=True)
     print("PHASE 1: Loading Model", flush=True)
     print("="*80, flush=True)
@@ -84,9 +84,9 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    print("[INFO] Loading LLaMA-3-8B model (this may take time)...", flush=True)
+    print("[INFO] Loading model (this may take time)...", flush=True)
     start_time = time.time()
-    model = TemporalLoRALlama3Model(
+    model = TemporalLoRAModel(
         model_name=model_name,
         lora_rank=8,
         lora_alpha=16.0,
@@ -97,17 +97,17 @@ def main():
     load_time = time.time() - start_time
     print(f"[OK] Model loaded in {load_time:.1f} seconds", flush=True)
     
-    # Добавляем адаптеры
+    # Add adapters
     model.add_adapter("shakespeare", "Renaissance Era (Shakespeare)")
     model.add_adapter("python", "IT Era (Python)")
     
-    # Убедиться, что все адаптеры и Time Mixer на правильном устройстве
+    # Ensure all adapters and Time Mixer are on correct device
     for adapter in model.adapters.values():
         adapter = adapter.to(DEVICE)
     if model.time_mixer is not None:
         model.time_mixer = model.time_mixer.to(DEVICE)
     
-    # 2. Генерация данных
+    # 2. Data generation
     print("\n" + "="*80, flush=True)
     print("PHASE 2: Data Generation", flush=True)
     print("="*80, flush=True)
@@ -126,7 +126,7 @@ def main():
     shakespeare_dataset = DomainDataset(shakespeare_texts, tokenizer, max_length=max_len)
     python_dataset = DomainDataset(python_texts, tokenizer, max_length=max_len)
     
-    # 3. Обучение адаптеров
+    # 3. Adapter training
     print("\n" + "="*80, flush=True)
     print("PHASE 3: Training Adapters", flush=True)
     print("="*80, flush=True)
@@ -136,7 +136,7 @@ def main():
     
     phase3_start = time.time()
     
-    # Обучение Shakespeare адаптера
+    # Train Shakespeare adapter
     train_adapter(
         model=model,
         tokenizer=tokenizer,
@@ -148,7 +148,7 @@ def main():
         use_active_sleep=False
     )
     
-    # Сохранение teacher Time Mixer
+    # Save teacher Time Mixer
     import copy
     teacher_mixer = None
     if model.time_mixer is not None:
@@ -158,7 +158,7 @@ def main():
         teacher_mixer.eval()
         print("[OK] Teacher Time Mixer saved", flush=True)
     
-    # Обучение Python адаптера с Active Sleep
+    # Train Python adapter with Active Sleep
     train_adapter(
         model=model,
         tokenizer=tokenizer,
@@ -175,7 +175,7 @@ def main():
     phase3_time = time.time() - phase3_start
     print(f"[OK] PHASE 3 completed in {phase3_time:.1f} seconds", flush=True)
     
-    # 4. Калибровка Time Mixer
+    # 4. Time Mixer calibration
     print("\n" + "="*80, flush=True)
     print("PHASE 4: Time Mixer Calibration", flush=True)
     print("="*80, flush=True)
@@ -198,7 +198,7 @@ def main():
     phase4_time = time.time() - phase4_start
     print(f"[OK] PHASE 4 completed in {phase4_time:.1f} seconds", flush=True)
     
-    # Сохранение чекпоинта
+    # Save checkpoint
     print("\n>>> Saving checkpoint...", flush=True)
     try:
         checkpoint = {
@@ -206,12 +206,12 @@ def main():
             'time_mixer': model.time_mixer.state_dict() if model.time_mixer is not None else None,
             'adapter_names': model.adapter_names
         }
-        torch.save(checkpoint, 'temporal_lora_checkpoint_llama3.pt')
-        print(f"[OK] Checkpoint saved: temporal_lora_checkpoint_llama3.pt", flush=True)
+        torch.save(checkpoint, 'temporal_lora_checkpoint.pt')
+        print(f"[OK] Checkpoint saved: temporal_lora_checkpoint.pt", flush=True)
     except Exception as e:
         print(f"[WARN] Failed to save checkpoint: {e}", flush=True)
     
-    # 5. Тесты гистерезиса
+    # 5. Hysteresis tests
     print("\n" + "="*80, flush=True)
     print("PHASE 5: Hysteresis Tests", flush=True)
     print("="*80, flush=True)
@@ -241,7 +241,7 @@ def main():
     phase5_time = time.time() - phase5_start
     print(f"[OK] PHASE 5 completed in {phase5_time:.1f} seconds", flush=True)
     
-    # 6. Тесты fatigue
+    # 6. Fatigue tests
     print("\n" + "="*80, flush=True)
     print("PHASE 6: Fatigue Tests (Deep Crystallization)", flush=True)
     print("="*80, flush=True)
@@ -260,7 +260,7 @@ def main():
     phase6_time = time.time() - phase6_start
     print(f"[OK] PHASE 6 completed in {phase6_time:.1f} seconds", flush=True)
     
-    # 7. Сохранение всех результатов
+    # 7. Save all results
     print("\n" + "="*80, flush=True)
     print("PHASE 7: Saving Results", flush=True)
     print("="*80, flush=True)
@@ -312,12 +312,12 @@ def main():
         else:
             return obj
     
-    results_path = "full_suite_results_llama3.json"
+    results_path = "full_suite_results.json"
     with open(results_path, 'w', encoding='utf-8') as f:
         json.dump(convert_to_python_types(all_results), f, indent=2, ensure_ascii=False)
     print(f"[OK] Results saved to: {results_path}", flush=True)
     
-    # 8. Финальный отчёт
+    # 8. Final report
     print("\n" + "="*80, flush=True)
     print("FINAL REPORT", flush=True)
     print("="*80, flush=True)
