@@ -135,8 +135,8 @@ def compute_return_gap(weights_A1: List[torch.Tensor], weights_A2: List[torch.Te
     if len(weights_A1) == 0 or len(weights_A2) == 0:
         return float('inf')
     
-    w1 = torch.stack(weights_A1).numpy()
-    w2 = torch.stack(weights_A2).numpy()
+    w1 = torch.stack(weights_A1).float().cpu().numpy()
+    w2 = torch.stack(weights_A2).float().cpu().numpy()
     
     if method == "cosine" or method == "cosine_distance":
         min_len = min(len(w1), len(w2))
@@ -179,7 +179,7 @@ def test_fatigue(
         print("[ERROR] No weights for analysis", flush=True)
         return None
     
-    weights_array = torch.stack(weights).numpy()
+    weights_array = torch.stack(weights).float().cpu().numpy()
     
     prompt_A_tokens = len(tokenizer.encode(prompt_A))
     switch_AP = min(prompt_A_tokens, len(weights) - 1)
@@ -200,7 +200,7 @@ def test_fatigue(
     )
     
     if len(segment_Python) > 0:
-        python_weights_array = torch.stack(segment_Python).numpy()
+        python_weights_array = torch.stack(segment_Python).float().cpu().numpy()
         avg_python_weight = np.mean(python_weights_array[:, 1])
         final_python_weight = segment_Python[-1][1].item()
         initial_python_weight = segment_Python[0][1].item()
@@ -231,10 +231,10 @@ def test_fatigue(
     )
     
     if len(segment_A2) >= 32:
-        tail_32_weights = torch.stack(segment_A2[:32]).numpy()
+        tail_32_weights = torch.stack(segment_A2[:32]).float().cpu().numpy()
         tail_area_32 = np.sum(1.0 - tail_32_weights[:, 0])
     else:
-        tail_32_weights = torch.stack(segment_A2).numpy() if len(segment_A2) > 0 else np.array([[0.5, 0.5]])
+        tail_32_weights = torch.stack(segment_A2).float().cpu().numpy() if len(segment_A2) > 0 else np.array([[0.5, 0.5]])
         tail_area_32 = np.sum(1.0 - tail_32_weights[:, 0]) if len(segment_A2) > 0 else 0.0
     
     return_gap_cosine = compute_return_gap(segment_A1, segment_A2, method="cosine_distance")

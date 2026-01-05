@@ -106,8 +106,8 @@ def compute_return_gap(
     if len(weights_A1) == 0 or len(weights_A2) == 0:
         return float('inf')
     
-    w1 = torch.stack(weights_A1).numpy()
-    w2 = torch.stack(weights_A2).numpy()
+    w1 = torch.stack(weights_A1).float().cpu().numpy()
+    w2 = torch.stack(weights_A2).float().cpu().numpy()
     
     if method == "cosine" or method == "cosine_distance":
         min_len = min(len(w1), len(w2))
@@ -175,7 +175,7 @@ def test_sequence_aba(
         model, tokenizer, full_prompt, max_length=max_length
     )
     
-    weights_array = torch.stack(weights).numpy()
+    weights_array = torch.stack(weights).float().cpu().numpy()
     
     # Find switching points
     switch_points = []
@@ -230,9 +230,9 @@ def test_sequence_aba(
     if switch_lag_AB is not None and switch_lag_BA is not None:
         switching_asymmetry = abs(switch_lag_AB - switch_lag_BA)
     
-    segment_A1_weights = torch.stack(segment_A1).numpy()
-    segment_B_weights = torch.stack(segment_B).numpy()
-    segment_A2_weights = torch.stack(segment_A2).numpy()
+    segment_A1_weights = torch.stack(segment_A1).float().cpu().numpy()
+    segment_B_weights = torch.stack(segment_B).float().cpu().numpy()
+    segment_A2_weights = torch.stack(segment_A2).float().cpu().numpy()
     
     avg_weight_A1 = np.mean(segment_A1_weights, axis=0)
     avg_weight_B = np.mean(segment_B_weights, axis=0)
@@ -292,7 +292,7 @@ def test_sequence_amixba(
         model, tokenizer, full_prompt, max_length=max_length
     )
     
-    weights_array = torch.stack(weights).numpy()
+    weights_array = torch.stack(weights).float().cpu().numpy()
     
     switch_points = []
     in_mix = False
@@ -347,16 +347,16 @@ def test_sequence_amixba(
     return_gap_euclidean = compute_return_gap(segment_A1, segment_A2, method="euclidean")
     return_gap_dtw = compute_return_gap(segment_A1, segment_A2, method="dtw")
     
-    mix_weights_array = torch.stack(segment_mix).numpy()
+    mix_weights_array = torch.stack(segment_mix).float().cpu().numpy()
     mix_entropy = []
     for w in mix_weights_array:
         entropy = -np.sum(w * np.log(w + 1e-10))
         mix_entropy.append(entropy)
     avg_mix_entropy = np.mean(mix_entropy)
     
-    segment_A1_weights = torch.stack(segment_A1).numpy()
-    segment_mix_weights = torch.stack(segment_mix).numpy()
-    segment_A2_weights = torch.stack(segment_A2).numpy()
+    segment_A1_weights = torch.stack(segment_A1).float().cpu().numpy()
+    segment_mix_weights = torch.stack(segment_mix).float().cpu().numpy()
+    segment_A2_weights = torch.stack(segment_A2).float().cpu().numpy()
     
     avg_weight_A1 = np.mean(segment_A1_weights, axis=0)
     avg_weight_mix = np.mean(segment_mix_weights, axis=0)
