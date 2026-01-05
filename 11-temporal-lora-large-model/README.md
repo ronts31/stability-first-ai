@@ -192,6 +192,36 @@ The `11-temporal-lora-large-model` folder is fully autonomous and does not affec
 - Reduce number of training epochs
 - Reduce number of test lengths in fatigue sweep
 
+## Citation
+
+If you find this research useful, please use the following citation:
+
+**Published Paper:**
+```bibtex
+@misc{sialedchyk2026stability,
+  author = {Sialedchyk, Vitali},
+  title = {Stability-First AI: Completed Experimental Studies and the Physics of Learning Time},
+  year = {2026},
+  publisher = {Zenodo},
+  doi = {10.5281/zenodo.18148080},
+  url = {https://doi.org/10.5281/zenodo.18148080}
+}
+```
+
+**Repository:**
+```bibtex
+@misc{stability_first_ai,
+  author = {Vitali Sialedchyk},
+  title = {Stability-First AI: Memory and Recursive Stability as System Time},
+  year = {2026},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/vitali-sialedchyk/stability-first-ai}}
+}
+```
+
+**DOI Badge:** [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18148080.svg)](https://doi.org/10.5281/zenodo.18148080)
+
 ## License
 
 See main repository LICENSE file.
