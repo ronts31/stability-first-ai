@@ -20,7 +20,7 @@ import torch
 import numpy as np
 from transformers import AutoTokenizer
 
-# Импорты из наших модулей
+# Imports from our modules
 from temporal_lora import (
     TemporalLoRAModel, DEVICE,
     DomainDataset, generate_shakespeare_data, generate_python_data,
