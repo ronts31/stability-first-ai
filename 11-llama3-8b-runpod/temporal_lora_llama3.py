@@ -290,84 +290,80 @@ class TemporalLoRALlama3Model(nn.Module):
         Forward pass with LoRA adapters and Time Mixer applied.
         Адаптирован для LLaMA-3 архитектуры.
         """
-        # LLaMA-3 uses embed_tokens instead of wte
-        inputs_embeds = self.backbone.model.embed_tokens(input_ids)  # [batch, seq_len, hidden_dim]
+        # Используем стандартный forward модели для правильной обработки RoPE
+        # Это гарантирует, что все параметры (position_embeddings, etc.) обрабатываются правильно
+        inputs_embeds = self.backbone.model.embed_tokens(input_ids)
         
-        # LLaMA uses RoPE (rotary positional embeddings), no separate position embeddings
-        # So we just use inputs_embeds directly
-        hidden_states = inputs_embeds
+        # Создаем position_ids для RoPE
+        seq_len = inputs_embeds.size(1)
+        batch_size = inputs_embeds.size(0)
+        position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
         
         # Collect Time Mixer weights for each layer
         all_mixer_weights = []
         
-        # Pass through transformer layers with LoRA applied
-        # LLaMA-3 uses model.layers instead of transformer.h
-        for layer_idx, block in enumerate(self.backbone.model.layers):
-            # Apply LoRA adapters to hidden states before each block
-            adapter_outputs = []
-            for name in self.adapter_names:
-                adapter = self.adapters[name]
-                adapted = adapter(hidden_states)
-                adapter_outputs.append(adapted)
-            
-            # Time Mixer or simple summation
-            if use_mixer and self.time_mixer is not None and len(adapter_outputs) > 1:
-                # Use Time Mixer for dynamic switching between temporal epochs
-                mixed_delta, mixer_weights = self.time_mixer(hidden_states, adapter_outputs, input_ids=input_ids)
-                # Apply delta with residual connection: x ← x + mixed_Δ
-                hidden_states = hidden_states + mixed_delta
-                if return_mixer_weights:
-                    all_mixer_weights.append(mixer_weights)
-            elif adapter_weights is not None:
-                # Manual weighting
-                for i, (name, weight) in enumerate(adapter_weights.items()):
-                    if name in self.adapter_names:
-                        idx = self.adapter_names.index(name)
-                        hidden_states += weight * adapter_outputs[idx]
-            elif len(adapter_outputs) > 0:
-                # Simple summation of all adapters
-                for adapter_delta in adapter_outputs:
-                    hidden_states += adapter_delta / len(adapter_outputs)
-            
-            # Pass through transformer block (LLaMA/Mistral)
-            # Mistral/LLaMA blocks use RoPE and need proper kwargs
-            # Create position_ids if not provided
-            seq_len = hidden_states.size(1)
-            batch_size = hidden_states.size(0)
-            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
-            
-            # Prepare kwargs for block forward
-            # Mistral/LLaMA blocks need use_cache=False and past_key_value=None for training
-            block_kwargs = {
-                "position_ids": position_ids,
-                "use_cache": False,
-                "past_key_value": None,
-                "output_attentions": False,
-            }
-            if attention_mask is not None:
-                block_kwargs["attention_mask"] = attention_mask
-            
-            # Call block with proper arguments
-            # Mistral/LLaMA blocks return tuple (hidden_states, ...) or BaseModelOutput
-            # Используем стандартный вызов блока - он сам обработает RoPE через rotary_emb
-            block_output = block(
-                hidden_states,
-                attention_mask=block_kwargs.get("attention_mask"),
+        # Используем pre_hook для применения LoRA перед каждым блоком
+        # Это позволяет модифицировать hidden_states до того, как блок их обработает
+        def make_hook(layer_idx):
+            def pre_hook(module, input_tuple):
+                # input_tuple содержит (hidden_states, attention_mask, position_ids, ...)
+                # Для Mistral/LLaMA первый аргумент - это hidden_states
+                if not isinstance(input_tuple, tuple) or len(input_tuple) == 0:
+                    return input_tuple
+                
+                hidden_states = input_tuple[0]
+                
+                # Apply LoRA adapters to hidden states before block
+                adapter_outputs = []
+                for name in self.adapter_names:
+                    adapter = self.adapters[name]
+                    adapted = adapter(hidden_states)
+                    adapter_outputs.append(adapted)
+                
+                # Time Mixer or simple summation
+                if use_mixer and self.time_mixer is not None and len(adapter_outputs) > 1:
+                    mixed_delta, mixer_weights = self.time_mixer(hidden_states, adapter_outputs, input_ids=input_ids)
+                    modified_hidden = hidden_states + mixed_delta
+                    if return_mixer_weights:
+                        all_mixer_weights.append(mixer_weights)
+                elif adapter_weights is not None:
+                    modified_hidden = hidden_states.clone()
+                    for i, (name, weight) in enumerate(adapter_weights.items()):
+                        if name in self.adapter_names:
+                            idx = self.adapter_names.index(name)
+                            modified_hidden += weight * adapter_outputs[idx]
+                elif len(adapter_outputs) > 0:
+                    modified_hidden = hidden_states.clone()
+                    for adapter_delta in adapter_outputs:
+                        modified_hidden += adapter_delta / len(adapter_outputs)
+                else:
+                    modified_hidden = hidden_states
+                
+                # Return modified input tuple
+                return (modified_hidden,) + input_tuple[1:]
+            return pre_hook
+        
+        # Register pre_hooks for each layer
+        hooks = []
+        for layer_idx, layer in enumerate(self.backbone.model.layers):
+            hook = layer.register_forward_pre_hook(make_hook(layer_idx))
+            hooks.append(hook)
+        
+        try:
+            # Use standard model forward - это правильно обработает RoPE и все параметры
+            outputs = self.backbone.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=None,
-                output_attentions=False,
                 use_cache=False,
+                output_attentions=False,
             )
             
-            # Extract hidden_states from output
-            if isinstance(block_output, tuple):
-                hidden_states = block_output[0]
-            elif hasattr(block_output, 'last_hidden_state'):
-                hidden_states = block_output.last_hidden_state
-            elif hasattr(block_output, 'hidden_states'):
-                hidden_states = block_output.hidden_states
-            else:
-                hidden_states = block_output
+            hidden_states = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs[0]
+        finally:
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
         
         # LLaMA-3 uses model.norm before lm_head
         if hasattr(self.backbone.model, 'norm'):
