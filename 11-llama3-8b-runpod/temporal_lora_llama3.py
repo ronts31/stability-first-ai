@@ -329,14 +329,26 @@ class TemporalLoRALlama3Model(nn.Module):
                 for adapter_delta in adapter_outputs:
                     hidden_states += adapter_delta / len(adapter_outputs)
             
-            # Pass through LLaMA transformer block
-            # LLaMA blocks accept hidden_states and attention_mask
+            # Pass through transformer block (LLaMA/Mistral)
+            # Mistral/LLaMA blocks use RoPE and need proper kwargs
+            # Create position_ids if not provided
+            seq_len = hidden_states.size(1)
+            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.size(0), -1)
+            
+            # Prepare kwargs for block forward
+            block_kwargs = {
+                "position_ids": position_ids,
+            }
             if attention_mask is not None:
-                # LLaMA expects attention_mask in a specific format
-                # For now, we'll pass it as is (may need adjustment)
-                hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+                block_kwargs["attention_mask"] = attention_mask
+            
+            # Call block with proper arguments
+            # Mistral/LLaMA blocks return tuple (hidden_states, ...)
+            block_output = block(hidden_states, **block_kwargs)
+            if isinstance(block_output, tuple):
+                hidden_states = block_output[0]
             else:
-                hidden_states = block(hidden_states)[0]
+                hidden_states = block_output
         
         # LLaMA-3 uses model.norm before lm_head
         if hasattr(self.backbone.model, 'norm'):
