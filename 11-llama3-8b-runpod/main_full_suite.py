@@ -17,6 +17,7 @@ import sys
 import time
 import json
 import torch
+import numpy as np
 from transformers import AutoTokenizer
 
 # Импорты из наших модулей
@@ -295,9 +296,25 @@ def main():
         'fatigue': fatigue_results if fatigue_results else {}
     }
     
+    # Helper function to convert numpy types to Python types
+    def convert_to_python_types(obj):
+        """Convert numpy types to Python native types for JSON serialization."""
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {key: convert_to_python_types(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_python_types(item) for item in obj]
+        elif isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist()
+        else:
+            return obj
+    
     results_path = "full_suite_results_llama3.json"
     with open(results_path, 'w', encoding='utf-8') as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
+        json.dump(convert_to_python_types(all_results), f, indent=2, ensure_ascii=False)
     print(f"[OK] Results saved to: {results_path}", flush=True)
     
     # 8. Финальный отчёт

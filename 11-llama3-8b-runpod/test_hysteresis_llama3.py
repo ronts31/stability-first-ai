@@ -18,11 +18,26 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import json
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from transformers import AutoTokenizer
 from temporal_lora_llama3 import TemporalLoRALlama3Model, DEVICE
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cosine, euclidean
+
+def convert_to_python_types(obj: Any) -> Any:
+    """Convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_to_python_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_python_types(item) for item in obj]
+    elif isinstance(obj, torch.Tensor):
+        return obj.cpu().numpy().tolist()
+    else:
+        return obj
 
 def generate_with_token_weights(
     model: TemporalLoRALlama3Model,
@@ -592,7 +607,7 @@ def main():
     
     json_path = "hysteresis_results_llama3.json"
     with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(results_summary, f, indent=2, ensure_ascii=False)
+        json.dump(convert_to_python_types(results_summary), f, indent=2, ensure_ascii=False)
     print(f"\n[OK] Results saved to: {json_path}", flush=True)
     
     print("\n" + "="*80, flush=True)
