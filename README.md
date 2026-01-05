@@ -27,6 +27,7 @@ Modern AI systems exist in "instantaneous time" — optimizing only for the curr
 | **07** | Stability-First (CIFAR-10) | Lazarus Project | **Breakthrough**: Data-free model recovery (93.9% recovery after damage, 85.3% after 80% pruning). | 🏆 **New** |
 | **08** | Stability-First (ImageNet) | Large-Scale | Testing Stability-First on ImageNet/CIFAR-100 with ResNet backbone. | ✅ New |
 | **10** | Recursive Time Depth | Subjective Time | **Novel**: Subjective "time" measured by depth of stable recursive transformations. p90/p99 percentile-based stopping, 5-7x speedup, CKA ~0.98 with growing amplitude. | ✅ Ready |
+| **11** | Temporal LoRA (Large Models) | LLM Scaling | **Confirmed on 7B**: All TemporalLoRA theories validated on Mistral-7B-Instruct. Hysteresis (switch-lag: 9 tokens), Deep Crystallization (r=0.8644), 100% router accuracy. Results match and strengthen GPT-2 findings. | ✅ Complete |
 
 ---
 
@@ -134,6 +135,14 @@ D:\new\
 ├── 02-temporal-lora-gpt2/             # 🌟 Temporal LoRA (GPT-2)
 │   ├── temporal_lora.py
 │   └── README.md
+│
+├── 11-temporal-lora-large-model/      # ✅ Temporal LoRA (Mistral-7B)
+│   ├── run_full_suite.py
+│   ├── temporal_lora.py
+│   ├── test_hysteresis.py
+│   ├── test_fatigue.py
+│   ├── RESULTS.md
+│   └── results/
 │
 ├── 06-subjective-time-critic/         # Metacognition
 │   ├── demo_6_subjective_time.py
