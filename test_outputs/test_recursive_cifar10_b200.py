@@ -211,17 +211,23 @@ class SoftRoutingGate(nn.Module):
     """
     Обучаемый gate для soft routing вместо жёсткого маскирования.
     Позволяет системе "сшивать" навыки, а не только хранить их.
+    Управляется через temperature для контроля сложности.
     """
     def __init__(self, feature_dim, num_heads, temperature=1.0):
         super().__init__()
         self.num_heads = num_heads
-        self.temperature = temperature
+        self.base_temperature = temperature  # базовая temperature
+        self.current_temperature = temperature  # текущая (управляется сложностью)
         # Маленькая сеть для предсказания ответственности каждого head
         self.gate_net = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, num_heads),
         )
+    
+    def set_temperature(self, temperature):
+        """Устанавливает temperature для управления routing (высокая = равномерный, низкая = уверенный)"""
+        self.current_temperature = max(0.1, min(5.0, float(temperature)))
     
     def forward(self, features):
         """
@@ -230,9 +236,139 @@ class SoftRoutingGate(nn.Module):
         Returns:
             gates: [B, num_heads] - soft weights для каждого head (sum=1)
         """
-        logits = self.gate_net(features) / self.temperature
+        logits = self.gate_net(features) / self.current_temperature
         gates = torch.softmax(logits, dim=-1)  # [B, num_heads]
         return gates
+
+
+# КРИТИЧНО: Complexity Controller - единый метаконтроллер для управления временем и рекурсией
+class ComplexityController:
+    """
+    Управляет временем и рекурсией через управление сложностью.
+    Превращает разрозненные сигналы в единую политику вычисления/памяти.
+    """
+    def __init__(self):
+        # Веса для вычисления состояния сложности
+        self.w_surprise = 0.30
+        self.w_pain = 0.25
+        self.w_entropy = 0.25
+        self.w_unknown = 0.20
+        
+        # Complexity Budget (закон сохранения сложности)
+        self.complexity_budget = 1.0  # [0..1]
+        self.budget_recovery_rate = 0.002  # восстановление за шаг
+        self.budget_decay_rate = 0.998  # медленное затухание
+        
+        # Стоимости действий
+        self.cost_recursion = 0.05  # за один рекурсивный проход
+        self.cost_replay = 0.01  # за единицу replay_ratio
+        self.cost_kl = 0.02  # за KL distillation
+        self.cost_expansion = 0.30  # за expansion
+        
+        # История для стабилизации
+        self.complexity_history = []
+        self.max_history = 100
+    
+    def compute_complexity(self, surprise, pain, entropy, unknown_rate):
+        """
+        Вычисляет единое состояние сложности из разрозненных сигналов.
+        
+        Args:
+            surprise: float [0..2+] - неожиданность от SubjectiveTimeCritic
+            pain: float [0..1] - конфликт градиентов
+            entropy: float [0..log(num_classes)] - энтропия предсказаний
+            unknown_rate: float [0..1] - доля unknown предсказаний
+        
+        Returns:
+            complexity: float [0..1] - единое состояние сложности
+        """
+        # Нормализуем входы
+        s_n = min(1.0, surprise / 1.2)  # surprise ~ 0..2
+        p_n = min(1.0, pain)  # pain уже [0..1]
+        e_n = min(1.0, entropy / 2.3)  # max entropy для 10 классов ≈ 2.3
+        u_n = unknown_rate  # уже [0..1]
+        
+        # Взвешенная сумма
+        C = (
+            self.w_surprise * s_n +
+            self.w_pain * p_n +
+            self.w_entropy * e_n +
+            self.w_unknown * u_n
+        )
+        C = max(0.0, min(1.0, C))  # clamp [0..1]
+        
+        # Обновляем историю
+        self.complexity_history.append(C)
+        if len(self.complexity_history) > self.max_history:
+            self.complexity_history.pop(0)
+        
+        return C
+    
+    def get_actions(self, complexity, has_expansion_budget, cooldown_ok):
+        """
+        Выдаёт действия на основе состояния сложности.
+        
+        Returns:
+            dict с ключами:
+                - n_recursions: int [1..3] - сколько рекурсивных проходов
+                - replay_ratio: float [0.1..0.4] - доля replay в батче
+                - gate_temperature: float [0.7..2.0] - temperature для routing
+                - crystal_target: float [0..1] - целевой crystal_level
+                - expand_allowed: bool - разрешение на expansion
+        """
+        # КРИТИЧНО: n_recursions зависит от сложности
+        n_recursions = 1 + int(round(2.0 * complexity))  # 1..3
+        
+        # replay_ratio: высокая сложность → больше памяти
+        replay_ratio = 0.10 + 0.30 * complexity  # 10%..40%
+        
+        # gate_temperature: высокая сложность → более равномерный routing (поиск)
+        gate_temperature = 0.7 + 1.3 * complexity  # 0.7..2.0
+        
+        # crystal_target: высокая сложность → меньше кристаллизации (больше пластичности)
+        crystal_target = 1.0 - complexity
+        
+        # expand_allowed: только при высокой сложности и наличии ресурсов
+        expand_allowed = (complexity > 0.7 and has_expansion_budget and cooldown_ok)
+        
+        return {
+            "n_recursions": n_recursions,
+            "replay_ratio": replay_ratio,
+            "gate_temperature": gate_temperature,
+            "crystal_target": crystal_target,
+            "expand_allowed": expand_allowed,
+        }
+    
+    def update_budget(self, actions, used_expansion=False, used_kl=False):
+        """
+        Обновляет complexity budget на основе использованных действий.
+        
+        Args:
+            actions: dict от get_actions()
+            used_expansion: bool - был ли использован expansion
+            used_kl: bool - был ли использован KL distillation
+        """
+        # Расходуем budget на действия
+        cost = 0.0
+        cost += actions["n_recursions"] * self.cost_recursion
+        cost += actions["replay_ratio"] * self.cost_replay
+        if used_kl:
+            cost += self.cost_kl
+        if used_expansion:
+            cost += self.cost_expansion
+        
+        # Тратим budget
+        self.complexity_budget = max(0.0, self.complexity_budget - cost)
+        
+        # Восстанавливаем budget (медленно)
+        self.complexity_budget = min(1.0, self.complexity_budget + self.budget_recovery_rate)
+    
+    def get_budget_status(self):
+        """Возвращает статус budget для логирования"""
+        return {
+            "budget": self.complexity_budget,
+            "avg_complexity": float(np.mean(self.complexity_history)) if self.complexity_history else 0.0,
+        }
 
 
 # Compatibility column for sleep compression
@@ -333,6 +469,9 @@ class RecursiveAgent(nn.Module):
         self.growth_budget = 1.0  # начальный budget
         self.growth_cost_per_expansion = 0.3  # стоимость одного expansion
         self.unknown_trained = False  # флаг для отключения эвристики Unknown
+        
+        # КРИТИЧНО: Complexity Controller для управления временем и рекурсией
+        self.complexity_controller = ComplexityController()
 
         self.use_curiosity = bool(use_curiosity and CLIP_AVAILABLE)
         if self.use_curiosity:
@@ -1347,6 +1486,7 @@ def run_drone_simulation():
             )
 
             # КРИТИЧНО: формализованный контроллер expansion
+            # Используем Complexity Controller для разрешения expansion
             should_expand = False
             expansion_reason = ""
             detected_classes = set()
@@ -1361,6 +1501,11 @@ def run_drone_simulation():
                 fallback_expansion_attempted = True
                 print(f"\n[FALLBACK EXPANSION] {expansion_reason}")
                 print(f"[SAFETY] Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
+            elif expansion_count > 0 and actions is not None and actions["expand_allowed"]:
+                # КРИТИЧНО: Complexity Controller разрешает expansion
+                should_expand = True
+                expansion_reason = f"COMPLEXITY CONTROLLER (C={complexity:.3f} > 0.7, budget={agent.complexity_controller.complexity_budget:.3f})"
+                print(f"\n[COMPLEXITY EXPANSION] {expansion_reason}")
             elif need_expand_score > EXPANSION_THRESHOLD and can_expand and has_budget and has_growth_budget:
                 # Формализованный контроллер сработал
                 should_expand = True
@@ -1489,12 +1634,151 @@ def run_drone_simulation():
             current_opt = optimizer_phase2 if optimizer_phase2 is not None else optimizer
             current_opt.zero_grad(set_to_none=True)
 
-            # sample replay once per step
-            x_replay, y_replay = agent.sample_replay_batch(batch_size=64, device=device)
+            # КРИТИЧНО: Complexity Controller - предварительное вычисление для первого прохода
+            # Используем приближение surprise из предыдущего шага (или entropy_test)
+            complexity = 0.0
+            actions = None
+            if expansion_count > 0:
+                # Для первого прохода используем приближение: surprise ≈ 0.5 * entropy_test
+                surp_approx = 0.5 * entropy_test if entropy_test > 0 else 0.0
+                complexity = agent.complexity_controller.compute_complexity(
+                    surprise=surp_approx,
+                    pain=pain_value,  # будет обновлён позже в pain-блоке
+                    entropy=entropy_test,
+                    unknown_rate=unknown_rate_test
+                )
+                
+                # Получаем действия от контроллера
+                has_expansion_budget = agent.growth_budget >= agent.growth_cost_per_expansion
+                actions = agent.complexity_controller.get_actions(
+                    complexity=complexity,
+                    has_expansion_budget=has_expansion_budget,
+                    cooldown_ok=can_expand
+                )
+                
+                # КРИТИЧНО: применяем gate_temperature к routing gate
+                if agent.use_soft_routing and agent.routing_gate is not None:
+                    agent.routing_gate.set_temperature(actions["gate_temperature"])
+            
+            # КРИТИЧНО: Memory Scheduler - управление replay через сложность
+            if actions is not None:
+                replay_batch_size = int(64 * actions["replay_ratio"] / 0.25)  # масштабируем от базового 64
+            else:
+                replay_batch_size = 64  # fallback
+            
+            # sample replay с динамическим размером
+            x_replay, y_replay = agent.sample_replay_batch(batch_size=replay_batch_size, device=device)
 
-            # ---- forward (BF16) ----
+            # КРИТИЧНО: Внутренняя рекурсия - динамический compute loop
+            # Рекурсивные проходы для "думать ещё раз" при высокой сложности
+            n_recursions = actions["n_recursions"] if (actions is not None and expansion_count > 0) else 1
+            used_recursions = 0
+            
+            all_outputs = []
+            all_features = []
+            all_surprises = []
+            
+            # ---- forward (BF16) с рекурсией ----
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                outputs, features = agent(data_mix, return_features=True)
+                # Pass0: начальный прогноз
+                outputs_pass0, features_pass0 = agent(data_mix, return_features=True)
+                all_outputs.append(outputs_pass0)
+                all_features.append(features_pass0)
+                used_recursions += 1
+                
+                # Вычисляем surprise для Pass0 (для остановки рекурсии)
+                surprise_pass0 = None
+                if use_subjective_time and agent.ref_backbone is not None:
+                    pred_ps_pass0 = agent.critic(features_pass0[:real_B].detach())
+                    real_ps_pass0 = criterion_none(outputs_pass0[:real_B, :10], target_real)
+                    surprise_pass0 = SubjectiveTimeCritic.surprise(pred_ps_pass0, real_ps_pass0)
+                    all_surprises.append(float(surprise_pass0.item()))
+                else:
+                    all_surprises.append(0.0)
+                
+                # Рекурсивные проходы (если сложность высокая и budget позволяет)
+                for pass_idx in range(1, n_recursions):
+                    # Проверяем: нужно ли продолжать (surprise падает?)
+                    if len(all_surprises) >= 2:
+                        delta_surprise = all_surprises[-2] - all_surprises[-1]
+                        if delta_surprise < 0.01:  # surprise не падает - останавливаемся
+                            break
+                    
+                    # Проверяем budget
+                    if agent.complexity_controller.complexity_budget < agent.complexity_controller.cost_recursion:
+                        break
+                    
+                    # PassN: повторный прогноз с дополнительным replay
+                    # Добавляем replay к data_mix для рекурсивного прохода
+                    if x_replay is not None:
+                        # Смешиваем текущий батч с replay
+                        mix_ratio = 0.7  # 70% текущий, 30% replay
+                        n_replay_mix = min(x_replay.size(0), int(real_B * (1 - mix_ratio)))
+                        if n_replay_mix > 0:
+                            data_mix_recursive = torch.cat([
+                                data_real[:int(real_B * mix_ratio)],
+                                x_replay[:n_replay_mix]
+                            ], dim=0)
+                        else:
+                            data_mix_recursive = data_mix
+                    else:
+                        data_mix_recursive = data_mix
+                    
+                    outputs_pass, features_pass = agent(data_mix_recursive, return_features=True)
+                    all_outputs.append(outputs_pass)
+                    all_features.append(features_pass)
+                    
+                    # Вычисляем surprise для этого прохода
+                    surprise_pass = None
+                    if use_subjective_time and agent.ref_backbone is not None:
+                        pred_ps_pass = agent.critic(features_pass[:real_B].detach())
+                        real_ps_pass = criterion_none(outputs_pass[:real_B, :10], target_real)
+                        surprise_pass = SubjectiveTimeCritic.surprise(pred_ps_pass, real_ps_pass)
+                        all_surprises.append(float(surprise_pass.item()))
+                    else:
+                        all_surprises.append(0.0)
+                    
+                    used_recursions += 1
+                
+                # КРИТИЧНО: усредняем предсказания от всех проходов (или берём последний)
+                if len(all_outputs) > 1:
+                    # Взвешенное усреднение (последний проход важнее)
+                    weights = torch.linspace(0.5, 1.0, len(all_outputs), device=device)
+                    weights = weights / weights.sum()
+                    outputs = sum(w * out for w, out in zip(weights, all_outputs))
+                    features = all_features[-1]  # берём features от последнего прохода
+                else:
+                    outputs = all_outputs[0]
+                    features = all_features[0]
+                
+                # Используем surprise от последнего прохода для дальнейших вычислений
+                if len(all_surprises) > 0 and surprise_pass0 is not None:
+                    surprise = surprise_pass0
+                else:
+                    # Fallback: вычисляем surprise из финальных outputs
+                    if use_subjective_time and agent.ref_backbone is not None:
+                        pred_ps = agent.critic(features[:real_B].detach())
+                        real_ps = criterion_none(outputs[:real_B, :10], target_real)
+                        surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
+                    else:
+                        surprise = None
+                
+                # КРИТИЧНО: обновляем complexity после вычисления surprise (для следующего шага)
+                if expansion_count > 0 and surprise is not None:
+                    surp_val = float(surprise.item())
+                    complexity = agent.complexity_controller.compute_complexity(
+                        surprise=surp_val,
+                        pain=pain_value,  # будет обновлён позже в pain-блоке
+                        entropy=entropy_test,
+                        unknown_rate=unknown_rate_test
+                    )
+                    # Обновляем actions с правильной complexity (для следующего шага)
+                    has_expansion_budget = agent.growth_budget >= agent.growth_cost_per_expansion
+                    actions = agent.complexity_controller.get_actions(
+                        complexity=complexity,
+                        has_expansion_budget=has_expansion_budget,
+                        cooldown_ok=can_expand
+                    )
                 
                 # КРИТИЧНО: Entropy penalty для стабилизации routing gates (если используется soft routing)
                 routing_entropy_loss = torch.zeros((), device=device, dtype=torch.float32)
@@ -1597,13 +1881,12 @@ def run_drone_simulation():
                     replay_loss = criterion_train(out_rep[:, :10], y_replay)
 
                 # ---- subjective time critic (per-sample, inside autocast) ----
-                # Используем только real данные для critic
-                surprise = None
+                # КРИТИЧНО: surprise уже вычислен в рекурсивном цикле, но обновляем critic_loss
                 critic_loss = None
-                if use_subjective_time and agent.ref_backbone is not None:
+                if use_subjective_time and agent.ref_backbone is not None and surprise is not None:
+                    # Используем surprise от последнего прохода, но обновляем critic
                     pred_ps = agent.critic(features[:real_B].detach())          # [real_B]
                     real_ps = criterion_none(outputs[:real_B, :10], target_real)  # [real_B]
-                    surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
                     critic_loss = F.mse_loss(pred_ps, real_ps.detach())
 
             # entropy (no grad) - только на real данных
@@ -1742,6 +2025,13 @@ def run_drone_simulation():
                 surp_val = float(surprise.item()) if surprise is not None else 0.0
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
                 
+                # КРИТИЧНО: Complexity Controller управляет crystal_target
+                if actions is not None:
+                    # Плавно подводим crystal_level к целевому значению от контроллера
+                    crystal_target = actions["crystal_target"]
+                    agent.crystal_level = 0.95 * agent.crystal_level + 0.05 * crystal_target
+                    agent.crystal_level = float(max(0.0, min(1.0, agent.crystal_level)))
+                
                 # Корректировка crystal_level на основе разнообразия CLIP
                 # Используем фактическое разнообразие относительно максимального возможного
                 if clip_diversity_at_expansion > 0:
@@ -1837,6 +2127,16 @@ def run_drone_simulation():
                     else:
                         if step % 50 == 0:
                             print(f"[WARNING] cryst_reg term is NaN/inf, skipping")
+            
+            # КРИТИЧНО: обновляем Complexity Budget на основе использованных действий
+            if expansion_count > 0 and actions is not None:
+                used_expansion = should_expand and has_budget
+                used_kl = (kl_loss != 0.0 and torch.isfinite(kl_loss))
+                agent.complexity_controller.update_budget(
+                    actions=actions,
+                    used_expansion=used_expansion,
+                    used_kl=used_kl
+                )
 
             # ---- critic update ----
             if use_subjective_time and critic_loss is not None:
@@ -1970,10 +2270,16 @@ def run_drone_simulation():
                 # КРИТИЧНО: диагностика компонентов loss для выявления источника взрыва
                 loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} U:{unknown_val:.3f} Reg:{reg_val:.2f}"
                 
+                # КРИТИЧНО: Complexity Controller статус
+                complexity_info = ""
+                if expansion_count > 0 and actions is not None:
+                    budget_status = agent.complexity_controller.get_budget_status()
+                    complexity_info = f" | C:{complexity:.3f} R:{used_recursions} B:{budget_status['budget']:.2f} T:{actions['gate_temperature']:.2f}"
+                
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} ({loss_components}) | Mem(M): {acc_A:.1f}% | "
                     f"New(A): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
-                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}"
+                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}{complexity_info}"
                 )
 
             step += 1
