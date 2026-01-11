@@ -1988,7 +1988,9 @@ class RecursiveAgent(nn.Module):
             return False
         
         # Находим пару с максимальным сходством
-        max_similarity_idx = np.argmax(similarities)
+        max_similarity_idx = int(torch.tensor(similarities).argmax().item()) if len(similarities) > 0 else -1
+        if max_similarity_idx < 0:
+            return False
         max_similarity = similarities[max_similarity_idx]
         best_pair = head_pairs[max_similarity_idx]
         i, j = best_pair
