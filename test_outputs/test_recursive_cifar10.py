@@ -220,16 +220,31 @@ class RecursiveAgent(nn.Module):
             for param in self.heads[i].parameters():
                 param.requires_grad = False
     
+    def _set_bn_train(self, train: bool):
+        """Переключает только BN модули в train/eval, остальное не трогает"""
+        for m in self.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.train(train)
+    
     def recalibrate_bn(self, loader, device, num_batches=20):
         """Калибровка BN статистик на новых данных (без обучения весов)"""
         was_training = self.training
-        self.train()  # Включаем train для обновления running stats
+        # Переключаем модель в eval, чтобы головы не "шумели"
+        self.eval()
+        # Но BN временно в train, чтобы обновить running stats
+        self._set_bn_train(True)
+        
         with torch.no_grad():
             for i, (x, _) in enumerate(loader):
                 if i >= num_batches:
                     break
                 x = x.to(device)
-                _ = self(x)  # Проход для обновления BN stats
+                # Калибруем только backbone BN (быстрее и стабильнее)
+                _ = self.shared_backbone(x)
+        
+        # Возвращаем BN в eval
+        self._set_bn_train(False)
+        # Восстанавливаем общий режим
         if was_training:
             self.train()
         else:
@@ -595,7 +610,7 @@ def run_drone_simulation():
 
     print(f"\n--- PHASE 2: WILDERNESS (Reality Shift to Animals: {classes_B}) ---")
     phase_transition_step.append(len(acc_A_hist))
-    expanded = False
+    expansion_count = 0  # Счетчик расширений (вместо флага expanded)
     
     # --- СОСТОЯНИЕ АГЕНТА И ПРЕДОХРАНИТЕЛИ ---
     last_expansion_step = -1000  # Когда последний раз росли
@@ -603,9 +618,11 @@ def run_drone_simulation():
     CLIP_TRUST_THRESHOLD = 0.6   # Верим CLIP только если он уверен > 60%
     MAX_LAYERS = 5               # Защита от переполнения памяти
     
-    # Обучение Фаза 2 (увеличиваем эпохи для лучшего обучения животных)
-    # Новый scheduler для Phase2
-    scheduler_phase2 = CosineAnnealingLR(optimizer, T_max=8, eta_min=1e-5)
+    # Phase2 optimizer и scheduler будут созданы после expansion
+    optimizer_phase2 = None
+    scheduler_phase2 = None
+    steps_per_epoch_B = len(loader_B)
+    total_steps_phase2 = steps_per_epoch_B * 8  # Для scheduler после expansion
     
     for epoch in range(8):  # Еще больше эпох для дифференциации животных
         for batch_idx, (data, target) in enumerate(loader_B):
@@ -623,7 +640,7 @@ def run_drone_simulation():
             can_expand = (step - last_expansion_step) > COOLDOWN_STEPS
             has_budget = len(agent.heads) < MAX_LAYERS
             
-            if not expanded and is_shock and can_expand and has_budget:
+            if is_shock and can_expand and has_budget:
                 print(f"\n[VISUAL CORTEX SHOCK] Loss {test_loss.item():.2f} detected (High Surprise).")
                 print(f"[SAFETY] Checking expansion conditions: Cooldown OK, Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
                 
@@ -666,9 +683,15 @@ def run_drone_simulation():
                             new_params = agent.expand(new_classes_indices=classes_B)
                             # Калибруем BN статистики на новых данных (Phase2)
                             agent.recalibrate_bn(loader_B, device, num_batches=20)
-                            # Увеличиваем LR для новой головы для быстрого обучения животных
-                            optimizer = optim.Adam(new_params, lr=0.002)  # x2 для новой головы
-                            expanded = True
+                            # Создаем новый optimizer и scheduler для Phase2
+                            optimizer_phase2 = optim.Adam(new_params, lr=0.002)  # x2 для новой головы
+                            # T_max = оставшиеся шаги после expansion (примерно)
+                            # Используем общее число шагов Phase2 минус уже пройденные
+                            steps_per_epoch_A = len(loader_A)
+                            steps_already_done = step - (phase_transition_step[-1] * steps_per_epoch_A if phase_transition_step else 0)
+                            remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
+                            scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
+                            expansion_count += 1
                             last_expansion_step = step
                         else:
                             print(f"[IGNORE] CLIP is unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skipping expansion to prevent hallucination.")
@@ -698,7 +721,9 @@ def run_drone_simulation():
                 print("[WAKE UP] Agent is ready for new memories.")
                 
             # 2. Обучение с использованием CLIP как teacher (если доступно)
-            optimizer.zero_grad()
+            # Используем правильный optimizer
+            current_optimizer = optimizer_phase2 if optimizer_phase2 is not None else optimizer
+            current_optimizer.zero_grad()
             outputs = agent(data)
             
             # Базовый loss
@@ -729,15 +754,27 @@ def run_drone_simulation():
                             clip_probs,
                             reduction='batchmean'
                         )
+                        # Планируемый KL коэффициент: warmup после expansion
+                        if expansion_count > 0:
+                            steps_since_expand = step - last_expansion_step
+                            kl_weight = min(0.3, 0.3 * (steps_since_expand / 500))
+                        else:
+                            kl_weight = 0.3
                         # Комбинируем losses
-                        loss = loss + 0.3 * kl_loss  # Коэффициент для баланса
+                        loss = loss + kl_weight * kl_loss
                         # 5) Логи только раз в N шагов (не каждый батч)
                         if step % 50 == 0:
                             print(f"[LOG] High entropy samples: {idx.numel()}, KL loss: {kl_loss.item():.4f}")
             
             loss.backward()
-            optimizer.step()
-            scheduler_phase2.step()  # Cosine LR schedule для Phase2
+            # Используем правильный optimizer (Phase2 если был expansion, иначе Phase1)
+            if optimizer_phase2 is not None:
+                optimizer_phase2.step()
+                if scheduler_phase2 is not None:
+                    scheduler_phase2.step()  # Cosine LR schedule для Phase2
+            else:
+                optimizer.step()
+                scheduler.step()  # Продолжаем Phase1 scheduler до expansion
             
             agent.sensor.update(loss.item())
             
@@ -873,8 +910,9 @@ def run_drone_simulation():
     # Статистика по классам (включая Unknown)
     class_correct = {i: 0 for i in range(11)}
     class_total = {i: 0 for i in range(10)}  # Unknown не может быть true_label
-    class_predictions = {i: {j: 0 for j in range(11)} for i in range(10)}  # confusion matrix
-    unknown_count = 0  # Сколько раз модель сказала "не знаю"
+    class_predictions = {i: {j: 0 for j in range(11)} for i in range(10)}      # confusion matrix
+    unknown_count = 0  # Сколько раз модель сказала "не знаю" (без блокировки)
+    unknown_count_blocked = 0  # Сколько раз модель сказала "не знаю" (с блокировкой для accuracy)
     
     with torch.no_grad():
         for data, target in test_loader_all:
@@ -891,21 +929,39 @@ def run_drone_simulation():
                     # Для техники - маскируем все кроме техники
                     out_masked = out.clone()
                     out_masked[:, [j for j in range(10) if j not in classes_A]] = -float('inf')
-                    out_masked[:, agent.unknown_class_idx] = -float('inf')  # B3) Запрещаем unknown
-                    _, pred = torch.max(out_masked, 1)
+                    # Для accuracy: блокируем unknown
+                    out_masked_blocked = out_masked.clone()
+                    out_masked_blocked[:, agent.unknown_class_idx] = -float('inf')
+                    _, pred = torch.max(out_masked_blocked, 1)
+                    # Для статистики unknown: без блокировки
+                    _, pred_unblocked = torch.max(out_masked, 1)
                 elif true_class in classes_B:
                     # Для животных - маскируем все кроме животных
                     out_masked = out.clone()
                     out_masked[:, [j for j in range(10) if j not in classes_B]] = -float('inf')
-                    out_masked[:, agent.unknown_class_idx] = -float('inf')  # B3) Запрещаем unknown
-                    _, pred = torch.max(out_masked, 1)
+                    # Для accuracy: блокируем unknown
+                    out_masked_blocked = out_masked.clone()
+                    out_masked_blocked[:, agent.unknown_class_idx] = -float('inf')
+                    _, pred = torch.max(out_masked_blocked, 1)
+                    # Для статистики unknown: без блокировки
+                    _, pred_unblocked = torch.max(out_masked, 1)
                 else:
                     # 3) В CIFAR-10 все классы видны (либо фаза 1, либо фаза 2)
                     # Этот блок не сработает, но оставляем для будущих расширений
                     out_masked = out.clone()
-                    out_masked[:, agent.unknown_class_idx] = -float('inf')  # Запрещаем unknown
-                    _, pred = torch.max(out_masked, 1)
+                    out_masked_blocked = out_masked.clone()
+                    out_masked_blocked[:, agent.unknown_class_idx] = -float('inf')
+                    _, pred = torch.max(out_masked_blocked, 1)
+                    _, pred_unblocked = torch.max(out_masked, 1)
                 
+                predicted_class = pred.item()
+                predicted_class_unblocked = pred_unblocked.item()
+                
+                # Статистика unknown (без блокировки)
+                if predicted_class_unblocked == agent.unknown_class_idx:
+                    unknown_count += 1
+                
+                # Для accuracy используем blocked версию
                 predicted_class = pred.item()
                 class_total[true_class] += 1
                 class_predictions[true_class][predicted_class] += 1
