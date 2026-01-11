@@ -44,6 +44,98 @@ class ComplexitySensor:
         z_score = (loss - self.mean) / self.std
         return z_score > self.sensitivity
 
+# --- SUBJECTIVE TIME CRITIC (из проекта 06) ---
+class SubjectiveTimeCritic(nn.Module):
+    """
+    Мета-когнитивная сеть, которая предсказывает loss на основе features.
+    Surprise = |Real_Loss - Predicted_Loss|
+    High Surprise -> Low Lambda (высокая пластичность)
+    Low Surprise -> High Lambda (высокая стабильность)
+    """
+    def __init__(self, feature_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)  # Предсказывает scalar Loss
+        )
+    
+    def forward(self, features):
+        return self.net(features).squeeze(-1)  # [batch]
+    
+    def compute_surprise(self, predicted_loss, real_loss):
+        """Вычисляет Surprise = |Real - Predicted|"""
+        return torch.abs(real_loss.detach() - predicted_loss).mean()
+    
+    def compute_lambda(self, surprise, base_lambda=10000.0, sensitivity=10.0):
+        """Вычисляет динамический Lambda на основе Surprise"""
+        return base_lambda / (1.0 + surprise.item() * sensitivity)
+
+# --- VAE для генерации реалистичных снов (из проекта 01, 05) ---
+class DreamVAE(nn.Module):
+    """
+    VAE для генерации "снов" - более реалистичных изображений вместо белого шума.
+    Используется в Active Sleep для генеративного replay.
+    """
+    def __init__(self, z_dim=128):
+        super().__init__()
+        self.z_dim = z_dim
+        
+        # Encoder: CIFAR-10 (3, 32, 32) -> z_dim
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 4, 2, 1),  # 32->16
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2, 1),  # 16->8
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 4, 2, 1),  # 8->4
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(256 * 4 * 4, 512),
+            nn.ReLU(),
+        )
+        self.mu = nn.Linear(512, z_dim)
+        self.logvar = nn.Linear(512, z_dim)
+        
+        # Decoder: z_dim -> (3, 32, 32)
+        self.decoder = nn.Sequential(
+            nn.Linear(z_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256 * 4 * 4),
+            nn.ReLU(),
+            nn.Unflatten(1, (256, 4, 4)),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 4->8
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),  # 8->16
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 3, 4, 2, 1),  # 16->32
+            nn.Tanh()  # [-1, 1] как CIFAR-10
+        )
+    
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.mu(h), self.logvar(h)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        return self.decoder(z)
+    
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+def vae_loss(x, x_recon, mu, logvar, beta=1.0):
+    """VAE loss: reconstruction + KL divergence"""
+    recon_loss = F.mse_loss(x_recon, x, reduction='sum') / x.size(0)
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+    return recon_loss + beta * kl_loss
+
 # C) Общий CNN Backbone (используется всеми головами)
 class SharedBackbone(nn.Module):
     def __init__(self):
@@ -178,7 +270,7 @@ class CuriosityModule:
             return (None, None, 0.0) if not return_probs else (None, None, 0.0, None)
 
 class RecursiveAgent(nn.Module):
-    def __init__(self, use_curiosity=False):
+    def __init__(self, use_curiosity=False, use_subjective_time=False, use_vae_dreams=False):
         super().__init__()
         # C) Общий backbone + расширяемые головы
         self.hidden_size = 512  # Размер скрытого представления после CNN
@@ -201,9 +293,26 @@ class RecursiveAgent(nn.Module):
         if self.use_curiosity:
             self.curiosity = CuriosityModule()
         
+        # SUBJECTIVE TIME CRITIC (из проекта 06)
+        self.use_subjective_time = use_subjective_time
+        if self.use_subjective_time:
+            self.critic = SubjectiveTimeCritic(feature_dim=self.hidden_size)
+            self.critic_optimizer = None  # Будет создан при обучении
+            self.ref_backbone = None  # Снимок backbone для регуляции
+        
+        # VAE для генерации реалистичных снов (из проекта 01, 05)
+        self.use_vae_dreams = use_vae_dreams
+        if self.use_vae_dreams:
+            self.dream_vae = DreamVAE(z_dim=128)
+            self.vae_trained = False
+        
         # 1️⃣ БУФЕР КОНФЛИКТОВ: Запоминаем несоответствия между моделью и CLIP
         self.conflict_buffer = []  # [(confidence_model, entropy_model, clip_label, clip_conf, image, true_label)]
         self.max_conflicts = 100  # Максимальный размер буфера
+        
+        # REPLAY BUFFER для восстановления памяти (из проекта 05)
+        self.replay_buffer = {'X': [], 'Y': []}
+        self.max_replay_size = 1000
         
         # 3️⃣ КЛАСС "UNKNOWN": Индекс для неопределенных объектов
         self.unknown_class_idx = 10 
@@ -252,8 +361,8 @@ class RecursiveAgent(nn.Module):
         else:
             self.eval()
 
-    def expand(self, new_classes_indices):
-        self.freeze_past()
+    def expand(self, new_classes_indices, use_fractal_time=False):
+        self.freeze_past(use_fractal_time=use_fractal_time)
         # C) Создаем только новую голову (backbone общий)
         prev_dims = [h.hidden_size for h in self.heads]
         device = next(self.parameters()).device
@@ -269,6 +378,65 @@ class RecursiveAgent(nn.Module):
         self.sensor = ComplexitySensor() 
         print(f"[EMERGENCE] Head {len(self.heads)} created (shared backbone). Scope: {new_classes_indices}")
         return new_head.parameters()  # Обучаем только новую голову
+    
+    def add_to_replay_buffer(self, X, Y, max_samples_per_class=100):
+        """Добавляет образцы в replay buffer для восстановления памяти"""
+        for x, y in zip(X, Y):
+            if len(self.replay_buffer['X']) < self.max_replay_size:
+                self.replay_buffer['X'].append(x.detach().cpu().clone())
+                self.replay_buffer['Y'].append(y.item() if isinstance(y, torch.Tensor) else y)
+            else:
+                # Заменяем случайный элемент
+                idx = np.random.randint(0, self.max_replay_size)
+                self.replay_buffer['X'][idx] = x.detach().cpu().clone()
+                self.replay_buffer['Y'][idx] = y.item() if isinstance(y, torch.Tensor) else y
+    
+    def sample_replay_batch(self, batch_size, device):
+        """Сэмплирует батч из replay buffer"""
+        if len(self.replay_buffer['X']) == 0:
+            return None, None
+        n = min(batch_size, len(self.replay_buffer['X']))
+        indices = np.random.choice(len(self.replay_buffer['X']), n, replace=False)
+        X = torch.stack([self.replay_buffer['X'][i] for i in indices]).to(device)
+        Y = torch.tensor([self.replay_buffer['Y'][i] for i in indices], dtype=torch.long).to(device)
+        return X, Y
+    
+    def recover_head_only(self, loader, device, epochs=20, lr=0.001):
+        """
+        Восстановление памяти через обучение только головы (из проекта 04)
+        Позволяет восстановить забытые задачи с минимальными данными
+        """
+        print(f"[RECOVERY] Head-only recovery for {epochs} epochs...")
+        # Замораживаем backbone
+        for param in self.shared_backbone.parameters():
+            param.requires_grad = False
+        
+        # Обучаем только последнюю голову
+        if len(self.heads) > 0:
+            optimizer = optim.Adam(self.heads[-1].parameters(), lr=lr)
+            criterion = nn.CrossEntropyLoss()
+            
+            self.train()
+            for epoch in range(epochs):
+                total_loss = 0
+                for x, y in loader:
+                    x, y = x.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    
+                    backbone_features = self.shared_backbone(x)
+                    logits, _ = self.heads[-1](backbone_features, prev_hiddens=[])
+                    loss = criterion(logits[:, :10], y)
+                    
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+                
+                if (epoch + 1) % 5 == 0:
+                    print(f"   Recovery epoch {epoch+1}/{epochs}: Loss {total_loss/len(loader):.4f}")
+        
+        # Размораживаем backbone
+        for param in self.shared_backbone.parameters():
+            param.requires_grad = True
     
     def record_conflict(self, confidence_model, entropy_model, clip_class, clip_label, clip_conf, image, true_label=None):
         """Запоминаем конфликт между моделью и CLIP для дальнейшего использования"""
@@ -393,11 +561,8 @@ class RecursiveAgent(nn.Module):
             total_distill = 0
             
             for dream_batch in range(num_dreams // dream_batch_size):
-                # Генерируем "сны" - улучшенный шум (более структурированный)
-                # Используем нормализованный шум для более реалистичных снов
-                noise = torch.randn(dream_batch_size, 3, 32, 32).to(device)
-                # Нормализуем в диапазон [-1, 1] (как CIFAR-10)
-                noise = torch.tanh(noise * 0.5)
+                # Генерируем "сны" - VAE или улучшенный шум
+                noise = self.sample_dreams(dream_batch_size, device)
                 
                 # LAZARUS v3: Consistency Anchor (главный компонент)
                 with torch.no_grad():
@@ -464,7 +629,7 @@ class RecursiveAgent(nn.Module):
         print(f"   Memory compressed: {len(self.heads)} head(s) remaining (shared backbone).")
         return "Knowledge Compressed with Lazarus v3!"
 
-    def forward(self, x, raw_image=None, return_curiosity_info=False):
+    def forward(self, x, raw_image=None, return_curiosity_info=False, return_features=False):
         # C) Используем общий backbone + расширяемые головы
         # x: [B, 3, 32, 32]
         backbone_features = self.shared_backbone(x)  # [B, 512]
@@ -524,7 +689,53 @@ class RecursiveAgent(nn.Module):
                 
         if return_curiosity_info:
             return final_logits, curiosity_info
+        if return_features:
+            return final_logits, backbone_features
         return final_logits
+    
+    def train_vae_on_data(self, loader, device, epochs=10, lr=1e-3):
+        """Обучает VAE на данных для генерации реалистичных снов"""
+        if not self.use_vae_dreams:
+            return
+        
+        print(f"[VAE] Training dream generator on {len(loader)} batches...")
+        optimizer = optim.Adam(self.dream_vae.parameters(), lr=lr)
+        self.dream_vae.train()
+        
+        for epoch in range(epochs):
+            total_loss = 0
+            for x, _ in loader:
+                x = x.to(device)
+                optimizer.zero_grad()
+                
+                x_recon, mu, logvar = self.dream_vae(x)
+                loss = vae_loss(x, x_recon, mu, logvar, beta=1.0)
+                
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            
+            if (epoch + 1) % 3 == 0:
+                print(f"   VAE epoch {epoch+1}/{epochs}: Loss {total_loss/len(loader):.4f}")
+        
+        self.dream_vae.eval()
+        self.vae_trained = True
+        print("[VAE] Dream generator ready!")
+    
+    def sample_dreams(self, n, device):
+        """Генерирует сны через VAE или белый шум"""
+        if self.use_vae_dreams and self.vae_trained:
+            # VAE сны (более реалистичные)
+            with torch.no_grad():
+                z = torch.randn(n, self.dream_vae.z_dim, device=device)
+                dreams = self.dream_vae.decode(z)
+                # Нормализуем в диапазон CIFAR-10
+                dreams = torch.clamp(dreams, -1, 1)
+            return dreams
+        else:
+            # Белый шум (fallback)
+            noise = torch.randn(n, 3, 32, 32, device=device)
+            return torch.tanh(noise * 0.5)  # Нормализуем
 
 # --- 2. ДАННЫЕ: МАШИНЫ vs ПРИРОДА ---
 def get_cifar_split():
@@ -612,17 +823,39 @@ def run_drone_simulation():
     test_loader_A = DataLoader(test_A, batch_size=500)
     test_loader_B = DataLoader(test_B, batch_size=500)
 
-    # Создаем агента с модулем любопытства
+    # Создаем агента с максимальной интеграцией всех механизмов
     use_curiosity = CLIP_AVAILABLE
-    agent = RecursiveAgent(use_curiosity=use_curiosity).to(device)
+    use_subjective_time = True  # Автоматическая регуляция пластичности
+    use_vae_dreams = True       # Реалистичные сны вместо белого шума
+    use_fractal_time = True      # Разные уровни защиты для разных слоев
+    use_adaptive_pain = True     # Динамический lambda на основе конфликта градиентов
+    
+    agent = RecursiveAgent(
+        use_curiosity=use_curiosity,
+        use_subjective_time=use_subjective_time,
+        use_vae_dreams=use_vae_dreams
+    ).to(device)
     agent.set_initial_responsibility(classes_A)
     
     if use_curiosity:
         print("[INFO] Curiosity Module (CLIP) enabled - agent can query world knowledge!")
+    if use_subjective_time:
+        print("[INFO] Subjective Time Critic enabled - adaptive plasticity regulation!")
+    if use_vae_dreams:
+        print("[INFO] VAE Dream Generator enabled - realistic dream generation!")
+    if use_fractal_time:
+        print("[INFO] Fractal Time enabled - layer-wise protection levels!")
+    if use_adaptive_pain:
+        print("[INFO] Adaptive Time/Pain enabled - dynamic lambda from gradient conflict!")
     
     # Улучшения для Phase1: AdamW + weight_decay для лучшего разделения Plane/Ship/Car/Truck
     optimizer = optim.AdamW(agent.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # Label smoothing для стабильности
+    
+    # Subjective Time Critic optimizer (если включен)
+    critic_optimizer = None
+    if use_subjective_time:
+        critic_optimizer = optim.Adam(agent.critic.parameters(), lr=1e-3)
 
     acc_A_hist, acc_B_hist = [], []
     step = 0
@@ -630,20 +863,55 @@ def run_drone_simulation():
 
     print(f"\n--- PHASE 1: URBAN ENVIRONMENT (Learning Machines: {classes_A}) ---")
     
+    # Обучение VAE на Phase 1 данных (если включен)
+    if use_vae_dreams:
+        print("[VAE] Pre-training dream generator on Phase 1 data...")
+        agent.train_vae_on_data(loader_A, device, epochs=5, lr=1e-3)
+    
     # Обучение Фаза 1 (больше эпох для лучшего разделения Plane/Ship/Car/Truck)
     # Cosine LR schedule для стабильного обучения
-    scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-5)
+    steps_per_epoch_A = len(loader_A)
+    scheduler = CosineAnnealingLR(optimizer, T_max=steps_per_epoch_A * 15, eta_min=1e-5)
+    
+    # Сохраняем образцы в replay buffer
+    replay_samples_collected = 0
     
     for epoch in range(15):  # Увеличено для лучшего разделения vehicles
         for batch_idx, (data, target) in enumerate(loader_A):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
+            
             # B1) Фаза 1: loss только по 10 классам
-            logits = agent(data)
+            logits, features = agent(data, return_features=True)
             loss = criterion(logits[:, :10], target)
+            
+            # Subjective Time Critic (если включен)
+            surprise = None
+            current_lambda = 0.0
+            if use_subjective_time:
+                # Предсказываем loss через Critic
+                predicted_loss = agent.critic(features.detach())  # [batch]
+                real_loss_per_sample = criterion(logits, target)  # [batch] - нужен reduction='none'
+                # Используем средний loss для Surprise
+                mean_real_loss = loss
+                mean_predicted_loss = predicted_loss.mean()
+                surprise = agent.critic.compute_surprise(mean_predicted_loss, mean_real_loss)
+                current_lambda = agent.critic.compute_lambda(surprise, base_lambda=0.0)  # Phase1: нет защиты
+            
+                # Обучаем Critic
+                critic_loss = nn.MSELoss()(mean_predicted_loss, mean_real_loss.detach())
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                critic_optimizer.step()
+            
             loss.backward()
             optimizer.step()
             scheduler.step()  # Cosine LR schedule
+            
+            # Добавляем в replay buffer (первые 1000 образцов)
+            if replay_samples_collected < agent.max_replay_size:
+                agent.add_to_replay_buffer(data[:min(32, len(data))], target[:min(32, len(target))])
+                replay_samples_collected += min(32, len(data))
             
             agent.sensor.update(loss.item())
             if step == 50: agent.sensor.calibrate()
@@ -652,7 +920,8 @@ def run_drone_simulation():
                 # Тест с правильным eval режимом
                 acc = eval_masked(agent, test_loader_A, classes_A, device, block_unknown=True)
                 acc_A_hist.append(acc); acc_B_hist.append(0)
-                print(f"Step {step}: Loss {loss.item():.2f} | Acc Machines: {acc:.1f}%")
+                surprise_str = f" | Surprise: {surprise.item():.4f}" if surprise is not None else ""
+                print(f"Step {step}: Loss {loss.item():.2f} | Acc Machines: {acc:.1f}%{surprise_str}")
             step += 1
 
     print(f"\n--- PHASE 2: WILDERNESS (Reality Shift to Animals: {classes_B}) ---")
@@ -726,8 +995,8 @@ def run_drone_simulation():
                                     true_label=target[0].item() if len(target) > 0 else None
                                 )
                             
-                            # Расширяем сознание
-                            new_params = agent.expand(new_classes_indices=classes_B)
+                            # Расширяем сознание (с Fractal Time если включен)
+                            new_params = agent.expand(new_classes_indices=classes_B, use_fractal_time=use_fractal_time)
                             # Калибруем BN статистики на новых данных (Phase2)
                             agent.recalibrate_bn(loader_B, device, num_batches=20)
                             # Создаем новый optimizer и scheduler для Phase2
@@ -740,6 +1009,13 @@ def run_drone_simulation():
                             scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
                             expansion_count += 1
                             last_expansion_step = step
+                            
+                            # Обновляем Subjective Time Critic после expansion
+                            if use_subjective_time:
+                                agent.ref_backbone = copy.deepcopy(agent.shared_backbone)
+                                agent.ref_backbone.eval()
+                                for p in agent.ref_backbone.parameters():
+                                    p.requires_grad = False
                         else:
                             print(f"[IGNORE] CLIP is unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skipping expansion to prevent hallucination.")
             
@@ -767,16 +1043,80 @@ def run_drone_simulation():
                 last_expansion_step = step
                 print("[WAKE UP] Agent is ready for new memories.")
                 
-            # 2. Обучение с использованием CLIP как teacher (если доступно)
+            # 2. Обучение с использованием всех интегрированных механизмов
             # Используем правильный optimizer
             current_optimizer = optimizer_phase2 if optimizer_phase2 is not None else optimizer
             current_optimizer.zero_grad()
-            outputs = agent(data)
+            
+            # Forward pass с features для Subjective Time
+            outputs, features = agent(data, return_features=True)
             
             # Базовый loss
             loss = criterion(outputs[:, :10], target)  # Только известные классы
             
+            # REPLAY BUFFER: добавляем replay loss для защиты памяти (из проекта 05)
+            replay_loss = 0.0
+            if len(agent.replay_buffer['X']) > 0:
+                x_replay, y_replay = agent.sample_replay_batch(batch_size=32, device=device)
+                if x_replay is not None:
+                    outputs_replay = agent(x_replay)
+                    replay_loss = criterion(outputs_replay[:, :10], y_replay)
+            
+            # SUBJECTIVE TIME CRITIC: динамическая регуляция пластичности
+            surprise = None
+            current_lambda = 10000.0  # Базовый lambda для Phase2
+            stability_loss = 0.0
+            if use_subjective_time and agent.ref_backbone is not None:
+                # Предсказываем loss через Critic
+                predicted_loss = agent.critic(features.detach())  # [batch]
+                real_loss_per_sample = criterion(outputs, target)  # Нужен reduction='none'
+                mean_real_loss = loss
+                mean_predicted_loss = predicted_loss.mean()
+                surprise = agent.critic.compute_surprise(mean_predicted_loss, mean_real_loss)
+                current_lambda = agent.critic.compute_lambda(surprise, base_lambda=10000.0, sensitivity=10.0)
+                
+                # Stability Loss (Backbone Anchor) - защита памяти
+                backbone_params = list(agent.shared_backbone.parameters())
+                backbone_ref_params = list(agent.ref_backbone.parameters())
+                for p, p_ref in zip(backbone_params, backbone_ref_params):
+                    stability_loss += (p - p_ref).pow(2).sum()
+                
+                # Обучаем Critic
+                critic_loss = nn.MSELoss()(mean_predicted_loss, mean_real_loss.detach())
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                critic_optimizer.step()
+            
+            # ADAPTIVE TIME/PAIN: динамический lambda на основе конфликта градиентов
+            adaptive_lambda = current_lambda
+            if use_adaptive_pain and len(agent.replay_buffer['X']) > 0:
+                x_replay, y_replay = agent.sample_replay_batch(batch_size=32, device=device)
+                if x_replay is not None:
+                    # Вычисляем градиенты для нового и старого loss
+                    backbone_params = list(agent.shared_backbone.parameters())
+                    
+                    loss_new = criterion(outputs[:, :10], target)
+                    loss_old = criterion(agent(x_replay)[:, :10], y_replay)
+                    
+                    g_new = torch.autograd.grad(loss_new, backbone_params, retain_graph=True, create_graph=False)
+                    g_old = torch.autograd.grad(loss_old, backbone_params, retain_graph=True, create_graph=False)
+                    
+                    # Вычисляем косинус между градиентами
+                    g_new_flat = torch.cat([gi.detach().flatten() for gi in g_new])
+                    g_old_flat = torch.cat([gi.detach().flatten() for gi in g_old])
+                    
+                    dot = torch.dot(g_new_flat, g_old_flat).item()
+                    n1 = (g_new_flat.pow(2).sum().item() ** 0.5) + 1e-8
+                    n2 = (g_old_flat.pow(2).sum().item() ** 0.5) + 1e-8
+                    cos = dot / (n1 * n2)
+                    
+                    # Pain = (1 - cos) / 2, lambda = lambda_min + (lambda_max - lambda_min) * pain
+                    pain = max(0.0, min(1.0, (1.0 - cos) * 0.5))
+                    adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain
+                    current_lambda = adaptive_lambda  # Используем adaptive lambda
+            
             # 2️⃣ ДОБАВЛЯЕМ KL-DIVERGENCE С CLIP (если высокая энтропия)
+            kl_loss = 0.0
             if agent.use_curiosity:
                 probs_model = torch.softmax(outputs[:, :10], dim=1)
                 entropy = -torch.sum(probs_model * torch.log(probs_model + 1e-9), dim=1)
@@ -807,23 +1147,38 @@ def run_drone_simulation():
                             kl_weight = min(0.3, 0.3 * (steps_since_expand / 500))
                         else:
                             kl_weight = 0.3
-                        # Комбинируем losses
-                        loss = loss + kl_weight * kl_loss
+                        # Сохраняем взвешенный KL loss
+                        kl_loss = kl_weight * kl_loss
                         # 5) Логи только раз в N шагов (не каждый батч)
                         if step % 50 == 0:
                             print(f"[LOG] High entropy samples: {idx.numel()}, KL loss: {kl_loss.item():.4f}")
             
-            loss.backward()
-            # Используем правильный optimizer (Phase2 если был expansion, иначе Phase1)
-            if optimizer_phase2 is not None:
-                optimizer_phase2.step()
-                if scheduler_phase2 is not None:
-                    scheduler_phase2.step()  # Cosine LR schedule для Phase2
-            else:
-                optimizer.step()
+            # ИТОГОВЫЙ LOSS: базовый + replay + stability (Subjective Time) + adaptive pain + KL
+            total_loss = loss
+            if replay_loss > 0:
+                total_loss = total_loss + 0.25 * replay_loss  # Replay fraction
+            if stability_loss > 0:
+                total_loss = total_loss + current_lambda * stability_loss  # Subjective Time stability
+            if kl_loss > 0:
+                total_loss = total_loss + kl_loss  # CLIP teacher distillation
+            
+            # Используем правильный optimizer
+            current_optimizer = optimizer_phase2 if optimizer_phase2 is not None else optimizer
+            current_optimizer.zero_grad()
+            
+            total_loss.backward()
+            
+            # Gradient clipping для стабильности
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
+            
+            current_optimizer.step()
+            
+            if scheduler_phase2 is not None:
+                scheduler_phase2.step()  # Cosine LR schedule для Phase2
+            elif optimizer_phase2 is None:
                 scheduler.step()  # Продолжаем Phase1 scheduler до expansion
             
-            agent.sensor.update(loss.item())
+            agent.sensor.update(total_loss.item())
             
             if step % 50 == 0:
                 # Тест Памяти (Машины) и Нового (Животные) с правильным eval режимом
