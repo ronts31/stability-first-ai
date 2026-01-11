@@ -737,6 +737,7 @@ def run_drone_simulation():
             
             loss.backward()
             optimizer.step()
+            scheduler_phase2.step()  # Cosine LR schedule для Phase2
             
             agent.sensor.update(loss.item())
             
