@@ -2384,7 +2384,9 @@ class RecursiveAgent(nn.Module):
                                                 
                                                 # КРИТИЧНО: Контрастивное воображение для выбора следующего патча
                                                 contrastive_candidate = 0.0
-                                                if len(self.heads) > 0:
+                                                if self.use_elegant_mode:
+                                                    logits_candidate, _, _ = self.elegant_core(image_candidate, max_steps=1)
+                                                elif len(self.heads) > 0:
                                                     logits_candidate, _ = self.heads[0](features_candidate, prev_hiddens=[])
                                                     if logits_candidate is not None and logits_candidate.size(1) >= 10:
                                                         probs_candidate = torch.softmax(logits_candidate[:, :10], dim=1)
@@ -2393,7 +2395,10 @@ class RecursiveAgent(nn.Module):
                                                         diff_candidate = top2_candidate[0].item() - top2_candidate[1].item()
                                                         
                                                         # Сравниваем с текущим состоянием
-                                                        logits_current_temp, _ = self.heads[0](current_features, prev_hiddens=[])
+                                                        if self.use_elegant_mode:
+                                                            logits_current_temp, _, _ = self.elegant_core(current_image, max_steps=1)
+                                                        else:
+                                                            logits_current_temp, _ = self.heads[0](current_features, prev_hiddens=[])
                                                         if logits_current_temp is not None:
                                                             probs_current_temp = torch.softmax(logits_current_temp[:, :10], dim=1)
                                                             probs_current_temp_mean = probs_current_temp.mean(dim=0)
