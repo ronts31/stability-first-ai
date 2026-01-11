@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn.functional as F
 import os
+import copy
+import copy
 try:
     import clip
     from PIL import Image
@@ -345,10 +347,14 @@ class RecursiveAgent(nn.Module):
     
     def dream_and_compress(self, num_dreams=1000, dream_batch_size=100):
         """
-        🌙 МОДУЛЬ СНОВИДЕНИЙ (CONSOLIDATION)
-        Генерирует "сны" (псевдо-данные) и сжимает знания всех слоев в один "Студент"
+        🌙 МОДУЛЬ СНОВИДЕНИЙ (CONSOLIDATION) + LAZARUS v3
+        Интегрирует механизмы из других экспериментов:
+        1. Consistency (Behavior Anchor) - главный компонент Lazarus (91.5% recovery)
+        2. Stability (Local Invariance) - устойчивость к шуму входов
+        3. Entropy Floor - предотвращение коллапса в "уверенную ошибку"
+        4. Knowledge Distillation - сжатие знаний всех голов в одну
         """
-        print("\n🌙 ENTERING SLEEP PHASE (Consolidating Memories)...")
+        print("\n🌙 ENTERING SLEEP PHASE (Lazarus v3 + Consolidation)...")
         print(f"   Current heads: {len(self.heads)}")
         
         if len(self.heads) <= 1:
@@ -358,64 +364,105 @@ class RecursiveAgent(nn.Module):
         device = next(self.parameters()).device
         
         # 1. Создаем "Студента" - одну компактную сеть
-        # Она должна быть такой же мощной, как сумма всех прошлых голов
-        # C) Используем общий backbone, создаем только новую голову
-        # Фикс: hidden_size, а не hidden_size * 2 (backbone выдает 512, не 1024)
         student_head = ExpandableHead(self.hidden_size, self.output_size).to(device)
-        # Для обратной совместимости создаем полную колонку
         student = TemporalColumn(0, self.hidden_size, self.output_size).to(device)
-        optimizer = optim.Adam(student_head.parameters(), lr=0.001)
+        optimizer = optim.Adam(student_head.parameters(), lr=0.0005)  # Меньше LR для стабильности
         
-        # 2. Генерируем сны (Псевдо-данные)
-        # Так как мы не храним картинки (Zero Replay), мы генерируем случайный шум
-        # И заставляем нашу текущую сеть (Учителя) разметить этот шум
+        # 2. LAZARUS: Создаем frozen teacher (Consistency Anchor)
+        # Это поведенческий якорь - главный компонент восстановления (91.5% recovery)
+        teacher_model = copy.deepcopy(self)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
         
-        print(f"   Generating {num_dreams} dreams...")
-        kl_loss_fn = nn.KLDivLoss(reduction='batchmean')
+        print(f"   Generating {num_dreams} dreams with Lazarus v3 protocol...")
+        print(f"   Parameters: w_cons=1.0, w_stab=0.5, w_ent=0.05, H0=1.5")
         
-        for epoch in range(10):  # Быстрый сон (REM sleep)
+        # Lazarus v3 параметры (из эксперимента 07-stability-first-cifar10)
+        w_cons = 1.0  # Consistency (главный компонент - 91.5% recovery)
+        w_stab = 0.5  # Stability (дополнительная стабилизация)
+        w_ent = 0.05  # Entropy Floor (предотвращение коллапса)
+        H0 = 1.5      # Минимальная энтропия
+        epsilon = 0.05  # Шум для stability loss
+        
+        for epoch in range(15):  # Больше эпох для лучшей консолидации
             total_loss = 0
+            total_cons = 0
+            total_stab = 0
+            total_ent = 0
+            total_distill = 0
             
             for dream_batch in range(num_dreams // dream_batch_size):
-                # Генерируем "Белый шум" (сны) - для CNN это изображения
+                # Генерируем "сны" - улучшенный шум (более структурированный)
+                # Используем нормализованный шум для более реалистичных снов
                 noise = torch.randn(dream_batch_size, 3, 32, 32).to(device)
+                # Нормализуем в диапазон [-1, 1] (как CIFAR-10)
+                noise = torch.tanh(noise * 0.5)
                 
-                # Спрашиваем у текущего Мозга (всех слоев): "Что ты видишь в этом шуме?"
+                # LAZARUS v3: Consistency Anchor (главный компонент)
                 with torch.no_grad():
-                    teacher_logits = self.forward(noise)  # Учитель дает свои предсказания
-                    teacher_probs = torch.softmax(teacher_logits[:, :10], dim=1)  # Только известные классы
+                    teacher_logits = teacher_model(noise)
+                    teacher_probs = torch.softmax(teacher_logits[:, :10], dim=1)
                 
-                # 3. Учим Студента подражать Учителю
-                # C) Используем общий backbone для студента
-                with torch.no_grad():
-                    backbone_features = self.shared_backbone(noise)
-                student_logits, _ = student_head(backbone_features, prev_hiddens=[])  # Студент пытается угадать
+                # Студент предсказывает
+                backbone_features = self.shared_backbone(noise)
+                student_logits, _ = student_head(backbone_features, prev_hiddens=[])
+                student_probs = torch.softmax(student_logits[:, :10], dim=1)
                 
-                # Loss: Студент должен выдавать те же вероятности, что и Учитель (Distillation Loss)
-                loss = kl_loss_fn(
+                # 1. Consistency Loss (MSE между student и teacher logits)
+                # Это главный компонент Lazarus - поведенческий якорь
+                loss_cons = F.mse_loss(student_logits[:, :10], teacher_logits[:, :10])
+                
+                # 2. Stability Loss (устойчивость к шуму входов)
+                # Заставляет модель быть инвариантной к малым возмущениям
+                noise_pert = noise + torch.randn_like(noise) * epsilon
+                backbone_features_pert = self.shared_backbone(noise_pert)
+                student_logits_pert, _ = student_head(backbone_features_pert, prev_hiddens=[])
+                loss_stab = F.mse_loss(student_logits[:, :10], student_logits_pert[:, :10])
+                
+                # 3. Entropy Floor (предотвращение коллапса)
+                # Предотвращает коллапс в "уверенную ошибку"
+                log_probs = F.log_softmax(student_logits[:, :10], dim=1)
+                entropy = -(student_probs * log_probs).sum(dim=1).mean()
+                loss_ent = F.relu(H0 - entropy)  # Штраф за слишком низкую энтропию
+                
+                # 4. Knowledge Distillation (KL divergence для мягких меток)
+                # Сжимает знания всех голов в одну
+                loss_distill = F.kl_div(
                     F.log_softmax(student_logits[:, :10], dim=1),
-                    teacher_probs
+                    teacher_probs,
+                    reduction='batchmean'
                 )
+                
+                # Итоговый loss (Lazarus v3 + Distillation)
+                loss = w_cons * loss_cons + w_stab * loss_stab + w_ent * loss_ent + 0.3 * loss_distill
                 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 
                 total_loss += loss.item()
+                total_cons += loss_cons.item()
+                total_stab += loss_stab.item()
+                total_ent += loss_ent.item()
+                total_distill += loss_distill.item()
             
-            if (epoch + 1) % 2 == 0:
-                print(f"   Dream epoch {epoch+1}/10: Loss {total_loss/(num_dreams//dream_batch_size):.4f}")
+            batches = num_dreams // dream_batch_size
+            if (epoch + 1) % 3 == 0:
+                print(f"   Epoch {epoch+1}/15: Total={total_loss/batches:.4f} "
+                      f"(Cons={total_cons/batches:.4f}, Stab={total_stab/batches:.4f}, "
+                      f"Ent={total_ent/batches:.4f}, Distill={total_distill/batches:.4f}, "
+                      f"H={entropy.item():.3f})")
         
-        print("☀️ WAKING UP: Consolidation Complete.")
+        print("☀️ WAKING UP: Lazarus Consolidation Complete.")
         
         # 4. Заменяем сложный мозг на одного Студента
-        # C) Заменяем все головы на одну, backbone остается общим
         self.heads = nn.ModuleList([student_head])
-        self.columns = nn.ModuleList([student])  # Для обратной совместимости
-        self.active_classes_per_column = {}  # Сброс зон ответственности, теперь Студент знает всё
+        self.columns = nn.ModuleList([student])
+        self.active_classes_per_column = {}
         
         print(f"   Memory compressed: {len(self.heads)} head(s) remaining (shared backbone).")
-        return "Knowledge Compressed!"
+        return "Knowledge Compressed with Lazarus v3!"
 
     def forward(self, x, raw_image=None, return_curiosity_info=False):
         # C) Используем общий backbone + расширяемые головы
