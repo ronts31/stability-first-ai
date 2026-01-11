@@ -1148,7 +1148,12 @@ def run_drone_simulation():
                 # Class-balanced loss для Phase2 (борьба с доминированием одного класса, например Frog)
                 if expansion_count > 0 and class_weights_phase2 is not None:
                     # Используем class-balanced loss с фиксированными весами (вычисленными по датасету)
-                    loss_new = class_balanced_loss(outputs[:, :10], target, class_weights_phase2, num_classes=10)
+                    # Проверка на валидность весов
+                    if torch.isfinite(class_weights_phase2).all() and (class_weights_phase2 > 0).all():
+                        loss_new = class_balanced_loss(outputs[:, :10], target, class_weights_phase2, num_classes=10)
+                    else:
+                        # Fallback на обычный loss если веса проблемные
+                        loss_new = criterion_train(outputs[:, :10], target)
                 else:
                     # Phase1 или если веса не вычислены - используем обычный loss
                     loss_new = criterion_train(outputs[:, :10], target)
@@ -1184,34 +1189,50 @@ def run_drone_simulation():
             # ---- adaptive pain (MUST be computed BEFORE crystallization update) ----
             pain_value = 0.0
             adaptive_lambda = None
-            if use_adaptive_pain and (x_replay is not None):
+            if use_adaptive_pain and (x_replay is not None) and expansion_count > 0:
                 backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
                 if len(backbone_params) > 0:
-                    # fp32 grads (без unknown-эвристики для чистоты градиентов)
-                    with torch.amp.autocast("cuda", enabled=False):
-                        # Используем только backbone + head для чистоты (без unknown логики)
-                        feats_new = agent.shared_backbone(data.float())
-                        logits_new = agent.heads[-1](feats_new, [])[0]  # последняя голова
-                        ln = criterion_train(logits_new[:, :10], target)
+                    # fp32 grads (используем полный forward для надежности)
+                    try:
+                        with torch.amp.autocast("cuda", enabled=False):
+                            # Используем полный forward (но без unknown для чистоты)
+                            out_new_fp32 = agent(data.float())
+                            ln = criterion_train(out_new_fp32[:, :10], target)
 
-                        feats_old = agent.shared_backbone(x_replay.float())
-                        logits_old = agent.heads[-1](feats_old, [])[0]
-                        lo = criterion_train(logits_old[:, :10], y_replay)
+                            out_old_fp32 = agent(x_replay.float())
+                            lo = criterion_train(out_old_fp32[:, :10], y_replay)
+                            
+                            # Проверка на NaN/inf
+                            if not torch.isfinite(ln) or not torch.isfinite(lo):
+                                raise ValueError("Loss contains NaN/inf")
+                    except Exception as e:
+                        if step % 50 == 0:
+                            print(f"[WARNING] Pain computation failed: {e}, skipping pain")
+                        ln = None
+                        lo = None
 
-                    g_new = torch.autograd.grad(ln, backbone_params, retain_graph=True, allow_unused=True)
-                    g_old = torch.autograd.grad(lo, backbone_params, retain_graph=True, allow_unused=True)
-                    g_new = [g for g in g_new if g is not None]
-                    g_old = [g for g in g_old if g is not None]
+                    if ln is not None and lo is not None and torch.isfinite(ln) and torch.isfinite(lo):
+                        try:
+                            g_new = torch.autograd.grad(ln, backbone_params, retain_graph=True, allow_unused=True, create_graph=False)
+                            g_old = torch.autograd.grad(lo, backbone_params, retain_graph=True, allow_unused=True, create_graph=False)
+                            g_new = [g for g in g_new if g is not None and torch.isfinite(g).all()]
+                            g_old = [g for g in g_old if g is not None and torch.isfinite(g).all()]
 
-                    if len(g_new) and len(g_old):
-                        gn = torch.cat([g.detach().flatten() for g in g_new])
-                        go = torch.cat([g.detach().flatten() for g in g_old])
-                        dot = float(torch.dot(gn, go).item())
-                        n1 = float(gn.pow(2).sum().sqrt().item()) + 1e-8
-                        n2 = float(go.pow(2).sum().sqrt().item()) + 1e-8
-                        cos = dot / (n1 * n2)
-                        pain_value = max(0.0, min(1.0, (1.0 - cos) * 0.5))
-                        adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain_value
+                            if len(g_new) and len(g_old):
+                                gn = torch.cat([g.detach().flatten() for g in g_new])
+                                go = torch.cat([g.detach().flatten() for g in g_old])
+                                # Проверка на inf/nan
+                                if torch.isfinite(gn).all() and torch.isfinite(go).all():
+                                    dot = float(torch.dot(gn, go).item())
+                                    n1 = float(gn.pow(2).sum().sqrt().item()) + 1e-8
+                                    n2 = float(go.pow(2).sum().sqrt().item()) + 1e-8
+                                    if n1 > 0 and n2 > 0 and torch.isfinite(torch.tensor([dot, n1, n2])).all():
+                                        cos = dot / (n1 * n2)
+                                        pain_value = max(0.0, min(1.0, (1.0 - cos) * 0.5))
+                                        adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain_value
+                        except Exception as e:
+                            if step % 50 == 0:
+                                print(f"[WARNING] Gradient computation failed: {e}")
 
             # ---- CLIP KL (unchanged, but computed AFTER forward) ----
             kl_loss = 0.0
@@ -1281,17 +1302,38 @@ def run_drone_simulation():
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
+            
+            # Проверка на NaN/inf в loss_new
+            if not torch.isfinite(loss_new):
+                print(f"[ERROR] loss_new is NaN/inf at step {step}")
+                continue
 
             if x_replay is not None:
-                total_loss = total_loss + 0.25 * replay_loss
+                replay_term = 0.25 * replay_loss
+                if torch.isfinite(replay_term):
+                    total_loss = total_loss + replay_term
+                else:
+                    if step % 50 == 0:
+                        print(f"[WARNING] replay_loss is NaN/inf, skipping")
 
-            if kl_loss != 0.0:
+            if kl_loss != 0.0 and torch.isfinite(kl_loss):
                 total_loss = total_loss + kl_loss
 
             # crystallization regularizer replaces old current_lambda * stability_loss
+            cryst_strength_warmup_mult = 1.0  # default если не в warmup
             if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
+                # Вычисляем warmup multiplier если еще не вычислен
+                steps_since_expand = step - last_expansion_step
+                if steps_since_expand < WARMUP_STEPS:
+                    cryst_strength_warmup_mult = 0.0
+                elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                    decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
+                    cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0
+                else:
+                    cryst_strength_warmup_mult = 1.0
+                
                 cryst_reg = agent.crystallization_regularizer()
-                if cryst_reg != 0.0:
+                if cryst_reg != 0.0 and torch.isfinite(cryst_reg):
                     # crystal strength controlled by crystal_level and optionally pain (adaptive_lambda)
                     # base strength: crystal_level (ослаблено для лучшей пластичности)
                     base_strength = 300.0 * agent.crystal_level
@@ -1302,9 +1344,14 @@ def run_drone_simulation():
                         mult = 0.5 + (min(20000.0, max(100.0, adaptive_lambda)) - 100.0) / (20000.0 - 100.0)
                         base_strength = base_strength * mult
                     
-                    # Warmup multiplier уже вычислен выше
+                    # Warmup multiplier
                     base_strength = base_strength * cryst_strength_warmup_mult
-                    total_loss = total_loss + base_strength * cryst_reg
+                    reg_term = base_strength * cryst_reg
+                    if torch.isfinite(reg_term):
+                        total_loss = total_loss + reg_term
+                    else:
+                        if step % 50 == 0:
+                            print(f"[WARNING] cryst_reg term is NaN/inf, skipping")
 
             # ---- critic update ----
             if use_subjective_time and critic_loss is not None:
@@ -1313,8 +1360,39 @@ def run_drone_simulation():
                 critic_optimizer.step()
 
             # ---- backward main ----
+            # Проверка на NaN/inf перед backward
+            if not torch.isfinite(total_loss):
+                print(f"[ERROR] Loss is NaN/inf at step {step}, skipping backward")
+                continue
+            
             total_loss.backward()
+            
+            # Проверка градиентов на inf/nan перед clipping
+            grad_norm_before = 0.0
+            for p in agent.parameters():
+                if p.grad is not None:
+                    if not torch.isfinite(p.grad).all():
+                        print(f"[ERROR] Non-finite gradients detected at step {step}, zeroing")
+                        p.grad.zero_()
+                    else:
+                        grad_norm_before += p.grad.data.norm(2).item() ** 2
+            grad_norm_before = grad_norm_before ** 0.5
+            
+            # Более агрессивный gradient clipping
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
+            
+            # Проверка после clipping
+            grad_norm_after = 0.0
+            for p in agent.parameters():
+                if p.grad is not None:
+                    grad_norm_after += p.grad.data.norm(2).item() ** 2
+            grad_norm_after = grad_norm_after ** 0.5
+            
+            if not torch.isfinite(torch.tensor([grad_norm_after])):
+                print(f"[ERROR] Gradients still non-finite after clipping at step {step}, skipping step")
+                current_opt.zero_grad(set_to_none=True)
+                continue
+            
             current_opt.step()
 
             # Scheduler step (ВАЖНО: после optimizer.step())
@@ -1374,12 +1452,15 @@ def run_drone_simulation():
                     preds = out[:, :10].argmax(dim=1)
                     # Фильтруем только целевые классы животных
                     animal_mask = torch.isin(preds, torch.tensor(classes_B, device=preds.device))
-                    if animal_mask.any():
+                    if animal_mask.any() and animal_mask.sum() > 0:
                         animal_preds = preds[animal_mask]
                         uniq, cnt = animal_preds.unique(return_counts=True)
-                        top3 = sorted(zip(uniq.cpu().tolist(), cnt.cpu().tolist()), key=lambda x: -x[1])[:3]
-                        class_names_short = ["Pl", "Car", "Bd", "Ct", "Dr", "Dg", "Fg", "Hs", "Sh", "Tk"]
-                        top3_str = ", ".join([f"{class_names_short[c]}:{cnt}" for c, cnt in top3])
+                        if len(uniq) > 0:
+                            top3 = sorted(zip(uniq.cpu().tolist(), cnt.cpu().tolist()), key=lambda x: -x[1])[:3]
+                            class_names_short = ["Pl", "Car", "Bd", "Ct", "Dr", "Dg", "Fg", "Hs", "Sh", "Tk"]
+                            top3_str = ", ".join([f"{class_names_short[c]}:{cnt}" for c, cnt in top3])
+                        else:
+                            top3_str = "none"
                     else:
                         top3_str = "none"
 
