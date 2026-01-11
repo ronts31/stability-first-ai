@@ -256,13 +256,13 @@ class ComplexityController:
         
         # Complexity Budget (закон сохранения сложности)
         self.complexity_budget = 1.0  # [0..1]
-        self.budget_recovery_rate = 0.01  # восстановление за шаг (увеличено для баланса)
+        self.budget_recovery_rate = 0.015  # восстановление за шаг (увеличено для лучшего баланса)
         self.budget_decay_rate = 0.998  # медленное затухание
         
         # Стоимости действий (уменьшены для баланса с recovery_rate)
-        self.cost_recursion = 0.02  # за один рекурсивный проход (было 0.05)
-        self.cost_replay = 0.005  # за единицу replay_ratio (было 0.01)
-        self.cost_kl = 0.01  # за KL distillation (было 0.02)
+        self.cost_recursion = 0.015  # за один рекурсивный проход (ещё уменьшено)
+        self.cost_replay = 0.003  # за единицу replay_ratio (ещё уменьшено)
+        self.cost_kl = 0.008  # за KL distillation (ещё уменьшено)
         self.cost_expansion = 0.30  # за expansion (оставляем высоким, т.к. это редкое событие)
         
         # История для стабилизации
@@ -1826,7 +1826,8 @@ def run_drone_simulation():
                 # Смесь noise/dreams/реальных OOD → target=unknown
                 # КРИТИЧНО: всегда tensor на device для type-safety
                 loss_unknown = torch.zeros((), device=device, dtype=torch.float32)
-                if expansion_count > 0:
+                # КРИТИЧНО: начинаем обучать unknown сразу после первого expansion
+                if len(agent.heads) > 1:  # после первого expansion начинаем обучать unknown
                     agent.unknown_trained = True  # помечаем что unknown обучается
                     # Генерируем outliers: noise + dreams
                     n_outliers = min(32, real_B // 4)  # 25% от real_B
