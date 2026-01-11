@@ -1883,13 +1883,14 @@ class RecursiveAgent(nn.Module):
                             # 3. Entropy reduction (чем ниже entropy, тем увереннее модель)
                             # Получаем logits для вычисления entropy
                             if len(self.heads) > 0:
-                                logits_after_zoom = self.heads[0](features_after_zoom)[0] if hasattr(self.heads[0], '__call__') else None
+                                # КРИТИЧНО: ExpandableHead требует prev_hiddens аргумент
+                                logits_after_zoom, _ = self.heads[0](features_after_zoom, prev_hiddens=[]) if hasattr(self.heads[0], '__call__') else (None, None)
                                 if logits_after_zoom is not None and logits_after_zoom.size(1) >= 10:
                                     probs_after = torch.softmax(logits_after_zoom[:, :10], dim=1)
                                     entropy_after = -(probs_after * torch.log(probs_after + 1e-9)).sum(dim=1).mean().item()
                                     
                                     # Сравниваем с текущей entropy (из features)
-                                    logits_current = self.heads[0](features)[0] if hasattr(self.heads[0], '__call__') else None
+                                    logits_current, _ = self.heads[0](features, prev_hiddens=[]) if hasattr(self.heads[0], '__call__') else (None, None)
                                     if logits_current is not None and logits_current.size(1) >= 10:
                                         probs_current = torch.softmax(logits_current[:, :10], dim=1)
                                         entropy_current = -(probs_current * torch.log(probs_current + 1e-9)).sum(dim=1).mean().item()
