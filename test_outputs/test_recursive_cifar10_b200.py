@@ -360,11 +360,14 @@ class RecursiveAgent(nn.Module):
         e_n = min(1.0, e / 2.0)          # 0..1
         p_n = min(1.0, p)                # 0..1
 
-        instability = 0.55 * s_n + 0.25 * p_n + 0.20 * e_n
+        # Усилен вес нестабильности (surprise/entropy важнее) чтобы crystal_level не рос слишком быстро
+        instability = 0.65 * s_n + 0.20 * p_n + 0.15 * e_n
         target_crystal = 1.0 - instability  # чем стабильнее, тем больше кристалл
 
-        # EMA
-        self.crystal_level = self.crystal_momentum * self.crystal_level + (1 - self.crystal_momentum) * target_crystal
+        # EMA с более быстрой реакцией вниз (меньше momentum при нестабильности)
+        # Если нестабильность высокая - быстрее снижаем crystal_level
+        effective_momentum = self.crystal_momentum if target_crystal > self.crystal_level else 0.95
+        self.crystal_level = effective_momentum * self.crystal_level + (1 - effective_momentum) * target_crystal
         self.crystal_level = float(max(0.0, min(1.0, self.crystal_level)))
 
     def crystallization_regularizer(self):
@@ -869,6 +872,10 @@ def run_drone_simulation():
     error_count_phase2 = 0
     last_sleep_step = -1000
 
+    # Warmup после expansion (эмоциональный разогрев)
+    WARMUP_STEPS = 200  # первые N шагов с повышенной пластичностью
+    WARMUP_DECAY_STEPS = 300  # плавный возврат к нормальному режиму
+
     optimizer_phase2 = None
     scheduler_phase2 = None
     steps_per_epoch_B = len(loader_B)
@@ -908,6 +915,14 @@ def run_drone_simulation():
                 param_groups.append({"params": early, "lr": base_lr_early, "tag": "early"})
 
         opt = optim.AdamW(param_groups, weight_decay=1e-4)
+        
+        # Логирование для диагностики
+        print(f"[OPTIMIZER] Phase2 optimizer created with {len(param_groups)} param groups:")
+        for pg in param_groups:
+            tag = pg.get("tag", "unknown")
+            n_params = sum(p.numel() for p in pg["params"])
+            print(f"  - {tag}: {n_params} params, base_lr={pg['lr']:.6f}")
+        
         return opt
 
     for epoch in range(8):
@@ -1106,13 +1121,35 @@ def run_drone_simulation():
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
                 agent.auto_hard_freeze_if_needed()
                 
-                # Apply LR scaling based on crystal_level (crystal controls learning speed)
+                # Warmup: эмоциональный разогрев после expansion
+                steps_since_expand = step - last_expansion_step
+                if steps_since_expand < WARMUP_STEPS:
+                    # Полный warmup: повышенная пластичность
+                    lr_warmup_mult_backbone = 2.0  # mid/late backbone учится быстрее
+                    cryst_strength_warmup_mult = 0.2  # якорение ослаблено
+                elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                    # Плавный возврат к нормальному режиму
+                    decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
+                    lr_warmup_mult_backbone = 2.0 - decay_progress * 1.0  # 2.0 -> 1.0
+                    cryst_strength_warmup_mult = 0.2 + decay_progress * 0.8  # 0.2 -> 1.0
+                else:
+                    # Нормальный режим
+                    lr_warmup_mult_backbone = 1.0
+                    cryst_strength_warmup_mult = 1.0
+                
+                # Apply LR scaling based on crystal_level + warmup
                 if optimizer_phase2 is not None:
                     scales = agent.time_lr_scale()
                     for pg in optimizer_phase2.param_groups:
                         tag = pg.get("tag", None)
                         if tag in scales and "lr_base" in pg:
-                            pg["lr"] = pg["lr_base"] * scales[tag]
+                            base_scale = scales[tag]
+                            # Warmup multiplier применяется только к backbone (mid/late)
+                            if tag in ["mid", "late"]:
+                                warmup_mult = lr_warmup_mult_backbone
+                            else:
+                                warmup_mult = 1.0
+                            pg["lr"] = pg["lr_base"] * base_scale * warmup_mult
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
@@ -1136,7 +1173,18 @@ def run_drone_simulation():
                         # map adaptive_lambda [100..20000] to multiplier [0.5..1.5]
                         mult = 0.5 + (min(20000.0, max(100.0, adaptive_lambda)) - 100.0) / (20000.0 - 100.0)
                         base_strength = base_strength * mult
-
+                    
+                    # Warmup: ослабляем якорение в первые шаги после expansion
+                    steps_since_expand = step - last_expansion_step
+                    if steps_since_expand < WARMUP_STEPS:
+                        cryst_strength_warmup_mult = 0.2
+                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                        decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
+                        cryst_strength_warmup_mult = 0.2 + decay_progress * 0.8
+                    else:
+                        cryst_strength_warmup_mult = 1.0
+                    
+                    base_strength = base_strength * cryst_strength_warmup_mult
                     total_loss = total_loss + base_strength * cryst_reg
 
             # ---- critic update ----
@@ -1181,13 +1229,97 @@ def run_drone_simulation():
 
                 s = f"{float(surprise.item()):.4f}" if surprise is not None else "n/a"
                 cryst_info = f" | Crystal: {agent.crystal_level:.3f}" if expansion_count > 0 else ""
+                
+                # Warmup статус
+                warmup_info = ""
+                if expansion_count > 0:
+                    steps_since_expand = step - last_expansion_step
+                    if steps_since_expand < WARMUP_STEPS:
+                        warmup_info = f" | WARMUP({steps_since_expand}/{WARMUP_STEPS})"
+                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                        warmup_info = f" | WARMUP-DECAY({steps_since_expand - WARMUP_STEPS}/{WARMUP_DECAY_STEPS})"
+                
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} | Mem(M): {acc_A:.1f}% | "
                     f"New(A): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
-                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}"
+                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}"
                 )
 
             step += 1
+
+    # ----------------------------
+    # Latent space visualization (diagnostic)
+    # ----------------------------
+    def visualize_latent_space(agent, loader, device, title_suffix=""):
+        """
+        Визуализация латентного пространства features для диагностики.
+        Показывает, насколько хорошо backbone разделяет классы.
+        """
+        try:
+            from sklearn.manifold import TSNE
+            use_tsne = True
+        except ImportError:
+            try:
+                from sklearn.decomposition import PCA
+                use_tsne = False
+                print("[VIZ] t-SNE not available, using PCA")
+            except ImportError:
+                print("[VIZ] sklearn not available, skipping latent visualization")
+                return
+
+        agent.eval()
+        features_list = []
+        labels_list = []
+        
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+            for data, target in loader:
+                data = data.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                _, features = agent(data, return_features=True)
+                features_list.append(features.cpu().numpy())
+                labels_list.append(target.numpy())
+                if len(features_list) * data.size(0) >= 2000:  # ограничиваем для скорости
+                    break
+        
+        features_all = np.concatenate(features_list, axis=0)
+        labels_all = np.concatenate(labels_list, axis=0)
+        
+        print(f"[VIZ] Computing {'t-SNE' if use_tsne else 'PCA'} for {len(features_all)} samples...")
+        
+        if use_tsne:
+            reducer = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+        else:
+            reducer = PCA(n_components=2, random_state=42)
+        
+        features_2d = reducer.fit_transform(features_all)
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=(12, 10))
+        class_names = ["Plane", "Car", "Bird", "Cat", "Deer", "Dog", "Frog", "Horse", "Ship", "Truck"]
+        colors = plt.cm.tab10(np.linspace(0, 1, 10))
+        
+        for i in range(10):
+            mask = labels_all == i
+            if mask.any():
+                ax.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                          c=[colors[i]], label=class_names[i], alpha=0.6, s=20)
+        
+        ax.set_title(f"Latent Space Visualization {title_suffix}")
+        ax.set_xlabel("Component 1")
+        ax.set_ylabel("Component 2")
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        out_path = os.path.join(project_root, "test_outputs", f"latent_space_{title_suffix.lower().replace(' ', '_')}.png")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"[VIZ] Saved to {out_path}")
+        plt.close()
+
+    # Визуализация после Phase2 (если есть expansion)
+    if expansion_count > 0:
+        print("\n--- VISUALIZING LATENT SPACE (Post Phase2) ---")
+        visualize_latent_space(agent, test_loader_B, device, title_suffix="Post Phase2 Animals")
 
     # ----------------------------
     # Final test on all classes (fixed unknown counting)
