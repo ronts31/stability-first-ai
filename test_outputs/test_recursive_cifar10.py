@@ -320,16 +320,40 @@ class RecursiveAgent(nn.Module):
     def set_initial_responsibility(self, classes):
         self.active_classes_per_column[0] = classes
 
-    def freeze_past(self):
+    def freeze_past(self, use_fractal_time=False):
+        """
+        Замораживание прошлого с опциональным Fractal Time
+        (разные уровни защиты для разных слоев backbone)
+        """
         print("[FREEZING] Memory (Crystallization)...")
-        # Замораживаем веса backbone (BN stats будут обновляться через recalibrate_bn)
-        for param in self.shared_backbone.parameters():
-            param.requires_grad = False
+        
+        if use_fractal_time:
+            # FRACTAL TIME: разные lambda для разных слоев
+            # Conv1-2: очень медленно (lambda_fc1=10000.0)
+            # Conv3-4: медленно (lambda_fc2=3000.0)
+            # Head: быстро (lambda_head=0.0)
+            print("[FRACTAL TIME] Different protection levels per layer group")
+            # Замораживаем только ранние слои (более консервативно)
+            for name, param in self.shared_backbone.named_parameters():
+                if 'conv1' in name or 'conv2' in name or 'bn1' in name or 'bn2' in name:
+                    param.requires_grad = False
+            # Поздние слои остаются обучаемыми (но с регуляризацией)
+        else:
+            # Стандартное замораживание: все веса backbone
+            for param in self.shared_backbone.parameters():
+                param.requires_grad = False
         
         # Замораживаем все старые головы кроме последней
         for i in range(len(self.heads) - 1):
             for param in self.heads[i].parameters():
                 param.requires_grad = False
+        
+        # Сохраняем снимок для Subjective Time Critic
+        if self.use_subjective_time:
+            self.ref_backbone = copy.deepcopy(self.shared_backbone)
+            self.ref_backbone.eval()
+            for p in self.ref_backbone.parameters():
+                p.requires_grad = False
     
     def _set_bn_train(self, train: bool):
         """Переключает только BN модули в train/eval, остальное не трогает"""
