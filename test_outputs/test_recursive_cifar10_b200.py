@@ -986,12 +986,11 @@ def run_drone_simulation():
         print("[SLEEP] Teacher ready for dream supervision")
     
     # Вычисляем фиксированные веса классов для class-balanced loss (один раз по датасету)
-    class_weights_phase2 = None
-    if use_subjective_time:  # только если будем использовать в Phase2
-        print("[PHASE2] Computing class weights for balanced loss...")
-        class_weights_phase2 = compute_class_weights_from_dataset(train_B.dataset, num_classes=10, beta=0.9999)
-        class_weights_phase2 = class_weights_phase2.to(device)
-        print(f"[PHASE2] Class weights: {class_weights_phase2.cpu().numpy()}")
+    # Используем train_B (Subset), а не train_B.dataset (полный CIFAR10)
+    print("[PHASE2] Computing class weights for balanced loss...")
+    class_weights_phase2 = compute_class_weights_from_dataset(train_B, num_classes=10, beta=0.9999)
+    class_weights_phase2 = class_weights_phase2.to(device)
+    print(f"[PHASE2] Class weights: {class_weights_phase2.cpu().numpy()}")
 
     expansion_count = 0
     last_expansion_step = -1000
@@ -1109,59 +1108,60 @@ def run_drone_simulation():
                     if not is_diverse:
                         print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
                         print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts. Skipping expansion (but continuing training).")
-                        # НЕ делаем continue - обучение продолжается, просто без expansion
-                    
-                    print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
-                    
-                    # Берем первый уверенный ответ для логирования
-                    best_idx, best_label, conf = agent.curiosity.what_is_this(data[0:1])
-                    if best_idx is not None and conf > CLIP_TRUST_THRESHOLD:
-                        print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}' (one of {len(detected_classes)} detected)")
-                        print(f"[ADAPTATION] Triggering Phase Transition with diverse concepts: {sorted(detected_classes)}...")
-
-                        with torch.no_grad():
-                            agent.eval()
-                            mo = agent(data[0:1])
-                            agent.train()
-                            mp = torch.softmax(mo[:, :10], dim=1)
-                            model_conf, model_pred = mp.max(dim=1)
-                            model_entropy = float((-torch.sum(mp * torch.log(mp + 1e-9), dim=1)).item())
-                            print(f"[LOG] Model confidence: {float(model_conf.item()):.3f}, Entropy: {model_entropy:.3f}")
-
-                            agent.record_conflict(
-                                confidence_model=float(model_conf.item()),
-                                entropy_model=model_entropy,
-                                clip_class=best_idx,
-                                clip_label=best_label,
-                                clip_conf=conf,
-                                image=data[0:1],
-                                true_label=int(target[0].item()) if target.numel() > 0 else None,
-                            )
-
-                        new_head = agent.expand(
-                            new_classes_indices=classes_B,
-                            use_fractal_time=use_fractal_time,
-                            train_late_backbone=train_late_backbone,
-                        )
-                        agent.recalibrate_bn(loader_B, device, num_batches=20)
-
-                        optimizer_phase2 = build_phase2_optimizer(new_head)
-                        
-                        # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
-                        for pg in optimizer_phase2.param_groups:
-                            pg["lr_base"] = pg["lr"]
-
-                        steps_already_done = 0
-                        remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
-                        scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
-
-                        expansion_count += 1
-                        last_expansion_step = step
-                        # Сохраняем фактическое разнообразие (может быть > CLIP_MIN_DIVERSITY)
-                        clip_diversity_at_expansion = len(detected_classes)
-                        # ref_backbone уже создан в agent.expand()
                     else:
-                        print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
+                        print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
+                        
+                        # Берем первый уверенный ответ для логирования
+                        best_idx, best_label, conf = agent.curiosity.what_is_this(data[0:1])
+                        if best_idx is not None and conf > CLIP_TRUST_THRESHOLD:
+                            print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}' (one of {len(detected_classes)} detected)")
+                            print(f"[ADAPTATION] Triggering Phase Transition with diverse concepts: {sorted(detected_classes)}...")
+
+                            with torch.no_grad():
+                                agent.eval()
+                                mo = agent(data[0:1])
+                                agent.train()
+                                mp = torch.softmax(mo[:, :10], dim=1)
+                                model_conf, model_pred = mp.max(dim=1)
+                                model_entropy = float((-torch.sum(mp * torch.log(mp + 1e-9), dim=1)).item())
+                                print(f"[LOG] Model confidence: {float(model_conf.item()):.3f}, Entropy: {model_entropy:.3f}")
+
+                                agent.record_conflict(
+                                    confidence_model=float(model_conf.item()),
+                                    entropy_model=model_entropy,
+                                    clip_class=best_idx,
+                                    clip_label=best_label,
+                                    clip_conf=conf,
+                                    image=data[0:1],
+                                    true_label=int(target[0].item()) if target.numel() > 0 else None,
+                                )
+
+                            new_head = agent.expand(
+                                new_classes_indices=classes_B,
+                                use_fractal_time=use_fractal_time,
+                                train_late_backbone=train_late_backbone,
+                            )
+                            agent.recalibrate_bn(loader_B, device, num_batches=20)
+
+                            optimizer_phase2 = build_phase2_optimizer(new_head)
+                            
+                            # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
+                            for pg in optimizer_phase2.param_groups:
+                                pg["lr_base"] = pg["lr"]
+                                # Сохраняем scheduler_factor для правильного масштабирования
+                                pg["scheduler_factor"] = 1.0  # начальное значение
+
+                            steps_already_done = 0
+                            remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
+                            scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
+
+                            expansion_count += 1
+                            last_expansion_step = step
+                            # Сохраняем фактическое разнообразие (может быть > CLIP_MIN_DIVERSITY)
+                            clip_diversity_at_expansion = len(detected_classes)
+                            # ref_backbone уже создан в agent.expand()
+                        else:
+                            print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
             elif is_shock and not can_expand and (step % 50 == 0):
                 remaining = COOLDOWN_STEPS - (step - last_expansion_step)
                 print(f"[COOLDOWN] Shock detected but refractory period ({remaining} steps)")
@@ -1477,6 +1477,7 @@ def run_drone_simulation():
             if scheduler_phase2 is not None:
                 scheduler_phase2.step()
                 # LR scaling применяется ПОСЛЕ scheduler (чтобы не перетиралось)
+                # ВАЖНО: масштабируем от scheduler значения, а не итеративно умножаем
                 if expansion_count > 0:
                     steps_since_expand = step - last_expansion_step
                     if steps_since_expand < WARMUP_STEPS:
@@ -1497,9 +1498,28 @@ def run_drone_simulation():
                                 warmup_mult = lr_warmup_mult_backbone
                             else:
                                 warmup_mult = 1.0
-                            # Применяем к текущему LR (после scheduler)
+                            
+                            # Масштабируем от lr_base (базовое значение) с учетом scheduler
+                            # scheduler уже изменил pg["lr"], но мы вычисляем от lr_base
+                            # Получаем текущее scheduler значение через lr_base и прогресс scheduler
+                            # Проще: используем scheduler_factor для отслеживания текущего множителя scheduler
+                            if "scheduler_factor" not in pg:
+                                pg["scheduler_factor"] = 1.0
+                            
+                            # Вычисляем новое scheduler_factor на основе текущего LR и lr_base
+                            # Если scheduler изменил LR, то scheduler_factor = pg["lr"] / pg["lr_base"]
+                            # Но мы хотим применить наши множители к scheduler значению
+                            # Поэтому: new_lr = lr_base * scheduler_factor * base_scale * warmup_mult
+                            # Где scheduler_factor обновляется каждый шаг из текущего pg["lr"] / lr_base
+                            
+                            # Обновляем scheduler_factor из текущего LR (после scheduler.step())
+                            current_scheduler_factor = pg["lr"] / pg["lr_base"] if pg["lr_base"] > 0 else 1.0
+                            pg["scheduler_factor"] = current_scheduler_factor
+                            
+                            # Применяем наши множители к базовому LR с учетом scheduler
+                            new_lr = pg["lr_base"] * current_scheduler_factor * base_scale * warmup_mult
+                            
                             # Проверка на разумность LR перед применением
-                            new_lr = pg["lr"] * base_scale * warmup_mult
                             if torch.isfinite(torch.tensor([new_lr])) and 1e-8 < new_lr < 1.0:
                                 pg["lr"] = new_lr
                             # Иначе оставляем LR от scheduler
