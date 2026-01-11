@@ -1112,6 +1112,8 @@ def run_drone_simulation():
                     if not is_diverse:
                         print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
                         print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts. Skipping expansion (but continuing training).")
+                        # КРИТИЧНО: не продолжаем к expansion, если diversity check не пройден
+                        # Обучение продолжается, но expansion пропускается
                     else:
                         print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
                         
@@ -1208,7 +1210,17 @@ def run_drone_simulation():
                         continue
 
                 # Supervised loss на real данных
-                loss_new = criterion_train(outputs[:real_B, :10], target_real)
+                # Используем class-balanced loss если веса вычислены (только в Phase2 после expansion)
+                if expansion_count > 0 and class_weights_phase2 is not None:
+                    # Проверка на валидность весов
+                    if torch.isfinite(class_weights_phase2).all() and (class_weights_phase2 > 0).all():
+                        loss_new = class_balanced_loss(outputs[:real_B, :10], target_real, class_weights_phase2, num_classes=10)
+                    else:
+                        # Fallback на обычный loss если веса проблемные
+                        loss_new = criterion_train(outputs[:real_B, :10], target_real)
+                else:
+                    # Phase1 или если веса не вычислены - используем обычный loss
+                    loss_new = criterion_train(outputs[:real_B, :10], target_real)
                 
                 # Distillation loss на dreams (сон с удержанием структуры)
                 loss_dream = 0.0
@@ -1479,7 +1491,14 @@ def run_drone_simulation():
 
             # Scheduler step (ВАЖНО: после optimizer.step())
             if scheduler_phase2 is not None:
+                # КРИТИЧНО: сохраняем LR ДО scheduler.step() для правильного масштабирования
+                lr_before_scheduler = {}
+                for pg in optimizer_phase2.param_groups:
+                    if "lr_base" in pg:
+                        lr_before_scheduler[id(pg)] = pg["lr"]
+                
                 scheduler_phase2.step()
+                
                 # LR scaling применяется ПОСЛЕ scheduler (чтобы не перетиралось)
                 # ВАЖНО: масштабируем от scheduler значения, а не итеративно умножаем
                 if expansion_count > 0:
@@ -1503,25 +1522,12 @@ def run_drone_simulation():
                             else:
                                 warmup_mult = 1.0
                             
-                            # Масштабируем от lr_base (базовое значение) с учетом scheduler
-                            # scheduler уже изменил pg["lr"], но мы вычисляем от lr_base
-                            # Получаем текущее scheduler значение через lr_base и прогресс scheduler
-                            # Проще: используем scheduler_factor для отслеживания текущего множителя scheduler
-                            if "scheduler_factor" not in pg:
-                                pg["scheduler_factor"] = 1.0
+                            # КРИТИЧНО: используем LR после scheduler.step() как базовое значение
+                            # scheduler уже изменил pg["lr"], это и есть текущее scheduler значение
+                            scheduler_lr = pg["lr"]  # это значение после scheduler.step()
                             
-                            # Вычисляем новое scheduler_factor на основе текущего LR и lr_base
-                            # Если scheduler изменил LR, то scheduler_factor = pg["lr"] / pg["lr_base"]
-                            # Но мы хотим применить наши множители к scheduler значению
-                            # Поэтому: new_lr = lr_base * scheduler_factor * base_scale * warmup_mult
-                            # Где scheduler_factor обновляется каждый шаг из текущего pg["lr"] / lr_base
-                            
-                            # Обновляем scheduler_factor из текущего LR (после scheduler.step())
-                            current_scheduler_factor = pg["lr"] / pg["lr_base"] if pg["lr_base"] > 0 else 1.0
-                            pg["scheduler_factor"] = current_scheduler_factor
-                            
-                            # Применяем наши множители к базовому LR с учетом scheduler
-                            new_lr = pg["lr_base"] * current_scheduler_factor * base_scale * warmup_mult
+                            # Применяем наши множители к scheduler значению (не итеративно!)
+                            new_lr = scheduler_lr * base_scale * warmup_mult
                             
                             # Проверка на разумность LR перед применением
                             if torch.isfinite(torch.tensor([new_lr])) and 1e-8 < new_lr < 1.0:
