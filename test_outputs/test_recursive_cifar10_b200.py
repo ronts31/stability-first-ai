@@ -930,6 +930,112 @@ class SoftRoutingGate(nn.Module):
         return gates
 
 
+class TimeMixer(nn.Module):
+    """
+    Time Mixer - сглаживает переходы между фазами через миксование временных репрезентаций.
+    
+    Решает проблемы:
+    1. Сглаживание "Шока" (Gradient Spikes) - плавное вытеснение старых признаков новыми
+    2. Решение "Frog Collapse" (Mode Collapse) - регуляризация через совместимость со старыми знаниями
+    3. Улучшение Lazarus v3 - миксование временных репрезентаций во время сна
+    
+    Хранит M последних состояний (EMA) и смешивает их с текущими features через обучаемые веса.
+    """
+    def __init__(self, feature_dim, memory_size=5, ema_decay=0.9):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.memory_size = memory_size
+        self.ema_decay = ema_decay
+        
+        # Обучаемые веса для смешивания временных слоев
+        self.mix_weights = nn.Parameter(torch.ones(memory_size + 1) / (memory_size + 1))  # +1 для текущего состояния
+        
+        # EMA буферы для хранения прошлых состояний (не обучаемые)
+        self.register_buffer('memory_buffer', torch.zeros(memory_size, feature_dim))
+        self.register_buffer('memory_count', torch.zeros(memory_size))
+        
+        # Сеть для адаптивного смешивания (опционально)
+        self.adaptive_mixer = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, memory_size + 1),
+            nn.Softmax(dim=-1)
+        )
+    
+    def update_memory(self, features):
+        """
+        Обновляет память прошлых состояний через EMA.
+        
+        Args:
+            features: [B, feature_dim] - текущие features (берём среднее по батчу)
+        """
+        if not self.training:
+            return
+        
+        # Берём среднее по батчу для обновления памяти
+        current_mean = features.mean(dim=0).detach()  # [feature_dim]
+        
+        # Сдвигаем память: новое состояние в начало, старые сдвигаются
+        self.memory_buffer = torch.cat([
+            current_mean.unsqueeze(0),  # новое состояние
+            self.memory_buffer[:-1]  # старые состояния (сдвиг)
+        ], dim=0)
+        
+        # Обновляем счётчики (для взвешенного EMA)
+        self.memory_count = torch.cat([
+            torch.ones(1, device=features.device),
+            self.memory_count[:-1] * self.ema_decay
+        ], dim=0)
+    
+    def forward(self, features, use_adaptive=True):
+        """
+        Смешивает текущие features с прошлыми состояниями.
+        
+        Args:
+            features: [B, feature_dim] - текущие features из backbone
+            use_adaptive: bool - использовать адаптивное смешивание или фиксированные веса
+        
+        Returns:
+            mixed_features: [B, feature_dim] - смешанные features
+        """
+        B = features.size(0)
+        
+        # Подготавливаем все состояния для смешивания
+        # [current, memory[0], memory[1], ..., memory[M-1]]
+        states = [features]  # текущее состояние
+        
+        # Добавляем прошлые состояния (повторяем для каждого элемента батча)
+        for i in range(self.memory_size):
+            if self.memory_count[i] > 0:  # если память инициализирована
+                memory_state = self.memory_buffer[i].unsqueeze(0).expand(B, -1)  # [B, feature_dim]
+                states.append(memory_state)
+            else:
+                # Если память не инициализирована, используем текущие features
+                states.append(features)
+        
+        # Объединяем все состояния
+        all_states = torch.stack(states, dim=1)  # [B, M+1, feature_dim]
+        
+        # Вычисляем веса смешивания
+        if use_adaptive and self.training:
+            # Адаптивное смешивание на основе текущих features
+            mix_logits = self.adaptive_mixer(features)  # [B, M+1]
+            mix_weights = mix_logits
+        else:
+            # Фиксированные веса (обучаемые параметры)
+            mix_weights = torch.softmax(self.mix_weights, dim=0)  # [M+1]
+            mix_weights = mix_weights.unsqueeze(0).expand(B, -1)  # [B, M+1]
+        
+        # Смешиваем состояния
+        mixed_features = torch.sum(all_states * mix_weights.unsqueeze(-1), dim=1)  # [B, feature_dim]
+        
+        # Обновляем память (только во время обучения)
+        if self.training:
+            self.update_memory(features)
+        
+        return mixed_features
+
+
 # КРИТИЧНО: Complexity Controller - единый метаконтроллер для управления временем и рекурсией
 class ComplexityController:
     """
@@ -1185,6 +1291,11 @@ class RecursiveAgent(nn.Module):
 
         self.sensor = ComplexitySensor()
         self.active_classes_per_column = {}
+        
+        # КРИТИЧНО: Time Mixer - сглаживает переходы между фазами
+        self.use_time_mixer = True
+        if self.use_time_mixer:
+            self.time_mixer = TimeMixer(feature_dim=self.hidden_size, memory_size=5, ema_decay=0.9)
         
         # КРИТИЧНО: Soft routing вместо жёсткого маскирования
         self.use_soft_routing = True  # можно отключить для обратной совместимости
@@ -1676,6 +1787,9 @@ class RecursiveAgent(nn.Module):
                     teacher_routing_confidence = None
                     if self.use_soft_routing and len(teacher_model.heads) > 1 and hasattr(teacher_model, 'routing_gate'):
                         teacher_features = teacher_model.shared_backbone(noise)
+                        # КРИТИЧНО: Time Mixer для teacher - используем временные репрезентации
+                        if teacher_model.use_time_mixer and hasattr(teacher_model, 'time_mixer'):
+                            teacher_features = teacher_model.time_mixer(teacher_features, use_adaptive=False)  # фиксированные веса для teacher
                         teacher_gates_full = teacher_model.routing_gate(teacher_features)  # [B, MAX_LAYERS]
                         teacher_gates = teacher_gates_full[:, :len(teacher_model.heads)]  # [B, H]
                         teacher_gates = teacher_gates / (teacher_gates.sum(dim=1, keepdim=True) + 1e-9)
@@ -1684,6 +1798,10 @@ class RecursiveAgent(nn.Module):
                 
                 # Студент предсказывает
                 backbone_features = self.shared_backbone(noise)
+                # КРИТИЧНО: Time Mixer для студента - миксование временных репрезентаций
+                # Это позволяет студенту выучить "инварианты" между машинами и животными
+                if self.use_time_mixer and hasattr(self, 'time_mixer'):
+                    backbone_features = self.time_mixer(backbone_features, use_adaptive=True)
                 student_logits, _ = student_head(backbone_features, prev_hiddens=[])
                 student_probs = torch.softmax(student_logits[:, :10], dim=1)
                 
@@ -1786,6 +1904,12 @@ class RecursiveAgent(nn.Module):
 
     def forward(self, x, return_features=False):
         feats = self.shared_backbone(x)
+        
+        # КРИТИЧНО: Time Mixer - смешивает текущие features с прошлыми состояниями
+        # Это сглаживает переходы между фазами и предотвращает "шок" при смене среды
+        if self.use_time_mixer and hasattr(self, 'time_mixer'):
+            feats = self.time_mixer(feats, use_adaptive=True)  # [B, feature_dim]
+        
         hiddens = []
         
         # КРИТИЧНО: Soft routing вместо жёсткого маскирования
@@ -2649,6 +2773,12 @@ def run_drone_simulation():
             ig_params = list(agent.internal_goals.parameters())
             if len(ig_params) > 0:
                 param_groups.append({"params": ig_params, "lr": 1e-3, "tag": "internal_goals"})
+        
+        # КРИТИЧНО: Time Mixer - обучаем вместе с остальными компонентами
+        if agent.use_time_mixer and hasattr(agent, 'time_mixer') and agent.time_mixer is not None:
+            tm_params = list(agent.time_mixer.parameters())
+            if len(tm_params) > 0:
+                param_groups.append({"params": tm_params, "lr": 1e-3, "tag": "time_mixer"})
 
         opt = optim.AdamW(param_groups, weight_decay=1e-4)
         
