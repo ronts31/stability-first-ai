@@ -1501,8 +1501,8 @@ def run_drone_simulation():
                 fallback_expansion_attempted = True
                 print(f"\n[FALLBACK EXPANSION] {expansion_reason}")
                 print(f"[SAFETY] Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
-            elif expansion_count > 0 and actions is not None and actions["expand_allowed"]:
-                # КРИТИЧНО: Complexity Controller разрешает expansion
+            elif len(agent.heads) > 0 and actions is not None and actions["expand_allowed"]:
+                # КРИТИЧНО: Complexity Controller разрешает expansion (работает даже после sleep)
                 should_expand = True
                 expansion_reason = f"COMPLEXITY CONTROLLER (C={complexity:.3f} > 0.7, budget={agent.complexity_controller.complexity_budget:.3f})"
                 print(f"\n[COMPLEXITY EXPANSION] {expansion_reason}")
@@ -1636,9 +1636,11 @@ def run_drone_simulation():
 
             # КРИТИЧНО: Complexity Controller - предварительное вычисление для первого прохода
             # Используем приближение surprise из предыдущего шага (или entropy_test)
+            # КРИТИЧНО: работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
             complexity = 0.0
             actions = None
-            if expansion_count > 0:
+            # Complexity Controller работает если есть хотя бы один head (включая после sleep)
+            if len(agent.heads) > 0:
                 # Для первого прохода используем приближение: surprise ≈ 0.5 * entropy_test
                 surp_approx = 0.5 * entropy_test if entropy_test > 0 else 0.0
                 complexity = agent.complexity_controller.compute_complexity(
@@ -1764,7 +1766,8 @@ def run_drone_simulation():
                         surprise = None
                 
                 # КРИТИЧНО: обновляем complexity после вычисления surprise (для следующего шага)
-                if expansion_count > 0 and surprise is not None:
+                # Работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
+                if len(agent.heads) > 0 and surprise is not None:
                     surp_val = float(surprise.item())
                     complexity = agent.complexity_controller.compute_complexity(
                         surprise=surp_val,
@@ -2021,7 +2024,8 @@ def run_drone_simulation():
                     lr_warmup_mult_backbone = 1.0
                     cryst_strength_warmup_mult = 1.0
             
-            if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
+            # КРИТИЧНО: Time Crystallization работает даже после sleep (если есть ref_backbone)
+            if len(agent.heads) > 0 and use_subjective_time and agent.ref_backbone is not None:
                 surp_val = float(surprise.item()) if surprise is not None else 0.0
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
                 
@@ -2103,7 +2107,8 @@ def run_drone_simulation():
 
             # crystallization regularizer replaces old current_lambda * stability_loss
             reg_val = 0.0  # инициализация для диагностики
-            if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
+            # КРИТИЧНО: работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
+            if len(agent.heads) > 0 and use_subjective_time and agent.ref_backbone is not None:
                 cryst_reg = agent.crystallization_regularizer()
                 if cryst_reg != 0.0 and torch.isfinite(cryst_reg):
                     # КРИТИЧНО: base_strength уменьшен с 300 до 30 для предотвращения взрыва loss
@@ -2129,7 +2134,8 @@ def run_drone_simulation():
                             print(f"[WARNING] cryst_reg term is NaN/inf, skipping")
             
             # КРИТИЧНО: обновляем Complexity Budget на основе использованных действий
-            if expansion_count > 0 and actions is not None:
+            # Работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
+            if len(agent.heads) > 0 and actions is not None:
                 used_expansion = should_expand and has_budget
                 used_kl = (kl_loss != 0.0 and torch.isfinite(kl_loss))
                 agent.complexity_controller.update_budget(
@@ -2271,8 +2277,9 @@ def run_drone_simulation():
                 loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} U:{unknown_val:.3f} Reg:{reg_val:.2f}"
                 
                 # КРИТИЧНО: Complexity Controller статус
+                # Показываем даже после sleep (когда expansion_count может быть 0, но есть heads)
                 complexity_info = ""
-                if expansion_count > 0 and actions is not None:
+                if len(agent.heads) > 0 and actions is not None:
                     budget_status = agent.complexity_controller.get_budget_status()
                     complexity_info = f" | C:{complexity:.3f} R:{used_recursions} B:{budget_status['budget']:.2f} T:{actions['gate_temperature']:.2f}"
                 
