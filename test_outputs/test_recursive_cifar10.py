@@ -44,25 +44,52 @@ class ComplexitySensor:
 class TemporalColumn(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, prev_dims=[]):
         super().__init__()
-        # Для CIFAR нужен слой побольше
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.bn1 = nn.BatchNorm1d(hidden_size) # Добавляем BatchNorm для стабильности на фото
-        self.adapters = nn.ModuleList([nn.Linear(p, hidden_size) for p in prev_dims])
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2) # Еще один слой глубины
-        self.fc3 = nn.Linear(hidden_size // 2, output_size)
-        self.hidden_size = hidden_size
+        # A) CNN вместо MLP для CIFAR-10 (3-4 conv слоя + GAP + linear)
+        # CIFAR-10: 32x32x3
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(256)
+        self.conv4 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(512)
+        
+        # Global Average Pooling
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # Адаптеры для интеграции прошлых слоев
+        self.adapters = nn.ModuleList([nn.Linear(p, 512) for p in prev_dims])
+        
+        # Финальный классификатор
+        self.fc = nn.Linear(512, output_size)
+        self.hidden_size = 512
 
     def forward(self, x, prev_hiddens):
-        # x shape: [batch, 3072]
-        h = F.relu(self.bn1(self.fc1(x)))
+        # x shape: [batch, 3072] -> reshape to [batch, 3, 32, 32]
+        if x.dim() == 2:
+            x = x.view(-1, 3, 32, 32)
+        
+        # CNN backbone
+        h = F.relu(self.bn1(self.conv1(x)))
+        h = F.max_pool2d(h, 2)  # 32x32 -> 16x16
+        
+        h = F.relu(self.bn2(self.conv2(h)))
+        h = F.max_pool2d(h, 2)  # 16x16 -> 8x8
+        
+        h = F.relu(self.bn3(self.conv3(h)))
+        h = F.max_pool2d(h, 2)  # 8x8 -> 4x4
+        
+        h = F.relu(self.bn4(self.conv4(h)))
+        h = self.gap(h)  # 4x4 -> 1x1
+        h = h.view(h.size(0), -1)  # [batch, 512]
         
         # Интеграция прошлого
         for i, adapter in enumerate(self.adapters):
             if i < len(prev_hiddens):
                 h = h + adapter(prev_hiddens[i])
         
-        h2 = F.relu(self.fc2(h))
-        return self.fc3(h2), h
+        return self.fc(h), h
 
 # --- МОДУЛЬ ЛЮБОПЫТСТВА (ORACLE) ---
 class CuriosityModule:
@@ -78,10 +105,12 @@ class CuriosityModule:
         self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
         self.model.eval()
         
-        # CIFAR-10 классы в текстовом виде для CLIP
+        # D) Улучшенные промпты для CLIP ("a photo of..." обычно лучше)
         self.cifar10_concepts = [
-            "an airplane", "a car", "a bird", "a cat", "a deer",
-            "a dog", "a frog", "a horse", "a ship", "a truck"
+            "a photo of an airplane", "a photo of a car", "a photo of a bird", 
+            "a photo of a cat", "a photo of a deer", "a photo of a dog", 
+            "a photo of a frog", "a photo of a horse", "a photo of a ship", 
+            "a photo of a truck"
         ]
         
         # CLIP нормализация (ImageNet статистика)
@@ -133,11 +162,11 @@ class CuriosityModule:
 class RecursiveAgent(nn.Module):
     def __init__(self, use_curiosity=False):
         super().__init__()
-        self.input_size = 32 * 32 * 3 # 3072 (RGB картинка)
-        self.hidden_size = 512 # Увеличили емкость мозга
+        # A) CNN работает с изображениями напрямую, не нужен input_size
+        self.hidden_size = 512  # Размер скрытого представления после CNN
         self.output_size = 11  # 10 классов + 1 "unknown/ambiguous"
         
-        self.columns = nn.ModuleList([TemporalColumn(self.input_size, self.hidden_size, self.output_size)])
+        self.columns = nn.ModuleList([TemporalColumn(0, self.hidden_size, self.output_size)])
         self.sensor = ComplexitySensor()
         self.active_classes_per_column = {}
         
@@ -164,7 +193,7 @@ class RecursiveAgent(nn.Module):
     def expand(self, new_classes_indices):
         self.freeze_past()
         prev_dims = [c.hidden_size for c in self.columns]
-        new_col = TemporalColumn(self.input_size, self.hidden_size, self.output_size, prev_dims)
+        new_col = TemporalColumn(0, self.hidden_size, self.output_size, prev_dims)
         
         # Переносим на то же устройство (GPU/CPU), где живет агент
         device = next(self.parameters()).device
@@ -215,21 +244,41 @@ class RecursiveAgent(nn.Module):
         }
     
     def get_clip_soft_targets(self, images):
-        """2️⃣ Получаем soft targets от CLIP для использования как teacher"""
+        """2️⃣ Получаем soft targets от CLIP для использования как teacher (D: батчевый проход)"""
         if not self.use_curiosity:
             return None
         
         device = images.device
-        probs_list = []
-        for i in range(images.size(0)):
-            _, _, _, probs = self.curiosity.what_is_this(images[i:i+1], return_probs=True)
-            if probs is None:
-                probs = torch.full((10,), 0.1, device=device)
-            else:
-                probs = probs.to(device)  # Убираем .cpu() для скорости
-            probs_list.append(probs)
+        batch_size = images.size(0)
         
-        return torch.stack(probs_list).to(device)  # [B,10] prob distribution
+        # D) Батчевый проход вместо цикла (оптимизированная версия)
+        try:
+            # Подготавливаем все изображения сразу (батчевая обработка)
+            # images: [B, 3, 32, 32] -> [B, 3, 224, 224]
+            images_batch = images.to(device)
+            # Применяем нормализацию и ресайз ко всему батчу сразу
+            images_batch = images_batch * 0.5 + 0.5  # [-1,1] -> [0,1]
+            images_batch = torch.clamp(images_batch, 0, 1)
+            images_prep = F.interpolate(images_batch, size=(224, 224), mode='bilinear', align_corners=False)
+            images_prep = (images_prep - self.curiosity.clip_mean) / self.curiosity.clip_std
+            
+            with torch.no_grad():
+                logits_per_image, _ = self.curiosity.model(images_prep, self.curiosity.text_inputs)
+                probs = logits_per_image.softmax(dim=-1)  # [B, 10]
+            
+            return probs.to(device)
+        except Exception as e:
+            print(f"[WARNING] Batch CLIP failed: {e}, falling back to per-image")
+            # Fallback на старый метод
+            probs_list = []
+            for i in range(batch_size):
+                _, _, _, probs = self.curiosity.what_is_this(images[i:i+1], return_probs=True)
+                if probs is None:
+                    probs = torch.full((10,), 0.1, device=device)
+                else:
+                    probs = probs.to(device)
+                probs_list.append(probs)
+            return torch.stack(probs_list).to(device)
     
     def dream_and_compress(self, num_dreams=1000, dream_batch_size=100):
         """
@@ -247,7 +296,7 @@ class RecursiveAgent(nn.Module):
         
         # 1. Создаем "Студента" - одну компактную сеть
         # Она должна быть такой же мощной, как сумма всех прошлых слоев
-        student = TemporalColumn(self.input_size, self.hidden_size * 2, self.output_size).to(device)
+        student = TemporalColumn(0, self.hidden_size * 2, self.output_size).to(device)
         optimizer = optim.Adam(student.parameters(), lr=0.001)
         
         # 2. Генерируем сны (Псевдо-данные)
@@ -261,8 +310,8 @@ class RecursiveAgent(nn.Module):
             total_loss = 0
             
             for dream_batch in range(num_dreams // dream_batch_size):
-                # Генерируем "Белый шум" (сны)
-                noise = torch.randn(dream_batch_size, self.input_size).to(device)
+                # Генерируем "Белый шум" (сны) - для CNN это изображения
+                noise = torch.randn(dream_batch_size, 3, 32, 32).to(device)
                 
                 # Спрашиваем у текущего Мозга (всех слоев): "Что ты видишь в этом шуме?"
                 with torch.no_grad():
@@ -297,14 +346,14 @@ class RecursiveAgent(nn.Module):
         return "Knowledge Compressed!"
 
     def forward(self, x, raw_image=None, return_curiosity_info=False):
-        x_flat = x.view(-1, 3072) # Flatten
+        # A) CNN работает с изображениями напрямую (x уже [B, 3, 32, 32])
         hiddens = []
         final_logits = torch.zeros(x.size(0), self.output_size).to(x.device)
         
         curiosity_info = None
         
         for i, col in enumerate(self.columns):
-            out, h = col(x_flat, hiddens)
+            out, h = col(x, hiddens)
             hiddens.append(h)
             
             if i in self.active_classes_per_column:
@@ -352,7 +401,16 @@ class RecursiveAgent(nn.Module):
 
 # --- 2. ДАННЫЕ: МАШИНЫ vs ПРИРОДА ---
 def get_cifar_split():
-    transform = transforms.Compose([
+    # B) Аугментации для обучения
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    # Без аугментаций для теста
+    test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
@@ -361,8 +419,8 @@ def get_cifar_split():
     import sys
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_path = os.path.join(project_root, 'data')
-    train_full = datasets.CIFAR10(data_path, train=True, download=True, transform=transform)
-    test_full = datasets.CIFAR10(data_path, train=False, transform=transform)
+    train_full = datasets.CIFAR10(data_path, train=True, download=True, transform=train_transform)
+    test_full = datasets.CIFAR10(data_path, train=False, transform=test_transform)
 
     # CIFAR-10 Классы:
     # 0:Plane, 1:Car, 8:Ship, 9:Truck (ТЕХНИКА)
