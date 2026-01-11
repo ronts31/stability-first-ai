@@ -6,3 +6,4 @@ torchvision
 numpy
 transformers
 matplotlib
+scikit-learn  # Optional: for latent space visualization (t-SNE/PCA) in test_recursive_cifar10_b200.py
