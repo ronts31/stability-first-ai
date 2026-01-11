@@ -584,7 +584,8 @@ class SelfModel(nn.Module):
         )
         
         # EMA для внутренних метрик (targets для обучения)
-        self.ema_capabilities = torch.zeros(num_heads)  # будет обновляться в training loop
+        # КРИТИЧНО: инициализируем как None, будет создан динамически при первом обновлении
+        self.ema_capabilities = None  # будет создан при первом update_ema_targets
         self.ema_confidence = 0.0
         self.ema_weakness = 0.0
         self.ema_momentum = 0.99
@@ -636,6 +637,23 @@ class SelfModel(nn.Module):
             actual_confidence: float - реальная уверенность (калибровка)
             actual_weakness: float - реальная слабость (surprise + pain + entropy)
         """
+        # КРИТИЧНО: создаём ema_capabilities при первом обновлении с правильным размером
+        if self.ema_capabilities is None:
+            self.ema_capabilities = actual_capabilities.clone()
+        else:
+            # Проверяем размерность и расширяем если нужно
+            if self.ema_capabilities.size(0) < actual_capabilities.size(0):
+                # Расширяем: добавляем новые heads с начальным значением
+                new_size = actual_capabilities.size(0)
+                old_size = self.ema_capabilities.size(0)
+                expanded = torch.zeros(new_size, device=self.ema_capabilities.device, dtype=self.ema_capabilities.dtype)
+                expanded[:old_size] = self.ema_capabilities
+                expanded[old_size:] = 0.5  # начальное значение для новых heads
+                self.ema_capabilities = expanded
+            elif self.ema_capabilities.size(0) > actual_capabilities.size(0):
+                # Обрезаем до текущего размера
+                self.ema_capabilities = self.ema_capabilities[:actual_capabilities.size(0)]
+        
         self.ema_capabilities = (
             self.ema_momentum * self.ema_capabilities + 
             (1 - self.ema_momentum) * actual_capabilities
@@ -651,6 +669,13 @@ class SelfModel(nn.Module):
     
     def get_targets(self):
         """Возвращает текущие targets для обучения"""
+        # КРИТИЧНО: если ema_capabilities ещё не инициализирован, возвращаем None
+        if self.ema_capabilities is None:
+            return {
+                "capabilities": None,
+                "confidence": self.ema_confidence,
+                "weakness": self.ema_weakness
+            }
         return {
             "capabilities": self.ema_capabilities.clone(),
             "confidence": self.ema_confidence,
@@ -3008,12 +3033,23 @@ def run_drone_simulation():
                 weakness_pred = agent.self_model.detect_weakness(features[:real_B])
                 
                 ema_targets = agent.self_model.get_targets()
-                loss_self_cap = F.mse_loss(capabilities_pred.mean(dim=0), ema_targets["capabilities"].to(features.device))
+                loss_self_model = torch.zeros((), device=device, dtype=torch.float32)
+                
+                # КРИТИЧНО: проверяем что capabilities target доступен
+                if ema_targets["capabilities"] is not None:
+                    # Берём только первые len(agent.heads) предсказаний
+                    num_heads = len(agent.heads)
+                    cap_pred_mean = capabilities_pred.mean(dim=0)[:num_heads]
+                    cap_target = ema_targets["capabilities"][:num_heads].to(features.device)
+                    if cap_pred_mean.size(0) == cap_target.size(0):
+                        loss_self_cap = F.mse_loss(cap_pred_mean, cap_target)
+                        loss_self_model = loss_self_model + loss_self_cap
+                
                 loss_self_conf = F.mse_loss(confidence_pred.mean(), torch.tensor(ema_targets["confidence"], device=features.device))
                 loss_self_weak = F.mse_loss(weakness_pred.mean(), torch.tensor(ema_targets["weakness"], device=features.device))
+                loss_self_model = loss_self_model + loss_self_conf + loss_self_weak
                 
-                loss_self_model = loss_self_cap + loss_self_conf + loss_self_weak
-                if torch.isfinite(loss_self_model):
+                if torch.isfinite(loss_self_model) and loss_self_model.item() > 0:
                     total_loss = total_loss + 0.05 * loss_self_model
             
             # Записываем эпизод в автобиографическую память
