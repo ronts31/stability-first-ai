@@ -1087,14 +1087,18 @@ class ComplexityController:
         
         # Complexity Budget (закон сохранения сложности)
         self.complexity_budget = 1.0  # [0..1]
-        self.budget_recovery_rate = 0.015  # восстановление за шаг (увеличено для лучшего баланса)
+        self.base_recovery_rate = 0.020  # базовое восстановление за шаг (увеличено для стабильности)
         self.budget_decay_rate = 0.998  # медленное затухание
         
         # Стоимости действий (уменьшены для баланса с recovery_rate)
-        self.cost_recursion = 0.015  # за один рекурсивный проход (ещё уменьшено)
+        self.cost_recursion = 0.012  # за один рекурсивный проход (уменьшено для баланса)
         self.cost_replay = 0.003  # за единицу replay_ratio (ещё уменьшено)
         self.cost_kl = 0.008  # за KL distillation (ещё уменьшено)
         self.cost_expansion = 0.30  # за expansion (оставляем высоким, т.к. это редкое событие)
+        
+        # История complexity для динамического баланса
+        self.recent_complexity = []  # последние N значений complexity
+        self.max_recent_complexity = 20  # размер окна для вычисления динамического recovery_rate
         
         # История для стабилизации
         self.complexity_history = []
@@ -1207,14 +1211,23 @@ class ComplexityController:
             "expand_allowed": expand_allowed,
         }
     
-    def update_budget(self, actions, used_expansion=False, used_kl=False):
+    def update_budget(self, actions, used_expansion=False, used_kl=False, current_complexity=None, pain_value=None):
         """
         Обновляет complexity budget на основе использованных действий.
+        
+        КРИТИЧНО: Динамический баланс - recovery_rate зависит от темпа поступления новых данных.
+        При высокой complexity (много новых данных) - быстрее восстанавливаем budget.
+        При низкой complexity (мало новых данных) - медленнее восстанавливаем.
+        
+        КРИТИЧНО: Регуляция "Эмоционального резонанса" - при высокой pain (>0.8) замедляем recovery,
+        чтобы система "болела" дольше и тратила больше ресурсов на рекурсию для решения проблем.
         
         Args:
             actions: dict от get_actions()
             used_expansion: bool - был ли использован expansion
             used_kl: bool - был ли использован KL distillation
+            current_complexity: float - текущая complexity (опционально, для динамического баланса)
+            pain_value: float - текущий уровень pain (опционально, для эмоциональной регуляции)
         """
         # Расходуем budget на действия
         cost = 0.0
@@ -1228,8 +1241,34 @@ class ComplexityController:
         # Тратим budget
         self.complexity_budget = max(0.0, self.complexity_budget - cost)
         
-        # Восстанавливаем budget (медленно)
-        self.complexity_budget = min(1.0, self.complexity_budget + self.budget_recovery_rate)
+        # КРИТИЧНО: Динамический recovery_rate в зависимости от темпа поступления новых данных
+        if current_complexity is not None:
+            # Обновляем историю complexity
+            self.recent_complexity.append(current_complexity)
+            if len(self.recent_complexity) > self.max_recent_complexity:
+                self.recent_complexity.pop(0)
+            
+            # Вычисляем среднюю complexity за последние N шагов
+            avg_complexity = sum(self.recent_complexity) / len(self.recent_complexity) if self.recent_complexity else 0.5
+            
+            # Динамический recovery_rate: высокая complexity -> быстрее восстановление
+            # complexity [0..1] -> recovery_rate [0.01..0.03]
+            # При complexity=0.5 recovery_rate=base_recovery_rate
+            dynamic_recovery = self.base_recovery_rate * (0.5 + avg_complexity)  # [0.01..0.03]
+        else:
+            # Fallback: используем базовый recovery_rate
+            dynamic_recovery = self.base_recovery_rate
+        
+        # КРИТИЧНО: Регуляция "Эмоционального резонанса" - при высокой pain замедляем recovery
+        # Это позволяет системе "болеть" дольше и тратить больше ресурсов на рекурсию
+        # для решения проблем (например, Cat vs Dog)
+        if pain_value is not None and pain_value > 0.8:
+            # При pain > 0.8 уменьшаем recovery_rate: pain 0.8 -> mult=0.8, pain 1.0 -> mult=0.5
+            pain_multiplier = max(0.5, 1.0 - (pain_value - 0.8) * 1.5)  # [0.5..0.8] при pain [0.8..1.0]
+            dynamic_recovery = dynamic_recovery * pain_multiplier
+        
+        # Восстанавливаем budget с динамическим recovery_rate
+        self.complexity_budget = min(1.0, self.complexity_budget + dynamic_recovery)
     
     def get_budget_status(self):
         """Возвращает статус budget для логирования"""
@@ -2081,8 +2120,9 @@ class RecursiveAgent(nn.Module):
                                 predicted_confidence = self.self_model.estimate_confidence(features_after_zoom).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
                                 confidence_increase_step = predicted_confidence - current_confidence_step
                                 
-                                # Entropy reduction
+                                # Entropy reduction и контрастивное воображение
                                 entropy_reduction_step = 0.0
+                                contrastive_score = 0.0  # КРИТИЧНО: разница между топ-2 классами
                                 if len(self.heads) > 0:
                                     logits_after, _ = self.heads[0](features_after_zoom, prev_hiddens=[])
                                     logits_current_step, _ = self.heads[0](current_features, prev_hiddens=[])
@@ -2092,12 +2132,27 @@ class RecursiveAgent(nn.Module):
                                         entropy_after = -(probs_after * torch.log(probs_after + 1e-9)).sum(dim=1).mean().item()
                                         entropy_current_step = -(probs_current_step * torch.log(probs_current_step + 1e-9)).sum(dim=1).mean().item()
                                         entropy_reduction_step = entropy_current_step - entropy_after
+                                        
+                                        # КРИТИЧНО: Контрастивное воображение - выбираем патч, который максимально различает топ-2 класса
+                                        # Если модель сомневается между Cat и Dog, ищем патч (уши/нос), где разница максимальна
+                                        probs_current_mean = probs_current_step.mean(dim=0)  # [10] - средние вероятности по батчу
+                                        top2_values, top2_indices = torch.topk(probs_current_mean, k=2)
+                                        
+                                        # Вычисляем разницу между топ-2 классами до и после Zoom
+                                        diff_before = top2_values[0].item() - top2_values[1].item()  # разница до Zoom
+                                        probs_after_mean = probs_after.mean(dim=0)  # [10]
+                                        top2_after_values, _ = torch.topk(probs_after_mean, k=2)
+                                        diff_after = top2_after_values[0].item() - top2_after_values[1].item()  # разница после Zoom
+                                        
+                                        # Контрастивный score: увеличение разницы между топ-2 классами
+                                        contrastive_score = diff_after - diff_before  # положительное = хороший патч для различения
                                 
                                 # Комбинированный score для этого шага
                                 step_score = (
                                     1.0 * weakness_reduction_step +
                                     1.0 * confidence_increase_step +
-                                    0.5 * entropy_reduction_step
+                                    0.5 * entropy_reduction_step +
+                                    0.8 * contrastive_score  # КРИТИЧНО: контрастивное воображение для Cat vs Dog
                                 )
                                 
                                 # Если улучшение значительное, продолжаем цепочку
@@ -2125,8 +2180,31 @@ class RecursiveAgent(nn.Module):
                                                 weakness_candidate = self.self_model.detect_weakness(features_candidate).mean().item()
                                                 confidence_candidate = self.self_model.estimate_confidence(features_candidate).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
                                                 
-                                                # Быстрая оценка (только weakness и confidence для скорости)
-                                                candidate_score = (current_weakness_step - weakness_candidate) + 0.5 * (confidence_candidate - current_confidence_step)
+                                                # КРИТИЧНО: Контрастивное воображение для выбора следующего патча
+                                                contrastive_candidate = 0.0
+                                                if len(self.heads) > 0:
+                                                    logits_candidate, _ = self.heads[0](features_candidate, prev_hiddens=[])
+                                                    if logits_candidate is not None and logits_candidate.size(1) >= 10:
+                                                        probs_candidate = torch.softmax(logits_candidate[:, :10], dim=1)
+                                                        probs_candidate_mean = probs_candidate.mean(dim=0)  # [10]
+                                                        top2_candidate, _ = torch.topk(probs_candidate_mean, k=2)
+                                                        diff_candidate = top2_candidate[0].item() - top2_candidate[1].item()
+                                                        
+                                                        # Сравниваем с текущим состоянием
+                                                        logits_current_temp, _ = self.heads[0](current_features, prev_hiddens=[])
+                                                        if logits_current_temp is not None:
+                                                            probs_current_temp = torch.softmax(logits_current_temp[:, :10], dim=1)
+                                                            probs_current_temp_mean = probs_current_temp.mean(dim=0)
+                                                            top2_current_temp, _ = torch.topk(probs_current_temp_mean, k=2)
+                                                            diff_current_temp = top2_current_temp[0].item() - top2_current_temp[1].item()
+                                                            contrastive_candidate = diff_candidate - diff_current_temp
+                                                
+                                                # Быстрая оценка с контрастивным воображением
+                                                candidate_score = (
+                                                    (current_weakness_step - weakness_candidate) +
+                                                    0.5 * (confidence_candidate - current_confidence_step) +
+                                                    0.6 * contrastive_candidate  # контрастивный компонент
+                                                )
                                                 
                                                 if candidate_score > best_next_score:
                                                     best_next_score = candidate_score
@@ -3309,6 +3387,8 @@ def run_drone_simulation():
                 loss_world_model = torch.zeros((), device=device, dtype=torch.float32)
                 wm_error_signal = 0.0
                 action_idx = None
+                # Инициализируем trust factor по умолчанию (на случай если World Model не используется)
+                agent._world_model_trust = 1.0
                 # КРИТИЧНО: Warm-up для Active Imagination - необученная WorldModel это генератор галлюцинаций
                 # Сначала "насмотренность" (обучение на данных), затем "аналитика" (активное воображение)
                 # Проверяем weakness или счетчик шагов перед использованием WorldModel для управления вниманием
@@ -3372,9 +3452,27 @@ def run_drone_simulation():
                         loss_wm_kl = -0.5 * torch.sum(1 + next_z_logvar - next_z_mean.pow(2) - next_z_logvar.exp()) / features[:real_B].size(0)
                         loss_world_model = loss_wm_recon + 0.1 * loss_wm_kl
                         
+                        # КРИТИЧНО: "Инстинкт недоверия" к воображению на ранних этапах новой фазы
+                        # На ранних этапах World Model может генерировать галлюцинации
+                        # Уменьшаем доверие к её прогнозам до тех пор, пока она не "насмотрится" на новые данные
+                        world_model_trust = 1.0
+                        if phase2_steps < 200:  # первые 200 шагов Phase 2
+                            # Линейное увеличение доверия: 0 шагов -> 0.3, 200 шагов -> 1.0
+                            world_model_trust = 0.3 + 0.7 * (phase2_steps / 200.0)
+                        elif agent.use_self_model and weakness_signal is not None:
+                            # Дополнительная проверка через weakness: если weakness высокая, уменьшаем доверие
+                            if weakness_signal > 0.6:
+                                world_model_trust = max(0.5, world_model_trust * (1.0 - (weakness_signal - 0.6) * 0.5))
+                        
+                        # Сохраняем trust factor для использования при добавлении в total_loss
+                        agent._world_model_trust = world_model_trust
+                        
                         # World Model error для Complexity Controller
                         wm_error_signal = float(loss_wm_recon.item())
                         agent._last_wm_error = wm_error_signal
+                    else:
+                        # Если World Model не готова, trust = 0
+                        agent._world_model_trust = 0.0
                 
                 # 2. Goal-conditioned Policy: модифицируем actions на основе целей
                 if agent.use_internal_goals and actions is not None and len(agent.heads) > 0:
@@ -3786,13 +3884,18 @@ def run_drone_simulation():
 
             # КРИТИЧНО: Unknown-margin на ID данных - Unknown должен быть НИЖЕ known на реальных CIFAR-10
             # Это предотвращает доминирование Unknown (10000 предсказаний)
+            # Уменьшен вес с 0.2 до 0.05 для здоровой самокритичности (1-2% Unknown предсказаний)
             if isinstance(loss_unk_id, torch.Tensor) and loss_unk_id.item() != 0.0 and torch.isfinite(loss_unk_id):
-                total_loss = total_loss + 0.2 * loss_unk_id  # вес 0.1..0.3 для margin loss
+                total_loss = total_loss + 0.05 * loss_unk_id  # уменьшен с 0.2 до 0.05 для самокритичности
             
             # --- AGI Components Losses ---
             # World Model Loss
             if isinstance(loss_world_model, torch.Tensor) and loss_world_model.item() != 0.0 and torch.isfinite(loss_world_model):
-                total_loss = total_loss + 0.1 * loss_world_model
+                # КРИТИЧНО: "Инстинкт недоверия" - уменьшаем вес loss_world_model на ранних этапах
+                # Это предотвращает обучение на галлюцинациях необученной World Model
+                world_model_trust = getattr(agent, '_world_model_trust', 1.0)  # по умолчанию полное доверие
+                world_model_weight = 0.1 * world_model_trust  # базовый вес 0.1, умножаем на trust
+                total_loss = total_loss + world_model_weight * loss_world_model
             
             # Concept Reconstruction Loss
             if isinstance(loss_concept_recon, torch.Tensor) and loss_concept_recon.item() != 0.0 and torch.isfinite(loss_concept_recon):
@@ -3956,7 +4059,9 @@ def run_drone_simulation():
                 agent.complexity_controller.update_budget(
                     actions=actions,
                     used_expansion=used_expansion,
-                    used_kl=used_kl
+                    used_kl=used_kl,
+                    current_complexity=complexity if 'complexity' in locals() else None,  # передаём complexity для динамического баланса
+                    pain_value=pain_value if 'pain_value' in locals() else None  # передаём pain для эмоциональной регуляции
                 )
 
             # ---- critic update ----
