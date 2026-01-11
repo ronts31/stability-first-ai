@@ -1,6 +1,12 @@
 # Быстрый запуск на Runpod B200
 
-## Одна команда для запуска:
+## Одна команда для запуска (B200-оптимизированная версия):
+
+```bash
+cd /workspace && git clone https://github.com/vitali-sialedchyk/stability-first-ai.git 2>/dev/null || (cd stability-first-ai && git pull) && cd stability-first-ai/test_outputs && pip install -q git+https://github.com/openai/CLIP.git matplotlib numpy pillow torch torchvision && python test_recursive_cifar10_b200.py
+```
+
+## Одна команда для запуска (стандартная версия):
 
 ```bash
 cd /workspace && git clone https://github.com/vitali-sialedchyk/stability-first-ai.git 2>/dev/null || (cd stability-first-ai && git pull) && cd stability-first-ai/test_outputs && pip install -q git+https://github.com/openai/CLIP.git matplotlib numpy pillow torch torchvision && python test_recursive_cifar10.py
