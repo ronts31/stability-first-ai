@@ -1864,12 +1864,12 @@ def run_drone_simulation():
     train_late_backbone = True      # IMPORTANT: if True, include late backbone params into optimizer_phase2
     use_adaptive_pain = True
 
-    # AGI Components (опционально, можно включить для экспериментов)
-    use_world_model = False  # World Model: предсказание будущих состояний
-    use_internal_goals = False  # Внутренние цели: независимые от внешних наград
-    use_own_concepts = False  # Собственные концепты: генерируемые системой
-    use_autobiographical_memory = False  # Автобиографическая память: запись опыта
-    use_self_model = False  # Self Model: модель самого себя
+    # AGI Components (все включены для полной AGI-системы)
+    use_world_model = True  # World Model: предсказание будущих состояний
+    use_internal_goals = True  # Внутренние цели: независимые от внешних наград
+    use_own_concepts = True  # Собственные концепты: генерируемые системой
+    use_autobiographical_memory = True  # Автобиографическая память: запись опыта
+    use_self_model = True  # Self Model: модель самого себя
     
     agent = RecursiveAgent(
         use_curiosity=use_curiosity,
