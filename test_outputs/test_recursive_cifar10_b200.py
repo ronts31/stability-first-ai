@@ -3132,6 +3132,11 @@ def run_drone_simulation():
             data_real = data[:real_B]
             target_real = target[:real_B]
             
+            # КРИТИЧНО: В элегантном режиме получаем features_f32 из data_real (если еще не получены)
+            if agent.use_elegant_mode and features_f32 is None:
+                with torch.no_grad():
+                    _, features_f32, _ = agent.elegant_core(data_real[:min(64, real_B)].to(device), max_steps=1)
+            
             # КРИТИЧНО: перемещаем data_real и target_real на device сразу после создания
             # чтобы избежать проблем с device mismatch в pain-блоке
             data_real = data_real.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -3201,17 +3206,8 @@ def run_drone_simulation():
             
             # КРИТИЧНО: получаем features_f32 для AGI компонентов (нужно для expansion decision)
             # Делаем это раньше, чтобы использовать в блоке expansion
+            # В элегантном режиме features будут получены позже из data_real (после его определения)
             features_f32 = None
-            if agent.use_elegant_mode:
-                # В элегантном режиме features получаем из elegant_core
-                with torch.no_grad():
-                    _, features_f32, _ = agent.elegant_core(x[:1], max_steps=1)  # пример для получения features
-            elif len(agent.heads) > 0 and agent.shared_backbone is not None:
-                # Получаем features из текущего батча для AGI компонентов
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
-                    if features_temp is not None:
-                        features_f32 = features_temp[:min(64, real_B)].float()  # конвертируем в float32
             
             # КРИТИЧНО: для рекурсивной эмергенции - новые концепты будут храниться здесь
             expansion_new_classes = None  # будет установлено если CLIP обнаружит новые концепты
