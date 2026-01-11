@@ -206,6 +206,35 @@ class ExpandableHead(nn.Module):
         return self.fc(h), h
 
 
+# КРИТИЧНО: Soft Routing Gate для устойчивости к масштабированию
+class SoftRoutingGate(nn.Module):
+    """
+    Обучаемый gate для soft routing вместо жёсткого маскирования.
+    Позволяет системе "сшивать" навыки, а не только хранить их.
+    """
+    def __init__(self, feature_dim, num_heads, temperature=1.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.temperature = temperature
+        # Маленькая сеть для предсказания ответственности каждого head
+        self.gate_net = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_heads),
+        )
+    
+    def forward(self, features):
+        """
+        Args:
+            features: [B, feature_dim] - features из backbone
+        Returns:
+            gates: [B, num_heads] - soft weights для каждого head (sum=1)
+        """
+        logits = self.gate_net(features) / self.temperature
+        gates = torch.softmax(logits, dim=-1)  # [B, num_heads]
+        return gates
+
+
 # Compatibility column for sleep compression
 class TemporalColumn(nn.Module):
     def __init__(self, hidden_size, output_size, prev_dims=None):
@@ -292,6 +321,15 @@ class RecursiveAgent(nn.Module):
 
         self.sensor = ComplexitySensor()
         self.active_classes_per_column = {}
+        
+        # КРИТИЧНО: Soft routing вместо жёсткого маскирования
+        self.use_soft_routing = True  # можно отключить для обратной совместимости
+        self.routing_gate = SoftRoutingGate(feature_dim=self.hidden_size, num_heads=1)
+        
+        # Growth budget для устойчивого expansion
+        self.growth_budget = 1.0  # начальный budget
+        self.growth_budget_decay = 0.995  # медленный рост со временем
+        self.growth_cost_per_expansion = 0.3  # стоимость одного expansion
 
         self.use_curiosity = bool(use_curiosity and CLIP_AVAILABLE)
         if self.use_curiosity:
@@ -671,21 +709,39 @@ class RecursiveAgent(nn.Module):
     def forward(self, x, return_features=False):
         feats = self.shared_backbone(x)
         hiddens = []
-        logits_sum = torch.zeros(x.size(0), self.output_size, device=x.device)
+        
+        # КРИТИЧНО: Soft routing вместо жёсткого маскирования
+        if self.use_soft_routing and len(self.heads) > 1:
+            # Обновляем gate если количество heads изменилось
+            if self.routing_gate.num_heads != len(self.heads):
+                self.routing_gate = SoftRoutingGate(feature_dim=self.hidden_size, num_heads=len(self.heads)).to(feats.device)
+            
+            # Вычисляем gates для каждого head
+            gates = self.routing_gate(feats)  # [B, num_heads]
+            
+            # Собираем логиты от всех heads с soft weights
+            logits_sum = torch.zeros(x.size(0), self.output_size, device=x.device)
+            for i, head in enumerate(self.heads):
+                out, h = head(feats, hiddens)
+                hiddens.append(h)
+                # Soft routing: взвешенная сумма логитов
+                logits_sum = logits_sum + gates[:, i:i+1] * out
+        else:
+            # Fallback: жёсткое маскирование (для обратной совместимости)
+            logits_sum = torch.zeros(x.size(0), self.output_size, device=x.device)
+            for i, head in enumerate(self.heads):
+                out, h = head(feats, hiddens)
+                hiddens.append(h)
+                if i in self.active_classes_per_column:
+                    idx = self.active_classes_per_column[i]
+                    mask = torch.zeros_like(out)
+                    mask[:, idx] = 1.0
+                    logits_sum = logits_sum + out * mask
+                else:
+                    logits_sum = logits_sum + out
 
-        for i, head in enumerate(self.heads):
-            out, h = head(feats, hiddens)
-            hiddens.append(h)
-            if i in self.active_classes_per_column:
-                idx = self.active_classes_per_column[i]
-                mask = torch.zeros_like(out)
-                mask[:, idx] = 1.0
-                logits_sum = logits_sum + out * mask
-            else:
-                logits_sum = logits_sum + out
-
-        # Unknown heuristic (not trained)
-        # КРИТИЧНО: применяем только в eval режиме, чтобы не влиять на backprop при обучении
+        # Unknown класс теперь обучается (см. Outlier Exposure ниже)
+        # Эвристика применяется только в eval если unknown не обучен
         if not self.training:
             probs_known = torch.softmax(logits_sum[:, :10], dim=1)
             entropy = -torch.sum(probs_known * torch.log(probs_known + 1e-9), dim=1)
@@ -1160,6 +1216,11 @@ def run_drone_simulation():
                 param_groups.append({"params": mid, "lr": base_lr_mid, "tag": "mid"})
             if len(early):
                 param_groups.append({"params": early, "lr": base_lr_early, "tag": "early"})
+        
+        # КРИТИЧНО: добавляем routing gate в optimizer если используется soft routing
+        if agent.use_soft_routing and agent.routing_gate is not None:
+            gate_params = list(agent.routing_gate.parameters())
+            param_groups.append({"params": gate_params, "lr": 1e-3, "tag": "routing_gate"})
 
         opt = optim.AdamW(param_groups, weight_decay=1e-4)
         
@@ -1205,9 +1266,19 @@ def run_drone_simulation():
                 test_out = agent(data_real)
                 test_loss = criterion_train(test_out[:, :10], target_real)
                 
-                # Вычисляем accuracy для fallback механизма
+                # Вычисляем метрики для формализованного контроллера expansion
                 test_pred = test_out[:, :10].argmax(dim=1)
                 test_acc = float((test_pred == target_real).float().mean().item())
+                
+                # Вычисляем entropy и unknown_rate для контроллера
+                probs_test = torch.softmax(test_out[:, :10], dim=1)
+                entropy_test = -torch.sum(probs_test * torch.log(probs_test + 1e-9), dim=1).mean().item()
+                max_prob_test, _ = probs_test.max(dim=1)
+                unknown_rate_test = float(((max_prob_test < 0.18) | (entropy_test > 1.95)).float().mean().item())
+                
+                # Conflict rate (из буфера конфликтов)
+                conflict_stats = agent.get_conflict_statistics()
+                conflict_rate = conflict_stats["total_conflicts"] / max(1, agent.max_conflicts) if conflict_stats else 0.0
 
             # КРИТИЧНО: рекалибруем сенсор после первых 50 шагов Phase2
             if not sensor_recalibrated and step >= 50:
@@ -1215,14 +1286,32 @@ def run_drone_simulation():
                 sensor_recalibrated = True
                 print(f"[SENSOR] Phase2 baseline set. Mean={agent.sensor.mean:.3f}, Std={agent.sensor.std:.3f}")
 
+            # КРИТИЧНО: формализованный контроллер expansion вместо эвристик
             is_shock = agent.sensor.is_shock(float(test_loss.item()))
             can_expand = (step - last_expansion_step) > COOLDOWN_STEPS
             has_budget = len(agent.heads) < MAX_LAYERS
             
-            # КРИТИЧНО: fallback условия для expansion
-            # 1) Принудительный expansion после FORCE_EXPANSION_STEPS без expansion
+            # Обновляем growth_budget (медленный рост со временем)
+            agent.growth_budget = min(1.0, agent.growth_budget * agent.growth_budget_decay + 0.001)
+            has_growth_budget = agent.growth_budget >= agent.growth_cost_per_expansion
+            
+            # Формализованный контроллер: need_expand_score = w1*shock + w2*high_entropy + w3*unknown_rate + w4*conflict_rate
+            w1, w2, w3, w4 = 0.4, 0.2, 0.2, 0.2  # веса сигналов
+            shock_signal = 1.0 if is_shock else 0.0
+            high_entropy_signal = min(1.0, max(0.0, (entropy_test - 1.0) / 1.0))  # нормализуем [0..1]
+            unknown_rate_signal = unknown_rate_test  # уже [0..1]
+            conflict_rate_signal = conflict_rate  # уже [0..1]
+            
+            need_expand_score = (
+                w1 * shock_signal +
+                w2 * high_entropy_signal +
+                w3 * unknown_rate_signal +
+                w4 * conflict_rate_signal
+            )
+            EXPANSION_THRESHOLD = 0.5  # порог для expansion
+            
+            # Fallback условия (для обратной совместимости)
             force_expansion = (expansion_count == 0 and step >= FORCE_EXPANSION_STEPS and has_budget)
-            # 2) Fallback expansion: низкая accuracy + высокий loss (без CLIP diversity check)
             fallback_expansion = (
                 not fallback_expansion_attempted and 
                 can_expand and 
@@ -1231,7 +1320,7 @@ def run_drone_simulation():
                 float(test_loss.item()) > 2.0
             )
 
-            # КРИТИЧНО: триггеры для expansion (shock, fallback, или принудительный)
+            # КРИТИЧНО: формализованный контроллер expansion
             should_expand = False
             expansion_reason = ""
             detected_classes = set()
@@ -1246,6 +1335,12 @@ def run_drone_simulation():
                 fallback_expansion_attempted = True
                 print(f"\n[FALLBACK EXPANSION] {expansion_reason}")
                 print(f"[SAFETY] Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
+            elif need_expand_score > EXPANSION_THRESHOLD and can_expand and has_budget and has_growth_budget:
+                # Формализованный контроллер сработал
+                should_expand = True
+                expansion_reason = f"CONTROLLER (score={need_expand_score:.3f} > {EXPANSION_THRESHOLD:.2f}, signals: shock={shock_signal:.2f}, entropy={high_entropy_signal:.2f}, unknown={unknown_rate_signal:.2f}, conflict={conflict_rate_signal:.2f})"
+                print(f"\n[EXPANSION CONTROLLER] {expansion_reason}")
+                print(f"[GROWTH BUDGET] {agent.growth_budget:.3f} >= {agent.growth_cost_per_expansion:.3f}")
             elif is_shock and can_expand and has_budget:
                 print(f"\n[VISUAL CORTEX SHOCK] Loss {float(test_loss.item()):.2f} detected (High Surprise).")
                 print(f"[SAFETY] Cooldown OK, Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
@@ -1335,6 +1430,11 @@ def run_drone_simulation():
 
                 expansion_count += 1
                 last_expansion_step = step
+                # Тратим growth_budget
+                agent.growth_budget = max(0.0, agent.growth_budget - agent.growth_cost_per_expansion)
+                # Обновляем routing gate для нового количества heads
+                if agent.use_soft_routing:
+                    agent.routing_gate = SoftRoutingGate(feature_dim=agent.hidden_size, num_heads=len(agent.heads)).to(device)
                 # Сохраняем фактическое разнообразие (если было обнаружено CLIP)
                 if len(detected_classes) > 0:
                     clip_diversity_at_expansion = len(detected_classes)
@@ -1372,6 +1472,18 @@ def run_drone_simulation():
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 outputs, features = agent(data_mix, return_features=True)
                 
+                # КРИТИЧНО: Entropy penalty для стабилизации routing gates (если используется soft routing)
+                routing_entropy_loss = 0.0
+                if agent.use_soft_routing and len(agent.heads) > 1 and agent.routing_gate is not None:
+                    # Вычисляем entropy gates для стабилизации (предотвращаем коллапс к одному head)
+                    gates = agent.routing_gate(features[:real_B])  # [real_B, num_heads]
+                    # Entropy penalty: поощряем равномерное распределение ответственности
+                    gate_entropy = -torch.sum(gates * torch.log(gates + 1e-9), dim=1).mean()
+                    # Целевая entropy (максимальная для равномерного распределения)
+                    target_entropy = torch.log(torch.tensor(len(agent.heads), dtype=torch.float32, device=gates.device))
+                    # Penalty если entropy слишком низкая (коллапс к одному head)
+                    routing_entropy_loss = F.relu(target_entropy * 0.7 - gate_entropy)  # penalty если entropy < 70% от максимума
+                
                 # Проверка outputs на inf/nan
                 if not torch.isfinite(outputs).all():
                     print(f"[ERROR] outputs contains inf/nan at step {step}")
@@ -1394,6 +1506,40 @@ def run_drone_simulation():
                 else:
                     # Phase1 или если веса не вычислены - используем обычный loss
                     loss_new = criterion_train(outputs[:real_B, :10], target_real)
+                
+                # КРИТИЧНО: Outlier Exposure для обучения Unknown класса
+                # Смесь noise/dreams/реальных OOD → target=unknown
+                loss_unknown = 0.0
+                if expansion_count > 0:
+                    # Генерируем outliers: noise + dreams
+                    n_outliers = min(32, real_B // 4)  # 25% от real_B
+                    if n_outliers > 0:
+                        # Noise outliers
+                        noise_outliers = torch.randn(n_outliers, 3, 32, 32, device=device)
+                        noise_outliers = torch.tanh(noise_outliers * 0.5)  # нормализуем в [-1, 1]
+                        noise_outliers = noise_outliers.to(memory_format=torch.channels_last)
+                        
+                        # Forward на noise outliers (внутри того же autocast)
+                        out_noise = agent(noise_outliers)
+                        # Unknown должен иметь высокий logit для outliers
+                        loss_unknown_noise = F.cross_entropy(
+                            out_noise, 
+                            torch.full((n_outliers,), agent.unknown_class_idx, dtype=torch.long, device=device),
+                            reduction='mean'
+                        )
+                        loss_unknown = loss_unknown + 0.5 * loss_unknown_noise
+                        
+                        # Dream outliers (если VAE доступен)
+                        if use_vae_dreams and agent.vae_trained:
+                            dream_outliers = agent.sample_dreams(n_outliers, device=device)
+                            dream_outliers = dream_outliers.to(memory_format=torch.channels_last)
+                            out_dreams = agent(dream_outliers)
+                            loss_unknown_dreams = F.cross_entropy(
+                                out_dreams,
+                                torch.full((n_outliers,), agent.unknown_class_idx, dtype=torch.long, device=device),
+                                reduction='mean'
+                            )
+                            loss_unknown = loss_unknown + 0.3 * loss_unknown_dreams
                 
                 # Distillation loss на dreams (сон с удержанием структуры)
                 loss_dream = 0.0
@@ -1567,6 +1713,14 @@ def run_drone_simulation():
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
             
+            # Добавляем loss для Unknown класса (Outlier Exposure)
+            if loss_unknown != 0.0 and torch.isfinite(loss_unknown):
+                total_loss = total_loss + 0.1 * loss_unknown  # небольшой вес для стабильности
+            
+            # Добавляем entropy penalty для routing gates
+            if routing_entropy_loss != 0.0 and torch.isfinite(routing_entropy_loss):
+                total_loss = total_loss + 0.05 * routing_entropy_loss  # небольшой вес для стабилизации
+            
             # Проверка на NaN/inf в loss_new с детальной диагностикой
             if not torch.isfinite(loss_new):
                 print(f"[ERROR] loss_new is NaN/inf at step {step}")
@@ -1584,6 +1738,7 @@ def run_drone_simulation():
 
             # КРИТИЧНО: сохраняем компоненты loss для диагностики
             loss_new_val = float(loss_new.item())
+            unknown_val = float(loss_unknown.item()) if isinstance(loss_unknown, torch.Tensor) and torch.isfinite(loss_unknown) else 0.0
             
             # Добавляем dream distillation loss (сон с удержанием структуры)
             dream_val = 0.0
@@ -1767,7 +1922,7 @@ def run_drone_simulation():
                 pred_info = f" | Pred: {top3_str}" if expansion_count > 0 else ""
                 
                 # КРИТИЧНО: диагностика компонентов loss для выявления источника взрыва
-                loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} Reg:{reg_val:.2f}"
+                loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} U:{unknown_val:.3f} Reg:{reg_val:.2f}"
                 
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} ({loss_components}) | Mem(M): {acc_A:.1f}% | "
@@ -1819,7 +1974,12 @@ def run_drone_simulation():
         print(f"[VIZ] Computing {'t-SNE' if use_tsne else 'PCA'} for {len(features_all)} samples...")
         
         if use_tsne:
-            reducer = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+            # КРИТИЧНО: в новых версиях sklearn параметр называется max_iter вместо n_iter
+            try:
+                reducer = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
+            except TypeError:
+                # Fallback для старых версий sklearn
+                reducer = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
         else:
             reducer = PCA(n_components=2, random_state=42)
         
