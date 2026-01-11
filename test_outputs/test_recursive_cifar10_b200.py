@@ -1364,15 +1364,16 @@ def run_drone_simulation():
         Показывает, насколько хорошо backbone разделяет классы.
         """
         try:
-            from sklearn.manifold import TSNE
+            from sklearn.manifold import TSNE  # type: ignore
             use_tsne = True
         except ImportError:
             try:
-                from sklearn.decomposition import PCA
+                from sklearn.decomposition import PCA  # type: ignore
                 use_tsne = False
                 print("[VIZ] t-SNE not available, using PCA")
             except ImportError:
                 print("[VIZ] sklearn not available, skipping latent visualization")
+                print("[VIZ] Install with: pip install scikit-learn")
                 return
 
         agent.eval()
