@@ -1917,11 +1917,11 @@ class RecursiveAgent(nn.Module):
             return None, None
         return self.own_concepts.extract_concepts(features)
     
-    def record_autobiographical_memory(self, step, state_features, action, outcome, reward_signal=None, context=None):
+    def record_autobiographical_memory(self, step, state_features, action, outcome, reward_signal=None, context=None, pain_level=None):
         """Записывает эпизод в автобиографическую память"""
         if not self.use_autobiographical_memory:
             return
-        self.autobiographical_memory.record(step, state_features, action, outcome, reward_signal, context)
+        self.autobiographical_memory.record(step, state_features, action, outcome, reward_signal, context, pain_level)
     
     def recall_similar_experiences(self, query_features, k=10):
         """Вспоминает похожие эпизоды из автобиографической памяти"""
@@ -2520,6 +2520,16 @@ def run_drone_simulation():
             agent.growth_budget = min(1.0, agent.growth_budget + 0.001)
             has_growth_budget = agent.growth_budget >= agent.growth_cost_per_expansion
             
+            # КРИТИЧНО: получаем features_f32 для AGI компонентов (нужно для expansion decision)
+            # Делаем это раньше, чтобы использовать в блоке expansion
+            features_f32 = None
+            if len(agent.heads) > 0:
+                # Получаем features из текущего батча для AGI компонентов
+                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
+                    if features_temp is not None:
+                        features_f32 = features_temp[:min(64, real_B)].float()  # конвертируем в float32
+            
             # КРИТИЧНО: для рекурсивной эмергенции - новые концепты будут храниться здесь
             expansion_new_classes = None  # будет установлено если CLIP обнаружит новые концепты
             
@@ -2698,7 +2708,7 @@ def run_drone_simulation():
                 
                 # КРИТИЧНО: Записываем weakness ДО expansion для мета-регуляции
                 weakness_before = None
-                if agent.use_self_model and len(agent.heads) > 0:
+                if agent.use_self_model and len(agent.heads) > 0 and features_f32 is not None:
                     weakness_pred = agent.self_model.detect_weakness(features_f32)
                     weakness_before = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
                 
@@ -2811,6 +2821,13 @@ def run_drone_simulation():
             all_features = []
             all_surprises = []
             
+            # КРИТИЧНО: получаем features_f32 для AGI компонентов (если еще не получены)
+            if features_f32 is None and len(agent.heads) > 0:
+                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
+                    if features_temp is not None:
+                        features_f32 = features_temp[:min(64, real_B)].float()  # конвертируем в float32
+            
             # ---- forward (BF16) с рекурсией ----
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 # Pass0: начальный прогноз
@@ -2818,6 +2835,10 @@ def run_drone_simulation():
                 all_outputs.append(outputs_pass0)
                 all_features.append(features_pass0)
                 used_recursions += 1
+                
+                # КРИТИЧНО: обновляем features_f32 из первого прохода (для AGI компонентов)
+                if features_f32 is None and features_pass0 is not None:
+                    features_f32 = features_pass0[:real_B].float()  # конвертируем в float32
                 
                 # Вычисляем surprise для Pass0 (для остановки рекурсии)
                 surprise_pass0 = None
