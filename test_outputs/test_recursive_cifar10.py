@@ -958,6 +958,18 @@ def run_drone_simulation():
     CLIP_TRUST_THRESHOLD = 0.6   # Верим CLIP только если он уверен > 60%
     MAX_LAYERS = 5               # Защита от переполнения памяти
     
+    # Автоматический запуск SLEEP после накопления ошибок
+    SLEEP_TRIGGER_STEPS = 500    # Запускать sleep после N шагов Phase2
+    SLEEP_TRIGGER_ERRORS = 100   # Или после N ошибок на животных
+    error_count_phase2 = 0       # Счетчик ошибок в Phase2
+    last_sleep_step = -1000      # Когда последний раз спали
+    
+    # Автоматический запуск SLEEP после накопления ошибок
+    SLEEP_TRIGGER_STEPS = 500    # Запускать sleep после N шагов Phase2
+    SLEEP_TRIGGER_ERRORS = 100   # Или после N ошибок на животных
+    error_count_phase2 = 0       # Счетчик ошибок в Phase2
+    last_sleep_step = -1000      # Когда последний раз спали
+    
     # Phase2 optimizer и scheduler будут созданы после expansion
     optimizer_phase2 = None
     scheduler_phase2 = None
@@ -1063,9 +1075,35 @@ def run_drone_simulation():
                 
                 # 3. СБРОС СОСТОЯНИЯ
                 # Мы "выспались", теперь у нас 1 слой и куча свободного места
-                expanded = True 
+                expansion_count = 0  # Сбрасываем счетчик после сна
                 last_expansion_step = step
+                last_sleep_step = step
+                error_count_phase2 = 0  # Сбрасываем счетчик ошибок
                 print("[WAKE UP] Agent is ready for new memories.")
+            
+            # АВТОМАТИЧЕСКИЙ ЗАПУСК SLEEP: после накопления ошибок или через N шагов
+            steps_since_sleep = step - last_sleep_step
+            should_sleep = (
+                len(agent.heads) >= 2 and  # Есть что консолидировать
+                expansion_count > 0 and  # Только если было расширение
+                steps_since_sleep > SLEEP_TRIGGER_STEPS and  # Прошло достаточно шагов
+                (error_count_phase2 > SLEEP_TRIGGER_ERRORS or steps_since_sleep > SLEEP_TRIGGER_STEPS * 2)
+            )
+            
+            if should_sleep:
+                print(f"\n[INTELLIGENT SLEEP] Triggered after {steps_since_sleep} steps and {error_count_phase2} errors.")
+                print(f"[ACTION] Initiating SLEEP PHASE to consolidate knowledge...")
+                
+                # 1. ЗАПУСК СНА (Консолидация знаний)
+                agent.dream_and_compress(num_dreams=1500, dream_batch_size=100)  # Больше снов для лучшей консолидации
+                
+                # 2. ПЕРЕЗАГРУЗКА
+                optimizer = optim.Adam(agent.parameters(), lr=0.001)
+                
+                # 3. СБРОС СОСТОЯНИЯ
+                last_sleep_step = step
+                error_count_phase2 = 0  # Сбрасываем счетчик ошибок
+                print("[WAKE UP] Knowledge consolidated. Agent is ready to continue learning.")
                 
             # 2. Обучение с использованием всех интегрированных механизмов
             # Используем правильный optimizer
@@ -1211,6 +1249,16 @@ def run_drone_simulation():
             
             agent.sensor.update(total_loss.item())
             
+            # Подсчитываем ошибки на животных для триггера sleep
+            if expansion_count > 0:  # Только после expansion
+                with torch.no_grad():
+                    agent.eval()
+                    test_out = agent(data)
+                    pred = test_out[:, :10].argmax(dim=1)
+                    errors = (pred != target).sum().item()
+                    error_count_phase2 += errors
+                    agent.train()
+            
             if step % 50 == 0:
                 # Тест Памяти (Машины) и Нового (Животные) с правильным eval режимом
                 acc_A = eval_masked(agent, test_loader_A, classes_A, device, block_unknown=True)
@@ -1227,7 +1275,7 @@ def run_drone_simulation():
                     # Синхронизировано с forward(): (max_prob < 0.2) | (entropy > 1.8)
                     unk_rate = ((mp < 0.2) | (ent > 1.8)).float().mean().item()
                 
-                print(f"Step {step}: Loss {loss.item():.2f} | Mem (Machines): {acc_A:.1f}% | New (Animals): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}%")
+                print(f"Step {step}: Loss {total_loss.item():.2f} | Mem (Machines): {acc_A:.1f}% | New (Animals): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | Errors: {error_count_phase2} | StepsSinceSleep: {step - last_sleep_step}")
             step += 1
     
     # 🌙 СОН: Консолидация памяти (если накопилось много голов)
