@@ -481,8 +481,8 @@ def run_drone_simulation():
 
     print(f"\n--- PHASE 1: URBAN ENVIRONMENT (Learning Machines: {classes_A}) ---")
     
-    # Обучение Фаза 1
-    for epoch in range(3): # CIFAR сложнее, нужно пару эпох
+    # Обучение Фаза 1 (увеличиваем эпохи для лучшего разделения классов)
+    for epoch in range(5): # Больше эпох для лучшего разделения Plane/Ship/Car/Truck
         for batch_idx, (data, target) in enumerate(loader_A):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
@@ -523,8 +523,8 @@ def run_drone_simulation():
     CLIP_TRUST_THRESHOLD = 0.6   # Верим CLIP только если он уверен > 60%
     MAX_LAYERS = 5               # Защита от переполнения памяти
     
-    # Обучение Фаза 2
-    for epoch in range(3):
+    # Обучение Фаза 2 (увеличиваем эпохи для лучшего обучения животных)
+    for epoch in range(5): # Больше эпох для лучшего обучения
         for batch_idx, (data, target) in enumerate(loader_B):
             data, target = data.to(device), target.to(device)
             
