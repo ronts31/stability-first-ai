@@ -3315,37 +3315,53 @@ def run_drone_simulation():
                     routing_entropy_loss = F.relu(target_entropy * 0.7 - gate_entropy)  # penalty если entropy < 70% от максимума
                     
                     # 2. КРИТИЧНО: Surprise-based routing loss - автономное переключение контекста
+                    # Всегда обучаем routing gate правильно переключаться, не только при высоком surprise
                     # Определяем правильный head для каждого класса
                     # Если класс в classes_B (animals), то head 1 (или последний после expansion)
                     # Если класс в classes_A (machines), то head 0
-                    if surprise is not None and surprise.item() > 0.3:  # Высокий surprise = новая среда
-                        # Создаём target gates: правильный head должен быть активирован
-                        target_gates = torch.zeros_like(gates)  # [B, H]
-                        classes_B_set = set(classes_B)
-                        classes_A_set = set(classes_A)
+                    # Создаём target gates: правильный head должен быть активирован
+                    target_gates = torch.zeros_like(gates)  # [B, H]
+                    classes_B_set = set(classes_B)
+                    classes_A_set = set(classes_A)
+                    
+                    for b in range(real_B):
+                        class_id = int(target_real[b].item())
+                        # Определяем правильный head для этого класса
+                        if class_id in classes_B_set:
+                            # Класс из Phase 2 (animals) - активируем последний head
+                            correct_head_idx = len(agent.heads) - 1
+                        elif class_id in classes_A_set:
+                            # Класс из Phase 1 (machines) - активируем первый head
+                            correct_head_idx = 0
+                        else:
+                            # Unknown класс - равномерное распределение
+                            correct_head_idx = None
                         
-                        for b in range(real_B):
-                            class_id = int(target_real[b].item())
-                            # Определяем правильный head для этого класса
-                            if class_id in classes_B_set:
-                                # Класс из Phase 2 (animals) - активируем последний head
-                                correct_head_idx = len(agent.heads) - 1
-                            elif class_id in classes_A_set:
-                                # Класс из Phase 1 (machines) - активируем первый head
-                                correct_head_idx = 0
-                            else:
-                                # Unknown класс - равномерное распределение
-                                correct_head_idx = None
-                            
-                            if correct_head_idx is not None and correct_head_idx < len(agent.heads):
-                                target_gates[b, correct_head_idx] = 1.0
-                            else:
-                                # Равномерное распределение для unknown
-                                target_gates[b, :] = 1.0 / len(agent.heads)
-                        
-                        # Surprise-based loss: чем выше surprise, тем сильнее штраф за неправильный routing
-                        surprise_weight = min(2.0, float(surprise.item()))  # масштабируем surprise [0.3..2.0]
-                        routing_surprise_loss = surprise_weight * F.mse_loss(gates, target_gates)
+                        if correct_head_idx is not None and correct_head_idx < len(agent.heads):
+                            target_gates[b, correct_head_idx] = 1.0
+                        else:
+                            # Равномерное распределение для unknown
+                            target_gates[b, :] = 1.0 / len(agent.heads)
+                    
+                    # Surprise-based loss: всегда обучаем, но вес зависит от surprise
+                    # При высоком surprise - более агрессивное обучение
+                    if surprise is not None:
+                        # Масштабируем surprise: базовый вес 0.5, при surprise > 0.3 увеличиваем до 2.0
+                        base_weight = 0.5
+                        surprise_boost = max(0.0, float(surprise.item()) - 0.3) * 3.0  # [0..1.5] при surprise [0.3..0.8]
+                        surprise_weight = base_weight + surprise_boost
+                    else:
+                        surprise_weight = 0.5  # базовый вес если surprise не доступен
+                    
+                    # Используем KL divergence для более агрессивного обучения (лучше чем MSE для вероятностей)
+                    # Нормализуем gates и target_gates для стабильности
+                    gates_norm = gates / (gates.sum(dim=1, keepdim=True) + 1e-9)
+                    target_gates_norm = target_gates / (target_gates.sum(dim=1, keepdim=True) + 1e-9)
+                    routing_surprise_loss = surprise_weight * F.kl_div(
+                        F.log_softmax(gates_norm + 1e-9, dim=1),
+                        target_gates_norm,
+                        reduction='batchmean'
+                    )
                 
                 # Проверка outputs на inf/nan
                 if not torch.isfinite(outputs).all():
@@ -3625,9 +3641,12 @@ def run_drone_simulation():
                 total_loss = total_loss + 0.05 * routing_entropy_loss  # небольшой вес для стабилизации
             
             # КРИТИЧНО: Surprise-based routing loss - автономное переключение контекста
+            # Всегда обучаем routing gate правильно переключаться, вес зависит от surprise
             # Когда surprise высокий, градиент идёт в RoutingGate для быстрого переключения на правильный head
             if isinstance(routing_surprise_loss, torch.Tensor) and routing_surprise_loss.item() != 0.0 and torch.isfinite(routing_surprise_loss):
-                total_loss = total_loss + 0.3 * routing_surprise_loss  # сильный вес при высоком surprise
+                # Увеличиваем вес для более агрессивного обучения routing gate
+                # Это критично для улучшения Global Accuracy
+                total_loss = total_loss + 0.5 * routing_surprise_loss  # сильный вес для автономного роутинга
             
             # Проверка на NaN/inf в loss_new с детальной диагностикой
             if not torch.isfinite(loss_new):
