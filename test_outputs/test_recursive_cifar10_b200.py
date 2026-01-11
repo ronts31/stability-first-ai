@@ -84,19 +84,38 @@ class AttentionAction(nn.Module):
     """
     Действие как выбор attention/patch/view.
     Для CIFAR: действие = выбор области изображения для фокуса (crop, zoom, rotate).
+    
+    КРИТИЧНО: Селективное внимание на основе класса/концепта.
+    Например, для Cat (класс 3) делаем zoom на центр (морда).
     """
     def __init__(self, num_patches=4, patch_size=16):
         super().__init__()
         self.num_patches = num_patches  # 2x2 grid = 4 patches
         self.patch_size = patch_size
+        
+        # Маппинг классов на предпочтительные patches
+        # Для Cat (3): центр (patch 1 или 2) - где обычно морда
+        # Для Dog (5): тоже центр
+        # Для Deer (4): верхняя часть (patch 0 или 1) - где голова
+        # Для Bird (2): верхняя часть
+        # Для остальных: равномерное распределение
+        self.class_to_patch_preference = {
+            2: [0, 1],  # Bird - верх
+            3: [1, 2],  # Cat - центр (морда)
+            4: [0, 1],  # Deer - верх (голова)
+            5: [1, 2],  # Dog - центр
+            6: [2, 3],  # Frog - низ
+            7: [1, 2],  # Horse - центр
+        }
     
-    def apply_action(self, x, action_idx):
+    def apply_action(self, x, action_idx, class_hint=None):
         """
         Применяет действие к изображению: выбирает patch для фокуса.
         
         Args:
             x: [B, 3, 32, 32] - исходное изображение
             action_idx: [B] - индекс выбранного patch (0..3)
+            class_hint: [B] - подсказка о классе для селективного внимания (опционально)
         
         Returns:
             x_next: [B, 3, 32, 32] - изображение с применённым действием (crop+zoom выбранного patch)
@@ -111,6 +130,18 @@ class AttentionAction(nn.Module):
         x_next = x.clone()
         for b in range(B):
             idx = int(action_idx[b].item())
+            
+            # КРИТИЧНО: если есть class_hint, корректируем patch для лучшего фокуса
+            if class_hint is not None:
+                class_id = int(class_hint[b].item()) if torch.is_tensor(class_hint[b]) else int(class_hint[b])
+                if class_id in self.class_to_patch_preference:
+                    # Если выбранный patch не в предпочтительных, используем предпочтительный
+                    preferred = self.class_to_patch_preference[class_id]
+                    if idx not in preferred:
+                        # Выбираем ближайший предпочтительный patch
+                        distances = [abs(idx - p) for p in preferred]
+                        idx = preferred[distances.index(min(distances))]
+            
             row = idx // 2
             col = idx % 2
             
@@ -1482,6 +1513,97 @@ class RecursiveAgent(nn.Module):
             return dreams
         noise = torch.randn(n, 3, 32, 32, device=device)
         return torch.tanh(noise * 0.5)
+    
+    def dream_and_compress(self, num_dreams=1000, dream_batch_size=100, device=None):
+        """
+        🌙 МОДУЛЬ СНОВИДЕНИЙ (CONSOLIDATION) + LAZARUS v3
+        Объединяет знания из нескольких heads в один через dream distillation.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        
+        print("\n🌙 ENTERING SLEEP PHASE (Lazarus v3 + Consolidation)...")
+        print(f"   Current heads: {len(self.heads)}")
+        
+        if len(self.heads) <= 1:
+            print("   Only one head exists. No compression needed.")
+            return
+        
+        # 1. Создаем "Студента" - одну компактную сеть
+        student_head = ExpandableHead(self.hidden_size, self.output_size).to(device)
+        optimizer = optim.Adam(student_head.parameters(), lr=0.0005)
+        
+        # 2. LAZARUS: Создаем frozen teacher (Consistency Anchor)
+        teacher_model = copy.deepcopy(self)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+        
+        print(f"   Generating {num_dreams} dreams with Lazarus v3 protocol...")
+        
+        # Lazarus v3 параметры
+        w_cons = 1.0  # Consistency (главный компонент)
+        w_stab = 0.5  # Stability
+        w_ent = 0.05  # Entropy Floor
+        H0 = 1.5      # Минимальная энтропия
+        epsilon = 0.05
+        
+        for epoch in range(15):
+            total_loss = 0
+            for dream_batch in range(num_dreams // dream_batch_size):
+                # Генерируем "сны"
+                noise = self.sample_dreams(dream_batch_size, device)
+                
+                # LAZARUS v3: Consistency Anchor
+                with torch.no_grad():
+                    teacher_logits = teacher_model(noise)
+                    teacher_probs = torch.softmax(teacher_logits[:, :10], dim=1)
+                
+                # Студент предсказывает
+                backbone_features = self.shared_backbone(noise)
+                student_logits, _ = student_head(backbone_features, prev_hiddens=[])
+                student_probs = torch.softmax(student_logits[:, :10], dim=1)
+                
+                # 1. Consistency Loss
+                loss_cons = F.mse_loss(student_logits[:, :10], teacher_logits[:, :10])
+                
+                # 2. Stability Loss
+                noise_pert = noise + torch.randn_like(noise) * epsilon
+                backbone_features_pert = self.shared_backbone(noise_pert)
+                student_logits_pert, _ = student_head(backbone_features_pert, prev_hiddens=[])
+                loss_stab = F.mse_loss(student_logits[:, :10], student_logits_pert[:, :10])
+                
+                # 3. Entropy Floor
+                log_probs = F.log_softmax(student_logits[:, :10], dim=1)
+                entropy = -(student_probs * log_probs).sum(dim=1).mean()
+                loss_ent = F.relu(H0 - entropy)
+                
+                # 4. Knowledge Distillation
+                loss_distill = F.kl_div(
+                    F.log_softmax(student_logits[:, :10], dim=1),
+                    teacher_probs,
+                    reduction='batchmean'
+                )
+                
+                # Итоговый loss
+                loss = w_cons * loss_cons + w_stab * loss_stab + w_ent * loss_ent + 0.3 * loss_distill
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            
+            if (epoch + 1) % 3 == 0:
+                batches = num_dreams // dream_batch_size
+                print(f"   Epoch {epoch+1}/15: Loss={total_loss/batches:.4f}, H={entropy.item():.3f}")
+        
+        print("☀️ WAKING UP: Lazarus Consolidation Complete.")
+        
+        # Заменяем сложный мозг на одного Студента
+        self.heads = nn.ModuleList([student_head])
+        self.active_classes_per_column = {0: list(range(10))}  # Объединяем все классы
+        
+        print(f"   Memory compressed: {len(self.heads)} head(s) remaining (shared backbone).")
 
     def forward(self, x, return_features=False):
         feats = self.shared_backbone(x)
@@ -1558,11 +1680,18 @@ class RecursiveAgent(nn.Module):
         action_idx = torch.argmax(action_logits, dim=-1)  # [B]
         return action_idx, action_logits
     
-    def apply_action_to_image(self, x, action_idx):
-        """Применяет действие к изображению"""
+    def apply_action_to_image(self, x, action_idx, class_hint=None):
+        """
+        Применяет действие к изображению с селективным вниманием.
+        
+        Args:
+            x: [B, 3, 32, 32] - изображение
+            action_idx: [B] - индекс действия
+            class_hint: [B] - подсказка о классе для улучшения внимания (опционально)
+        """
         if not self.use_world_model:
             return x
-        return self.attention_action.apply_action(x, action_idx)
+        return self.attention_action.apply_action(x, action_idx, class_hint)
     
     def predict_next_state(self, features, action_idx):
         """
@@ -2416,7 +2545,7 @@ def run_drone_simulation():
             elif is_shock and not has_budget:
                 print(f"\n[CRITICAL] Head Limit ({MAX_LAYERS}) reached. Consider SLEEP here (disabled in this file).")
 
-            # Intelligent sleep trigger placeholder (kept, but no compression code here)
+            # Intelligent sleep: консолидация знаний из нескольких heads в один
             steps_since_sleep = step - last_sleep_step
             should_sleep = (
                 len(agent.heads) >= 2
@@ -2425,10 +2554,24 @@ def run_drone_simulation():
                 and (error_count_phase2 > SLEEP_TRIGGER_ERRORS or steps_since_sleep > SLEEP_TRIGGER_STEPS * 2)
             )
             if should_sleep:
-                print(f"\n[INTELLIGENT SLEEP] Would trigger after {steps_since_sleep} steps and {error_count_phase2} errors (sleep disabled).")
-                # sleep disabled => do NOT reset counters, only mark last_sleep_step for throttle
+                print(f"\n[INTELLIGENT SLEEP] Triggered after {steps_since_sleep} steps and {error_count_phase2} errors.")
+                print(f"[ACTION] Initiating SLEEP PHASE to consolidate knowledge and reduce confusion...")
+                
+                # Запускаем консолидацию через dream distillation
+                agent.dream_and_compress(num_dreams=1500, dream_batch_size=100, device=device)
+                
+                # Перезагружаем optimizer после консолидации
+                if optimizer_phase2 is not None:
+                    optimizer_phase2 = build_phase2_optimizer(agent.heads[-1] if len(agent.heads) > 0 else None)
+                    for pg in optimizer_phase2.param_groups:
+                        pg["lr_base"] = pg["lr"]
+                        pg["scheduler_factor"] = 1.0
+                
+                # Сбрасываем состояние
                 last_sleep_step = step
-                # error_count_phase2 remains accumulated
+                error_count_phase2 = 0
+                expansion_count = 0  # Сбрасываем после консолидации
+                print("[WAKE UP] Knowledge consolidated. Heads merged. Agent ready to continue learning.")
 
             # 2) training step
             current_opt = optimizer_phase2 if optimizer_phase2 is not None else optimizer
@@ -2561,8 +2704,18 @@ def run_drone_simulation():
                     # Выбираем действие
                     action_idx, action_logits = agent.select_action(features_f32, goal_features)
                     
-                    # Применяем действие к изображению
-                    x_next = agent.apply_action_to_image(data_real, action_idx)
+                    # КРИТИЧНО: используем предсказания модели как class_hint для селективного внимания
+                    # Для Cat (класс 3) делаем zoom на центр (морда)
+                    with torch.no_grad():
+                        # Получаем предсказания для подсказки о классе
+                        pred_logits = outputs[:real_B, :10] if 'outputs' in locals() else None
+                        class_hint = None
+                        if pred_logits is not None:
+                            # Используем текущие предсказания как подсказку
+                            class_hint = pred_logits.argmax(dim=1)  # [real_B]
+                    
+                    # Применяем действие к изображению с селективным вниманием
+                    x_next = agent.apply_action_to_image(data_real, action_idx, class_hint)
                     with torch.no_grad():
                         features_next = agent.shared_backbone(x_next)
                     
