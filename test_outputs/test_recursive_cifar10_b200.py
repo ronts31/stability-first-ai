@@ -16,7 +16,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn.functional as F
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 import matplotlib.pyplot as plt
 
 try:
@@ -1670,6 +1670,17 @@ class RecursiveAgent(nn.Module):
                 with torch.no_grad():
                     teacher_logits = teacher_model(noise)
                     teacher_probs = torch.softmax(teacher_logits[:, :10], dim=1)
+                    
+                    # КРИТИЧНО: Lazarus v3 для Роутера - дистиллируем уверенность роутера
+                    # Студент должен учиться не только "что это", но и "какая голова за это отвечает"
+                    teacher_routing_confidence = None
+                    if self.use_soft_routing and len(teacher_model.heads) > 1 and hasattr(teacher_model, 'routing_gate'):
+                        teacher_features = teacher_model.shared_backbone(noise)
+                        teacher_gates_full = teacher_model.routing_gate(teacher_features)  # [B, MAX_LAYERS]
+                        teacher_gates = teacher_gates_full[:, :len(teacher_model.heads)]  # [B, H]
+                        teacher_gates = teacher_gates / (teacher_gates.sum(dim=1, keepdim=True) + 1e-9)
+                        # Сохраняем routing confidence для дистилляции
+                        teacher_routing_confidence = teacher_gates  # [B, H] - уверенность каждого head
                 
                 # Студент предсказывает
                 backbone_features = self.shared_backbone(noise)
@@ -1697,8 +1708,28 @@ class RecursiveAgent(nn.Module):
                     reduction='batchmean'
                 )
                 
+                # 5. КРИТИЧНО: Routing Confidence Distillation
+                # Студент учится "какая голова за что отвечает" через неявное кодирование в features
+                # Если teacher routing confidence высокая для head i, student должен предсказывать классы этого head
+                loss_routing_distill = torch.zeros((), device=device)
+                if teacher_routing_confidence is not None:
+                    # Вычисляем взвешенную по routing confidence дистилляцию
+                    # Если head i имеет высокую confidence, его предсказания важнее для студента
+                    for head_idx in range(len(teacher_model.heads)):
+                        head_confidence = teacher_routing_confidence[:, head_idx:head_idx+1]  # [B, 1]
+                        # Взвешиваем KL divergence по confidence этого head
+                        # Это учит студента: "когда teacher был уверен в head i, предсказывай как head i"
+                        weighted_kl = head_confidence * F.kl_div(
+                            F.log_softmax(student_logits[:, :10], dim=1),
+                            teacher_probs,
+                            reduction='none'
+                        ).sum(dim=1, keepdim=True)
+                        loss_routing_distill = loss_routing_distill + weighted_kl.mean()
+                
                 # Итоговый loss
                 loss = w_cons * loss_cons + w_stab * loss_stab + w_ent * loss_ent + 0.3 * loss_distill
+                if loss_routing_distill.item() > 0:
+                    loss = loss + 0.2 * loss_routing_distill  # дистилляция routing confidence
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -2351,6 +2382,9 @@ def run_drone_simulation():
     loader_B = DataLoader(train_B, batch_size=256, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
     test_loader_A = DataLoader(test_A, batch_size=500, shuffle=False, num_workers=4, pin_memory=True)
     test_loader_B = DataLoader(test_B, batch_size=500, shuffle=False, num_workers=4, pin_memory=True)
+    # КРИТИЧНО: комбинированный loader для глобальной метрики (все 10 классов)
+    test_all_combined = ConcatDataset([test_A, test_B])
+    test_loader_all = DataLoader(test_all_combined, batch_size=500, shuffle=False, num_workers=4, pin_memory=True)
 
     use_curiosity = CLIP_AVAILABLE
     use_subjective_time = True
@@ -3262,19 +3296,56 @@ def run_drone_simulation():
                         expansion_history=agent.expansion_history
                     )
                 
-                # КРИТИЧНО: Entropy penalty для стабилизации routing gates (если используется soft routing)
+                # КРИТИЧНО: Автономный Роутинг - обучение на сигнале сюрприза
+                # Если SubjectiveTimeCritic кричит о высоком Surprise, система должна автоматически
+                # перенаправлять градиент в RoutingGate, чтобы он быстрее выучил: "Это новая среда, переключи внимание на Head 2"
                 routing_entropy_loss = torch.zeros((), device=device, dtype=torch.float32)
+                routing_surprise_loss = torch.zeros((), device=device, dtype=torch.float32)
                 if agent.use_soft_routing and len(agent.heads) > 1:
                     # Вычисляем gates_full и берём срез (как в forward)
                     gates_full = agent.routing_gate(features[:real_B])  # [real_B, MAX_LAYERS]
                     gates = gates_full[:, :len(agent.heads)]  # [B, H]
                     gates = gates / (gates.sum(dim=1, keepdim=True) + 1e-9)  # нормализуем
-                    # Entropy penalty: поощряем равномерное распределение ответственности
+                    
+                    # 1. Entropy penalty: поощряем равномерное распределение ответственности
                     gate_entropy = -torch.sum(gates * torch.log(gates + 1e-9), dim=1).mean()
                     # Целевая entropy (максимальная для равномерного распределения)
                     target_entropy = torch.log(torch.tensor(len(agent.heads), dtype=torch.float32, device=gates.device))
                     # Penalty если entropy слишком низкая (коллапс к одному head)
                     routing_entropy_loss = F.relu(target_entropy * 0.7 - gate_entropy)  # penalty если entropy < 70% от максимума
+                    
+                    # 2. КРИТИЧНО: Surprise-based routing loss - автономное переключение контекста
+                    # Определяем правильный head для каждого класса
+                    # Если класс в classes_B (animals), то head 1 (или последний после expansion)
+                    # Если класс в classes_A (machines), то head 0
+                    if surprise is not None and surprise.item() > 0.3:  # Высокий surprise = новая среда
+                        # Создаём target gates: правильный head должен быть активирован
+                        target_gates = torch.zeros_like(gates)  # [B, H]
+                        classes_B_set = set(classes_B)
+                        classes_A_set = set(classes_A)
+                        
+                        for b in range(real_B):
+                            class_id = int(target_real[b].item())
+                            # Определяем правильный head для этого класса
+                            if class_id in classes_B_set:
+                                # Класс из Phase 2 (animals) - активируем последний head
+                                correct_head_idx = len(agent.heads) - 1
+                            elif class_id in classes_A_set:
+                                # Класс из Phase 1 (machines) - активируем первый head
+                                correct_head_idx = 0
+                            else:
+                                # Unknown класс - равномерное распределение
+                                correct_head_idx = None
+                            
+                            if correct_head_idx is not None and correct_head_idx < len(agent.heads):
+                                target_gates[b, correct_head_idx] = 1.0
+                            else:
+                                # Равномерное распределение для unknown
+                                target_gates[b, :] = 1.0 / len(agent.heads)
+                        
+                        # Surprise-based loss: чем выше surprise, тем сильнее штраф за неправильный routing
+                        surprise_weight = min(2.0, float(surprise.item()))  # масштабируем surprise [0.3..2.0]
+                        routing_surprise_loss = surprise_weight * F.mse_loss(gates, target_gates)
                 
                 # Проверка outputs на inf/nan
                 if not torch.isfinite(outputs).all():
@@ -3553,6 +3624,11 @@ def run_drone_simulation():
             if isinstance(routing_entropy_loss, torch.Tensor) and routing_entropy_loss.item() != 0.0 and torch.isfinite(routing_entropy_loss):
                 total_loss = total_loss + 0.05 * routing_entropy_loss  # небольшой вес для стабилизации
             
+            # КРИТИЧНО: Surprise-based routing loss - автономное переключение контекста
+            # Когда surprise высокий, градиент идёт в RoutingGate для быстрого переключения на правильный head
+            if isinstance(routing_surprise_loss, torch.Tensor) and routing_surprise_loss.item() != 0.0 and torch.isfinite(routing_surprise_loss):
+                total_loss = total_loss + 0.3 * routing_surprise_loss  # сильный вес при высоком surprise
+            
             # Проверка на NaN/inf в loss_new с детальной диагностикой
             if not torch.isfinite(loss_new):
                 print(f"[ERROR] loss_new is NaN/inf at step {step}")
@@ -3789,7 +3865,8 @@ def run_drone_simulation():
                 acc_B = eval_masked(agent, test_loader_B, classes_B, device, block_unknown=True)
                 # КРИТИЧНО: Глобальная метрика (10-классовая точность без маскирования)
                 # Показывает, насколько хорошо Soft Routing Gate научился переключать контексты
-                acc_global = eval_global(agent, test_loader_B, device)
+                # Используем комбинированный loader со всеми 10 классами, а не только animals
+                acc_global = eval_global(agent, test_loader_all, device)
                 acc_A_hist.append(acc_A)
                 acc_B_hist.append(acc_B)
 
