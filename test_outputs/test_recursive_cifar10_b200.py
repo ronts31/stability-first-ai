@@ -1095,25 +1095,33 @@ def check_clip_diversity(agent, data_batch, target_classes, min_diversity=3, con
     Проверяет разнообразие CLIP ответов перед expansion.
     Требует минимум min_diversity разных концептов с confidence > threshold.
     
+    КРИТИЧНО: для рекурсивной эмергенции также обнаруживает НОВЫЕ концепты (не в target_classes),
+    которые могут триггерить expansion для создания новых heads.
+    
     Returns:
-        (is_diverse, detected_classes, diversity_info)
+        (is_diverse, detected_classes, diversity_info, new_concepts)
     """
     if not agent.use_curiosity:
-        return True, set(), "CLIP not available"
+        return True, set(), "CLIP not available", set()
     
     detected_classes = set()
+    new_concepts = set()  # концепты, не входящие в target_classes (потенциальные новые heads)
     sample_size = min(32, data_batch.size(0))  # проверяем первые N образцов
     
     for i in range(sample_size):
         best_idx, best_label, conf = agent.curiosity.what_is_this(data_batch[i:i+1])
         if best_idx is not None and conf > confidence_threshold:
-            if best_idx in target_classes:  # только целевые классы
+            if best_idx in target_classes:  # целевые классы
                 detected_classes.add(best_idx)
+            elif best_idx < 10:  # новый концепт из CIFAR-10, но не в текущих target_classes
+                new_concepts.add(best_idx)
     
     is_diverse = len(detected_classes) >= min_diversity
     diversity_info = f"Detected {len(detected_classes)}/{min_diversity} diverse concepts: {sorted(detected_classes)}"
+    if new_concepts:
+        diversity_info += f" | New concepts (potential expansion): {sorted(new_concepts)}"
     
-    return is_diverse, detected_classes, diversity_info
+    return is_diverse, detected_classes, diversity_info, new_concepts
 
 
 @torch.no_grad()
@@ -1463,11 +1471,15 @@ def run_drone_simulation():
             agent.growth_budget = min(1.0, agent.growth_budget + 0.001)
             has_growth_budget = agent.growth_budget >= agent.growth_cost_per_expansion
             
+            # КРИТИЧНО: для рекурсивной эмергенции - новые концепты будут храниться здесь
+            expansion_new_classes = None  # будет установлено если CLIP обнаружит новые концепты
+            
             # Формализованный контроллер: need_expand_score = w1*shock + w2*high_entropy + w3*unknown_rate + w4*conflict_rate
-            w1, w2, w3, w4 = 0.4, 0.2, 0.2, 0.2  # веса сигналов
+            # КРИТИЧНО: unknown_rate теперь имеет больший вес, т.к. неизвестное должно триггерить expansion
+            w1, w2, w3, w4 = 0.3, 0.2, 0.3, 0.2  # веса сигналов (unknown_rate увеличен с 0.2 до 0.3)
             shock_signal = 1.0 if is_shock else 0.0
             high_entropy_signal = min(1.0, max(0.0, (entropy_test - 1.0) / 1.0))  # нормализуем [0..1]
-            unknown_rate_signal = unknown_rate_test  # уже [0..1]
+            unknown_rate_signal = unknown_rate_test  # уже [0..1] - высокий unknown_rate = нужен новый head
             conflict_rate_signal = conflict_rate  # уже [0..1]
             
             need_expand_score = (
@@ -1523,13 +1535,39 @@ def run_drone_simulation():
                     print("[CURIOSITY] Querying Oracle (CLIP)...")
                     # CLIP Diversity Check: требуем минимум 3 разных концепта
                     # КРИТИЧНО: используем data_real (уже на GPU и channels_last) вместо data (CPU)
-                    is_diverse, detected_classes, diversity_info = check_clip_diversity(
+                    is_diverse, detected_classes, diversity_info, new_concepts = check_clip_diversity(
                         agent, data_real, classes_B, 
                         min_diversity=CLIP_MIN_DIVERSITY, 
                         confidence_threshold=CLIP_TRUST_THRESHOLD
                     )
                     
-                    if not is_diverse:
+                    # КРИТИЧНО: если CLIP обнаружил новые концепты (не в текущих классах), это триггер для expansion
+                    # КРИТИЧНО: для рекурсивной эмергенции неизвестное выносится в новые heads
+                    if new_concepts and len(new_concepts) >= 2:  # минимум 2 новых концепта для expansion
+                        print(f"[NEW CONCEPTS] CLIP detected {len(new_concepts)} new concepts: {sorted(new_concepts)}")
+                        print(f"[RECURSIVE EMERGENCE] New concepts trigger expansion for structural growth")
+                        should_expand = True
+                        expansion_reason = f"NEW CONCEPTS DETECTED ({len(new_concepts)} concepts: {sorted(new_concepts)})"
+                        # КРИТИЧНО: сохраняем оригинальные classes_B и используем новые концепты для нового head
+                        # Это будет обработано в блоке expansion ниже
+                        expansion_new_classes = list(new_concepts)  # новые классы для expansion
+                        print(f"[EXPANSION] Will create new head for classes: {expansion_new_classes}")
+                    else:
+                        expansion_new_classes = None
+                    
+                    # КРИТИЧНО: проверяем новые концепты для рекурсивной эмергенции
+                    if new_concepts and len(new_concepts) >= 2:  # минимум 2 новых концепта для expansion
+                        print(f"[NEW CONCEPTS] CLIP detected {len(new_concepts)} new concepts: {sorted(new_concepts)}")
+                        print(f"[RECURSIVE EMERGENCE] New concepts trigger expansion for structural growth")
+                        should_expand = True
+                        expansion_reason = f"NEW CONCEPTS DETECTED ({len(new_concepts)} concepts: {sorted(new_concepts)})"
+                        # КРИТИЧНО: используем новые концепты как целевые классы для нового head
+                        # Сохраняем оригинальные classes_B для fallback
+                        original_classes_B = classes_B.copy()
+                        classes_B = list(new_concepts)  # расширяемся на новые концепты
+                        print(f"[EXPANSION] Creating new head for classes: {classes_B}")
+                    
+                    if not is_diverse and not should_expand:
                         print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
                         print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts.")
                         # КРИТИЧНО: если CLIP не сработал, но условия fallback выполнены - расширяемся
@@ -1540,7 +1578,7 @@ def run_drone_simulation():
                             print(f"[FALLBACK EXPANSION] {expansion_reason}")
                         else:
                             print(f"[DIVERSITY CHECK] Skipping expansion (but continuing training).")
-                    else:
+                    elif is_diverse and not should_expand:
                         print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
                         should_expand = True
                         expansion_reason = f"SHOCK + CLIP diversity ({len(detected_classes)} concepts)"
@@ -1582,8 +1620,12 @@ def run_drone_simulation():
                             true_label=int(target_real[0].item()) if target_real.numel() > 0 else None,
                         )
 
+                # КРИТИЧНО: для рекурсивной эмергенции используем новые концепты если они обнаружены
+                # Иначе используем оригинальные classes_B
+                expansion_classes = expansion_new_classes if expansion_new_classes is not None else classes_B
+                
                 new_head = agent.expand(
-                    new_classes_indices=classes_B,
+                    new_classes_indices=expansion_classes,
                     use_fractal_time=use_fractal_time,
                     train_late_backbone=train_late_backbone,
                 )
@@ -1822,42 +1864,15 @@ def run_drone_simulation():
                     # Phase1 или если веса не вычислены - используем обычный loss
                     loss_new = criterion_train(outputs[:real_B, :10], target_real)
                 
-                # КРИТИЧНО: Outlier Exposure для обучения Unknown класса
-                # Смесь noise/dreams/реальных OOD → target=unknown
-                # КРИТИЧНО: всегда tensor на device для type-safety
+                # КРИТИЧНО: Outlier Exposure ОТКЛЮЧЕН для рекурсивной эмергенции
+                # Неизвестное должно триггерить expansion новых heads, а не обучаться как отдельный класс.
+                # Система будет расширяться структурно при встрече с новыми концептами через:
+                # 1. unknown_rate в Complexity Controller (триггерит expansion)
+                # 2. CLIP обнаружение новых концептов (триггерит expansion)
+                # 3. High entropy + shock (триггерит expansion)
                 loss_unknown = torch.zeros((), device=device, dtype=torch.float32)
-                # КРИТИЧНО: начинаем обучать unknown сразу после первого expansion
-                if len(agent.heads) > 1:  # после первого expansion начинаем обучать unknown
-                    agent.unknown_trained = True  # помечаем что unknown обучается
-                    # Генерируем outliers: noise + dreams
-                    n_outliers = min(32, real_B // 4)  # 25% от real_B
-                    if n_outliers > 0:
-                        # Noise outliers
-                        noise_outliers = torch.randn(n_outliers, 3, 32, 32, device=device)
-                        noise_outliers = torch.tanh(noise_outliers * 0.5)  # нормализуем в [-1, 1]
-                        noise_outliers = noise_outliers.to(memory_format=torch.channels_last)
-                        
-                        # Forward на noise outliers (внутри того же autocast)
-                        out_noise = agent(noise_outliers)
-                        # Unknown должен иметь высокий logit для outliers
-                        loss_unknown_noise = F.cross_entropy(
-                            out_noise, 
-                            torch.full((n_outliers,), agent.unknown_class_idx, dtype=torch.long, device=device),
-                            reduction='mean'
-                        )
-                        loss_unknown = loss_unknown + 0.5 * loss_unknown_noise
-                        
-                        # Dream outliers (если VAE доступен)
-                        if use_vae_dreams and agent.vae_trained:
-                            dream_outliers = agent.sample_dreams(n_outliers, device=device)
-                            dream_outliers = dream_outliers.to(memory_format=torch.channels_last)
-                            out_dreams = agent(dream_outliers)
-                            loss_unknown_dreams = F.cross_entropy(
-                                out_dreams,
-                                torch.full((n_outliers,), agent.unknown_class_idx, dtype=torch.long, device=device),
-                                reduction='mean'
-                            )
-                            loss_unknown = loss_unknown + 0.3 * loss_unknown_dreams
+                agent.unknown_trained = True  # помечаем что unknown не обучается как класс, а триггерит expansion
+                # Outlier Exposure код удалён - неизвестное выносится в новые heads через expansion
                 
                 # Distillation loss на dreams (сон с удержанием структуры)
                 loss_dream = 0.0
