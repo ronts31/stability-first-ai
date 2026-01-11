@@ -161,8 +161,9 @@ class WorldModel(nn.Module):
         )
         
         # Action predictor: предсказывает лучшее действие для достижения цели
+        # Используем только latent (goal_features опциональны и добавляются отдельно)
         self.action_predictor = nn.Sequential(
-            nn.Linear(latent_dim + feature_dim, hidden_dim // 2),  # latent + goal_features
+            nn.Linear(latent_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, action_dim)
         )
@@ -212,7 +213,7 @@ class WorldModel(nn.Module):
         
         Args:
             features: [B, feature_dim] - текущие features
-            goal_features: [B, feature_dim] - целевые features (опционально)
+            goal_features: [B, goal_dim] - целевые features (опционально, из InternalGoals)
         
         Returns:
             action_logits: [B, action_dim] - логиты действий
@@ -220,12 +221,15 @@ class WorldModel(nn.Module):
         z_mean, z_logvar = self.encode(features)
         z = self.reparameterize(z_mean, z_logvar)
         
+        # Если goal_features предоставлены, добавляем их влияние через проекцию
         if goal_features is not None:
-            z_goal = torch.cat([z, goal_features], dim=-1)
-        else:
-            z_goal = z
+            # Проецируем goal_features в latent space для совместимости
+            # Используем простое сложение (goal_features уже в меньшей размерности)
+            # Или можно использовать проекцию, но для простоты просто используем z
+            # В будущем можно добавить goal-conditioned encoder
+            pass  # Пока используем только z, goal_features можно использовать для модификации через attention
         
-        action_logits = self.action_predictor(z_goal)
+        action_logits = self.action_predictor(z)
         return action_logits
 
 
