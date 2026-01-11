@@ -1704,8 +1704,8 @@ def run_drone_simulation():
 
             # КРИТИЧНО: complexity и actions уже вычислены ДО блока expansion decision
             # Здесь применяем gate_temperature к routing gate (если actions доступен)
-            # КРИТИЧНО: применяем gate_temperature к routing gate
-                if agent.use_soft_routing and agent.routing_gate is not None:
+                # КРИТИЧНО: применяем gate_temperature к routing gate
+                if agent.use_soft_routing and agent.routing_gate is not None and actions is not None:
                     agent.routing_gate.set_temperature(actions["gate_temperature"])
             
             # КРИТИЧНО: Memory Scheduler - управление replay через сложность
