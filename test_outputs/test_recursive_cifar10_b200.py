@@ -1846,8 +1846,9 @@ class RecursiveAgent(nn.Module):
                 current_weakness_pred = self.self_model.detect_weakness(features)
                 current_weakness = current_weakness_pred.mean().item() if current_weakness_pred.numel() > 0 else 0.0
             
-            # 2. Если высокая слабость (>0.5), проигрываем все возможные действия
-            if current_weakness > 0.5:
+            # 2. Если есть слабость (>0.3), проигрываем все возможные действия
+            # КРИТИЧНО: снижен порог с 0.5 до 0.3 для более частой активации
+            if current_weakness > 0.3:
                 weakness_reductions = []  # насколько снизится Weakness для каждого действия
                 
                 for patch_idx in range(4):
@@ -1872,15 +1873,15 @@ class RecursiveAgent(nn.Module):
                         weakness_reductions.append(0.0)
                 
                 # 3. Выбираем действие с максимальным снижением Weakness
-                if weakness_reductions and max(weakness_reductions) > 0.01:  # минимум 0.01 снижения
+                if weakness_reductions and max(weakness_reductions) > 0.005:  # минимум 0.005 снижения (снижен с 0.01)
                     best_idx = np.argmax(weakness_reductions)
                     action_idx = torch.full((B,), best_idx, device=device, dtype=torch.long)
                     # Создаём action_logits (выбранное действие имеет высокий score)
                     action_logits = torch.zeros(B, 4, device=device)
                     action_logits[:, best_idx] = 1.0
                     
-                    # Логирование для отладки (только для первого элемента батча)
-                    if B > 0 and current_weakness > 0.7:  # только для высокой слабости
+                    # Логирование для отладки (чаще, для лучшей видимости)
+                    if B > 0 and current_weakness > 0.4:  # снижен порог логирования с 0.7 до 0.4
                         print(f"   [AUTONOMOUS ATTENTION] Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, reduction: {weakness_reductions[best_idx]:.3f})")
                     
                     return action_idx, action_logits
