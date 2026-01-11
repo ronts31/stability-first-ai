@@ -1807,18 +1807,21 @@ class RecursiveAgent(nn.Module):
             return logits_sum, feats
         return logits_sum
     
-    def select_action(self, features, goal_features=None, weakness_signal=None):
+    def select_action(self, features, goal_features=None, weakness_signal=None, image=None, class_hint=None):
         """
         Выбирает действие (attention/patch selection) на основе текущего состояния и цели.
         
-        КРИТИЧНО: Осознанное автономное внимание через прогнозирование снижения Weakness.
-        WorldModel спрашивает у SelfModel: "Какой патч (Zoom) даст мне больше информации,
-        чтобы снизить мою текущую Weakness?" и выбирает действие, которое максимально снижает неуверенность.
+        КРИТИЧНО: Активное латентное воображение - реальная симуляция Zoom для минимизации Weakness.
+        WorldModel делает внутреннюю симуляцию: "Если я посмотрю на уши, станет ли мне понятнее?"
+        Если прогноз говорит "Да", дрон делает Zoom. Это превращает систему из "распознавателя"
+        в "активного наблюдателя".
         
         Args:
             features: [B, feature_dim] - текущие features
             goal_features: [B, feature_dim] - целевые features (опционально)
             weakness_signal: [B, 1] или float - сигнал слабости от SelfModel (опционально)
+            image: [B, 3, H, W] - исходное изображение для реальной симуляции Zoom (опционально)
+            class_hint: [B] - подсказка о классе для улучшения внимания (опционально)
         
         Returns:
             action_idx: [B] - индекс выбранного patch (0..3)
@@ -1829,7 +1832,7 @@ class RecursiveAgent(nn.Module):
             B = features.size(0)
             return torch.randint(0, 4, (B,), device=features.device), None
         
-        # КРИТИЧНО: Осознанное автономное внимание - прогнозируем снижение Weakness
+        # КРИТИЧНО: Активное латентное воображение - реальная симуляция Zoom
         if self.use_self_model and self.use_world_model:
             B = features.size(0)
             device = features.device
@@ -1846,43 +1849,57 @@ class RecursiveAgent(nn.Module):
                 current_weakness_pred = self.self_model.detect_weakness(features)
                 current_weakness = current_weakness_pred.mean().item() if current_weakness_pred.numel() > 0 else 0.0
             
-            # 2. Если есть слабость (>0.3), проигрываем все возможные действия
-            # КРИТИЧНО: снижен порог с 0.5 до 0.3 для более частой активации
+            # 2. Если есть слабость (>0.3), проигрываем все возможные действия через реальную симуляцию
             if current_weakness > 0.3:
                 weakness_reductions = []  # насколько снизится Weakness для каждого действия
                 
+                # КРИТИЧНО: Реальная симуляция Zoom на изображении (если доступно)
+                use_real_simulation = (image is not None and hasattr(self, 'attention_action') and self.attention_action is not None)
+                
                 for patch_idx in range(4):
-                    # Создаём one-hot для этого действия
-                    action_onehot = torch.zeros(B, 4, device=device)
-                    action_onehot[:, patch_idx] = 1.0
-                    
-                    # Предсказываем следующее состояние для этого действия
-                    next_features_pred, _, _, _, _ = self.world_model.predict_next(features, action_onehot)
-                    
-                    if next_features_pred is not None:
-                        # КРИТИЧНО: Прогнозируем Weakness после применения этого действия
-                        # SelfModel оценивает, насколько уверенной станет модель после этого Zoom
-                        predicted_weakness = self.self_model.detect_weakness(next_features_pred)
-                        predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness
+                    if use_real_simulation:
+                        # РЕАЛЬНАЯ СИМУЛЯЦИЯ: применяем Zoom к изображению и получаем новые features
+                        # Это превращает систему в "активного наблюдателя"
+                        action_idx_temp = torch.full((B,), patch_idx, device=device, dtype=torch.long)
+                        image_zoomed = self.attention_action.apply_action(image, action_idx_temp, class_hint)
                         
-                        # Вычисляем снижение Weakness (чем больше снижение, тем лучше)
-                        weakness_reduction = current_weakness - predicted_weakness_mean
-                        weakness_reductions.append(weakness_reduction)
+                        # Получаем features после Zoom через backbone
+                        with torch.no_grad():
+                            features_after_zoom = self.shared_backbone(image_zoomed)
+                            
+                            # КРИТИЧНО: Прогнозируем Weakness после реального Zoom
+                            predicted_weakness = self.self_model.detect_weakness(features_after_zoom)
+                            predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness
+                            
+                            # Вычисляем снижение Weakness (чем больше снижение, тем лучше)
+                            weakness_reduction = current_weakness - predicted_weakness_mean
+                            weakness_reductions.append(weakness_reduction)
                     else:
-                        # Если предсказание не удалось, считаем что Weakness не изменится
-                        weakness_reductions.append(0.0)
+                        # FALLBACK: прогнозирование через WorldModel (если изображение недоступно)
+                        action_onehot = torch.zeros(B, 4, device=device)
+                        action_onehot[:, patch_idx] = 1.0
+                        
+                        next_features_pred, _, _, _, _ = self.world_model.predict_next(features, action_onehot)
+                        
+                        if next_features_pred is not None:
+                            predicted_weakness = self.self_model.detect_weakness(next_features_pred)
+                            predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness
+                            weakness_reduction = current_weakness - predicted_weakness_mean
+                            weakness_reductions.append(weakness_reduction)
+                        else:
+                            weakness_reductions.append(0.0)
                 
                 # 3. Выбираем действие с максимальным снижением Weakness
-                if weakness_reductions and max(weakness_reductions) > 0.005:  # минимум 0.005 снижения (снижен с 0.01)
+                if weakness_reductions and max(weakness_reductions) > 0.005:
                     best_idx = np.argmax(weakness_reductions)
                     action_idx = torch.full((B,), best_idx, device=device, dtype=torch.long)
-                    # Создаём action_logits (выбранное действие имеет высокий score)
                     action_logits = torch.zeros(B, 4, device=device)
                     action_logits[:, best_idx] = 1.0
                     
-                    # Логирование для отладки (чаще, для лучшей видимости)
-                    if B > 0 and current_weakness > 0.4:  # снижен порог логирования с 0.7 до 0.4
-                        print(f"   [AUTONOMOUS ATTENTION] Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, reduction: {weakness_reductions[best_idx]:.3f})")
+                    # Логирование для отладки
+                    if B > 0 and current_weakness > 0.4:
+                        sim_type = "REAL" if use_real_simulation else "PREDICTED"
+                        print(f"   [ACTIVE IMAGINATION] {sim_type} Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, reduction: {weakness_reductions[best_idx]:.3f})")
                     
                     return action_idx, action_logits
         
@@ -2955,25 +2972,30 @@ def run_drone_simulation():
                         # Конвертируем goal в goal_features (используем goal как features для simplicity)
                         goal_features = agent.internal_goals.goal_generator(features_f32)
                     
-                    # КРИТИЧНО: Автономное внимание через минимизацию слабости
+                    # КРИТИЧНО: Активное латентное воображение - реальная симуляция Zoom
                     # Если SelfModel сообщает о высокой Weakness, используем проигрывание вариантов
                     weakness_signal = None
                     if agent.use_self_model and len(agent.heads) > 0:
                         weakness_pred = agent.self_model.detect_weakness(features_f32)
                         weakness_signal = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
                     
-                    # Выбираем действие с учётом слабости
-                    action_idx, action_logits = agent.select_action(features_f32, goal_features, weakness_signal)
-                    
-                    # КРИТИЧНО: используем предсказания модели как class_hint для селективного внимания
-                    # Для Cat (класс 3) делаем zoom на центр (морда)
-                    # Используем outputs из текущего forward pass
+                    # КРИТИЧНО: Получаем class_hint для улучшения внимания
                     class_hint = None
                     if len(all_outputs) > 0:
-                        # Берём последний output для предсказания класса
                         pred_outputs = all_outputs[-1][:real_B, :10] if all_outputs[-1].size(0) >= real_B else all_outputs[-1][:, :10]
                         class_hint = pred_outputs.argmax(dim=1)  # [real_B]
                     
+                    # Выбираем действие с учётом слабости и реальным изображением для симуляции
+                    # КРИТИЧНО: передаём image для реальной симуляции Zoom
+                    action_idx, action_logits = agent.select_action(
+                        features_f32, 
+                        goal_features, 
+                        weakness_signal,
+                        image=data_real[:real_B] if real_B > 0 else None,  # КРИТИЧНО: реальное изображение для симуляции
+                        class_hint=class_hint
+                    )
+                    
+                    # КРИТИЧНО: class_hint уже получен выше в select_action
                     # Применяем действие к изображению с селективным вниманием
                     x_next = agent.apply_action_to_image(data_real, action_idx, class_hint)
                     with torch.no_grad():
