@@ -3755,8 +3755,9 @@ def run_drone_simulation():
                         has_budget = len(agent.heads) < MAX_LAYERS
                     else:
                         print(f"[EVOLUTION] Polyglot Synthesis: No mergeable heads found. Forcing SLEEP for consolidation.")
-                        # Если слияние невозможно, принудительно запускаем SLEEP
-                        if steps_since_sleep >= MIN_SLEEP_INTERVAL:
+                        # Если слияние невозможно, принудительно запускаем SLEEP (если прошло достаточно шагов)
+                        # Используем ту же логику, что и в Intelligent sleep ниже
+                        if steps_since_sleep >= 500:  # минимум 500 шагов между sleep
                             should_sleep = True
 
             # Intelligent sleep: консолидация знаний из нескольких heads в один
