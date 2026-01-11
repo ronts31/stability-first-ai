@@ -2154,28 +2154,31 @@ class RecursiveAgent(nn.Module):
                 # а свою "уверенность" в структуре. Так Голова 2 учится понимать "опору" (ноги животного)
                 # через призму "шасси".
                 loss_cross_head = torch.zeros((), device=device)
-                if len(teacher_model.heads) > 1 and self.use_soft_routing:
+                if len(teacher_model.heads) > 1 and self.use_soft_routing and hasattr(teacher_model, 'shared_backbone'):
                     # Получаем предсказания каждой головы teacher
                     teacher_features = teacher_model.shared_backbone(noise)
                     if teacher_model.use_time_mixer and hasattr(teacher_model, 'time_mixer'):
                         teacher_features = teacher_model.time_mixer(teacher_features, use_adaptive=False)
                     
-                    # Вычисляем латентные представления каждой головы
+                    # Вычисляем латентные представления каждой головы (hidden states перед классификацией)
                     head_latents = []
                     for head_idx in range(len(teacher_model.heads)):
                         with torch.no_grad():
-                            _, head_latent = teacher_model.heads[head_idx](teacher_features, prev_hiddens=[])
-                            head_latents.append(head_latent.detach())
+                            # Получаем hidden state перед финальным классификатором
+                            h = teacher_features
+                            for adapter in teacher_model.heads[head_idx].adapters:
+                                if len(head_latents) < len(teacher_model.heads[head_idx].adapters):
+                                    h = h + adapter(h)  # адаптеры для предыдущих голов
+                            head_latents.append(h.detach())
                     
                     # Студент должен предсказывать латентные представления всех голов
                     # Это учит его "полиглотству" - пониманию разных точек зрения
-                    student_latent = student_head.fc.weight @ backbone_features.T  # упрощенное латентное представление
+                    # Используем backbone_features студента как его латентное представление
+                    student_latent = backbone_features
                     for head_latent in head_latents:
-                        # MSE между латентными представлениями
-                        loss_cross_head = loss_cross_head + F.mse_loss(
-                            student_latent[:head_latent.size(0), :head_latent.size(1)],
-                            head_latent
-                        )
+                        if student_latent.size() == head_latent.size():
+                            # MSE между латентными представлениями
+                            loss_cross_head = loss_cross_head + F.mse_loss(student_latent, head_latent)
                     loss_cross_head = loss_cross_head / len(head_latents) if len(head_latents) > 0 else loss_cross_head
                 
                 # 6. КРИТИЧНО: Routing Confidence Distillation
