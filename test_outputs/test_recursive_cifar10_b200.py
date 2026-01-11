@@ -967,135 +967,51 @@ def run_drone_simulation():
             current_opt = optimizer_phase2 if optimizer_phase2 is not None else optimizer
             current_opt.zero_grad(set_to_none=True)
 
-            # sample replay once per step (used for replay loss + pain)
+            # sample replay once per step
             x_replay, y_replay = agent.sample_replay_batch(batch_size=64, device=device)
 
+            # ---- forward (BF16) ----
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 outputs, features = agent(data, return_features=True)
+
+                # base loss (new task)
                 loss_new = criterion_train(outputs[:, :10], target)
-                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck, Cat↔Dog confusion
                 pm = pair_margin_loss(outputs[:, :10], target, margin=0.15)
                 loss_new = loss_new + 0.05 * pm
 
+                # replay loss
                 replay_loss = 0.0
                 if x_replay is not None:
                     out_rep = agent(x_replay)
                     replay_loss = criterion_train(out_rep[:, :10], y_replay)
 
-                # Compute entropy for crystallization (before other losses)
-                with torch.no_grad():
-                    probs_m = torch.softmax(outputs[:, :10], dim=1)
-                    ent_batch = (-(probs_m * torch.log(probs_m + 1e-9)).sum(dim=1)).mean().item()
+            # entropy (no grad)
+            with torch.no_grad():
+                probs_m = torch.softmax(outputs[:, :10], dim=1)
+                ent_batch = (-(probs_m * torch.log(probs_m + 1e-9)).sum(dim=1)).mean().item()
 
-                # subjective time critic + stability anchor (normalized)
-                surprise = None
-                stability_loss = 0.0
-                current_lambda = 10000.0
+            # ---- subjective time critic (per-sample) ----
+            surprise = None
+            critic_loss = None
+            if use_subjective_time and agent.ref_backbone is not None:
+                pred_ps = agent.critic(features.detach())          # [B]
+                real_ps = criterion_none(outputs[:, :10], target)  # [B]
+                surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
+                critic_loss = F.mse_loss(pred_ps, real_ps.detach())
 
-                if use_subjective_time and agent.ref_backbone is not None:
-                    pred_ps = agent.critic(features.detach())
-                    real_ps = criterion_none(outputs[:, :10], target)
-                    surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
-                    current_lambda = SubjectiveTimeCritic.compute_lambda(surprise, base_lambda=10000.0, sensitivity=10.0)
-
-                    # normalized stability over trainable backbone params only
-                    cnt = 0
-                    for p, p_ref in zip(agent.shared_backbone.parameters(), agent.ref_backbone.parameters()):
-                        if p.requires_grad:
-                            stability_loss = stability_loss + F.mse_loss(p, p_ref, reduction="mean")
-                            cnt += 1
-                    if cnt > 0:
-                        stability_loss = stability_loss / cnt
-
-                    critic_loss = F.mse_loss(pred_ps, real_ps.detach())
-                else:
-                    critic_loss = None
-
-                # adaptive pain: gradient conflict -> adaptive lambda
-                adaptive_lambda = current_lambda
-                pain_value = 0.0  # default if not computed
-                if use_adaptive_pain and (x_replay is not None):
-                    # only params that are actually updated by optimizer
-                    backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
-                    if len(backbone_params) > 0:
-                        # Need grads; do NOT autocast for grad vectors reliability
-                        # compute outside autocast block in fp32
-                        pass
-
-                # CLIP KL (gated by CLIP confidence)
-                kl_loss = 0.0
-                if agent.use_curiosity:
-                    probs_model = torch.softmax(outputs[:, :10], dim=1)
-                    ent = -torch.sum(probs_model * torch.log(probs_model + 1e-9), dim=1)
-                    hi = ent > 1.5
-                    if hi.any():
-                        idx = torch.where(hi)[0]
-                        MAX_UNCERTAIN = 16
-                        if idx.numel() > MAX_UNCERTAIN:
-                            idx = idx[:MAX_UNCERTAIN]
-                        clip_targets = agent.get_clip_soft_targets(data[idx])
-                        if clip_targets is not None:
-                            clip_conf, _ = clip_targets.max(dim=1)
-                            mask_ok = clip_conf > 0.8
-                            if mask_ok.any():
-                                idx2 = idx[mask_ok]
-                                clip_probs_ok = clip_targets[mask_ok]
-                                kl = F.kl_div(
-                                    torch.log(probs_model[idx2] + 1e-9),
-                                    clip_probs_ok,
-                                    reduction="batchmean",
-                                )
-                                # lower max weight than before (0.1)
-                                if expansion_count > 0:
-                                    steps_since_expand = step - last_expansion_step
-                                    kl_weight = min(0.1, 0.1 * (steps_since_expand / 500.0))
-                                else:
-                                    kl_weight = 0.1
-                                kl_loss = kl_weight * kl
-                                if step % 50 == 0:
-                                    print(f"[LOG] High entropy: {int(idx2.numel())}, KL: {float(kl_loss.item()):.4f}")
-
-                # total loss assembly
-                total_loss = loss_new
-                if x_replay is not None:
-                    total_loss = total_loss + 0.25 * replay_loss
-                if (use_subjective_time and agent.ref_backbone is not None) and (stability_loss != 0.0):
-                    total_loss = total_loss + current_lambda * stability_loss
-                if kl_loss != 0.0:
-                    total_loss = total_loss + kl_loss
-
-            # Update time crystallization (after computing surprise, pain, entropy)
-            if expansion_count > 0 and use_subjective_time:
-                surp_val = surprise.item() if surprise is not None else 0.0
-                agent.update_time_crystallization(surp_val, pain_value, ent_batch)
-                
-                # Auto hard-freeze if needed
-                agent.auto_hard_freeze_if_needed()
-                
-                # Crystallization regularizer (replaces old hard stability_loss with adaptive strength)
-                cryst_reg = agent.crystallization_regularizer()
-                if cryst_reg != 0.0:
-                    # Сила защиты: чем выше crystal_level, тем сильнее закрепление
-                    cryst_strength = 2000.0 * agent.crystal_level
-                    total_loss = total_loss + cryst_strength * cryst_reg
-
-            # critic update (separate)
-            if use_subjective_time and critic_loss is not None:
-                critic_optimizer.zero_grad(set_to_none=True)
-                critic_loss.backward(retain_graph=True)
-                critic_optimizer.step()
-
-            # adaptive pain grad conflict in fp32 (optional)
+            # ---- adaptive pain (MUST be computed BEFORE crystallization update) ----
+            pain_value = 0.0
+            adaptive_lambda = None
             if use_adaptive_pain and (x_replay is not None):
                 backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
                 if len(backbone_params) > 0:
-                    # compute gradients for new and old tasks
-                    # Use fp32 for grad vectors
+                    # fp32 grads
                     with torch.amp.autocast("cuda", enabled=False):
-                        out_new = agent(data.float())
-                        ln = criterion_train(out_new[:, :10], target)
-                        out_old = agent(x_replay.float())
-                        lo = criterion_train(out_old[:, :10], y_replay)
+                        out_new_fp32 = agent(data.float())
+                        ln = criterion_train(out_new_fp32[:, :10], target)
+
+                        out_old_fp32 = agent(x_replay.float())
+                        lo = criterion_train(out_old_fp32[:, :10], y_replay)
 
                     g_new = torch.autograd.grad(ln, backbone_params, retain_graph=True, allow_unused=True)
                     g_old = torch.autograd.grad(lo, backbone_params, retain_graph=True, allow_unused=True)
@@ -1112,14 +1028,76 @@ def run_drone_simulation():
                         pain_value = max(0.0, min(1.0, (1.0 - cos) * 0.5))
                         adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain_value
 
-                        # if stability loss exists, replace lambda (re-weight stability)
-                        if use_subjective_time and agent.ref_backbone is not None and stability_loss != 0.0:
-                            # small correction term (avoid double-counting)
-                            # We approximate by adding delta_lambda * stability_loss
-                            delta = adaptive_lambda - current_lambda
-                            if abs(delta) > 1e-6:
-                                total_loss = total_loss + float(delta) * stability_loss
+            # ---- CLIP KL (unchanged, but computed AFTER forward) ----
+            kl_loss = 0.0
+            if agent.use_curiosity:
+                probs_model = torch.softmax(outputs[:, :10], dim=1)
+                ent = -torch.sum(probs_model * torch.log(probs_model + 1e-9), dim=1)
+                hi = ent > 1.5
+                if hi.any():
+                    idx = torch.where(hi)[0]
+                    MAX_UNCERTAIN = 16
+                    if idx.numel() > MAX_UNCERTAIN:
+                        idx = idx[:MAX_UNCERTAIN]
+                    clip_targets = agent.get_clip_soft_targets(data[idx])
+                    if clip_targets is not None:
+                        clip_conf, _ = clip_targets.max(dim=1)
+                        mask_ok = clip_conf > 0.8
+                        if mask_ok.any():
+                            idx2 = idx[mask_ok]
+                            clip_probs_ok = clip_targets[mask_ok]
+                            kl = F.kl_div(
+                                torch.log(probs_model[idx2] + 1e-9),
+                                clip_probs_ok,
+                                reduction="batchmean",
+                            )
+                            if expansion_count > 0:
+                                steps_since_expand = step - last_expansion_step
+                                kl_weight = min(0.1, 0.1 * (steps_since_expand / 500.0))
+                            else:
+                                kl_weight = 0.1
+                            kl_loss = kl_weight * kl
+                            if step % 50 == 0:
+                                print(f"[LOG] High entropy: {int(idx2.numel())}, KL: {float(kl_loss.item()):.4f}")
 
+            # ---- UPDATE TIME CRYSTALLIZATION (NOW sees pain_value correctly) ----
+            if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
+                surp_val = float(surprise.item()) if surprise is not None else 0.0
+                agent.update_time_crystallization(surp_val, pain_value, ent_batch)
+                agent.auto_hard_freeze_if_needed()
+
+            # ---- assemble total loss (single protection mechanism) ----
+            total_loss = loss_new
+
+            if x_replay is not None:
+                total_loss = total_loss + 0.25 * replay_loss
+
+            if kl_loss != 0.0:
+                total_loss = total_loss + kl_loss
+
+            # crystallization regularizer replaces old current_lambda * stability_loss
+            if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
+                cryst_reg = agent.crystallization_regularizer()
+                if cryst_reg != 0.0:
+                    # crystal strength controlled by crystal_level and optionally pain (adaptive_lambda)
+                    # base strength: crystal_level
+                    base_strength = 2000.0 * agent.crystal_level
+
+                    # optional: pain makes protection stronger when gradients conflict
+                    if adaptive_lambda is not None:
+                        # map adaptive_lambda [100..20000] to multiplier [0.5..1.5]
+                        mult = 0.5 + (min(20000.0, max(100.0, adaptive_lambda)) - 100.0) / (20000.0 - 100.0)
+                        base_strength = base_strength * mult
+
+                    total_loss = total_loss + base_strength * cryst_reg
+
+            # ---- critic update ----
+            if use_subjective_time and critic_loss is not None:
+                critic_optimizer.zero_grad(set_to_none=True)
+                critic_loss.backward(retain_graph=True)
+                critic_optimizer.step()
+
+            # ---- backward main ----
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
             current_opt.step()
