@@ -1125,7 +1125,9 @@ def run_drone_simulation():
 
                             with torch.no_grad():
                                 agent.eval()
-                                mo = agent(data[0:1])
+                                # Перемещаем data на устройство перед вызовом agent
+                                data_sample = data[0:1].to(device, non_blocking=True)
+                                mo = agent(data_sample)
                                 agent.train()
                                 mp = torch.softmax(mo[:, :10], dim=1)
                                 model_conf, model_pred = mp.max(dim=1)
