@@ -948,7 +948,11 @@ class TimeMixer(nn.Module):
         self.ema_decay = ema_decay
         
         # Обучаемые веса для смешивания временных слоев
-        self.mix_weights = nn.Parameter(torch.ones(memory_size + 1) / (memory_size + 1))  # +1 для текущего состояния
+        # КРИТИЧНО: больший вес для текущего состояния, меньший для старых (предотвращает размывание)
+        initial_weights = torch.ones(memory_size + 1)
+        initial_weights[0] = 2.0  # текущее состояние важнее
+        initial_weights[1:] = 0.5 / memory_size  # старые состояния менее важны
+        self.mix_weights = nn.Parameter(initial_weights / initial_weights.sum())
         
         # EMA буферы для хранения прошлых состояний (не обучаемые)
         self.register_buffer('memory_buffer', torch.zeros(memory_size, feature_dim))
@@ -987,31 +991,53 @@ class TimeMixer(nn.Module):
             self.memory_count[:-1] * self.ema_decay
         ], dim=0)
     
-    def forward(self, features, use_adaptive=True):
+    def forward(self, features, use_adaptive=True, surprise=None):
         """
         Смешивает текущие features с прошлыми состояниями.
         
         Args:
             features: [B, feature_dim] - текущие features из backbone
             use_adaptive: bool - использовать адаптивное смешивание или фиксированные веса
+            surprise: float - уровень surprise (опционально, для адаптивного забывания)
         
         Returns:
             mixed_features: [B, feature_dim] - смешанные features
         """
         B = features.size(0)
         
+        # КРИТИЧНО: При высокой surprise (новая среда) - забываем старые состояния быстрее
+        # Это предотвращает размывание признаков при переходе между фазами
+        forget_factor = 1.0
+        if surprise is not None and surprise > 0.5:  # высокая surprise = новая среда
+            # Увеличиваем забывание: surprise 0.5 -> forget=0.5, surprise 1.0 -> forget=0.0
+            forget_factor = max(0.0, 1.0 - 2.0 * (surprise - 0.5))  # [0.5..1.0] -> [0.0..1.0]
+        
         # Подготавливаем все состояния для смешивания
         # [current, memory[0], memory[1], ..., memory[M-1]]
         states = [features]  # текущее состояние
         
-        # Добавляем прошлые состояния (повторяем для каждого элемента батча)
+        # КРИТИЧНО: Вычисляем "новизну" на основе расстояния между текущими и прошлыми features
+        # Это позволяет адаптивно забывать старые состояния без явного surprise
+        novelty_signal = None
+        if self.memory_count[0] > 0:  # если есть хотя бы одно прошлое состояние
+            recent_memory = self.memory_buffer[0].unsqueeze(0).expand(B, -1)  # [B, feature_dim]
+            # Вычисляем косинусное расстояние между текущими и недавними features
+            cosine_sim = F.cosine_similarity(features, recent_memory, dim=1)  # [B]
+            novelty_signal = (1.0 - cosine_sim.mean()).item()  # [0..2], чем выше, тем новее
+            # Если новизна высокая (>0.3), увеличиваем забывание
+            if novelty_signal > 0.3:
+                forget_factor = max(0.0, forget_factor * (1.0 - novelty_signal * 0.5))
+        
+        # Добавляем прошлые состояния с учётом забывания
         for i in range(self.memory_size):
             if self.memory_count[i] > 0:  # если память инициализирована
                 memory_state = self.memory_buffer[i].unsqueeze(0).expand(B, -1)  # [B, feature_dim]
-                states.append(memory_state)
+                # Применяем забывание: старые состояния становятся менее важными
+                memory_weight = forget_factor ** (i + 1)  # более старые состояния забываются быстрее
+                states.append(memory_state * memory_weight)
             else:
-                # Если память не инициализирована, используем текущие features
-                states.append(features)
+                # Если память не инициализирована, используем текущие features с низким весом
+                states.append(features * forget_factor * 0.1)
         
         # Объединяем все состояния
         all_states = torch.stack(states, dim=1)  # [B, M+1, feature_dim]
@@ -1021,9 +1047,19 @@ class TimeMixer(nn.Module):
             # Адаптивное смешивание на основе текущих features
             mix_logits = self.adaptive_mixer(features)  # [B, M+1]
             mix_weights = mix_logits
+            # КРИТИЧНО: При высокой surprise увеличиваем вес текущего состояния
+            if surprise is not None and surprise > 0.5:
+                current_weight_boost = min(0.5, (surprise - 0.5) * 1.0)  # [0..0.5] при surprise [0.5..1.0]
+                mix_weights[:, 0] = mix_weights[:, 0] + current_weight_boost  # увеличиваем вес текущего
+                mix_weights = mix_weights / mix_weights.sum(dim=1, keepdim=True)  # нормализуем
         else:
             # Фиксированные веса (обучаемые параметры)
             mix_weights = torch.softmax(self.mix_weights, dim=0)  # [M+1]
+            # КРИТИЧНО: При высокой surprise увеличиваем вес текущего состояния
+            if surprise is not None and surprise > 0.5:
+                current_weight_boost = min(0.3, (surprise - 0.5) * 0.6)  # [0..0.3] при surprise [0.5..1.0]
+                mix_weights[0] = mix_weights[0] + current_weight_boost
+                mix_weights = mix_weights / mix_weights.sum()  # нормализуем
             mix_weights = mix_weights.unsqueeze(0).expand(B, -1)  # [B, M+1]
         
         # Смешиваем состояния
