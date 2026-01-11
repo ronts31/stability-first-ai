@@ -107,6 +107,13 @@ class AttentionAction(nn.Module):
             6: [2, 3],  # Frog - низ
             7: [1, 2],  # Horse - центр
         }
+        
+        # КРИТИЧНО: "Логика боли" для Ship/Plane (синий фон)
+        # Если фон синий - ищем различия: киль/мачта для Ship, крылья для Plane
+        # Ship (8): нижняя часть (patch 2 или 3) - где киль/мачта
+        # Plane (0): верхняя часть (patch 0 или 1) - где крылья
+        self.class_to_patch_preference[0] = [0, 1]  # Plane - верх (крылья)
+        self.class_to_patch_preference[8] = [2, 3]  # Ship - низ (киль/мачта)
     
     def apply_action(self, x, action_idx, class_hint=None):
         """
@@ -134,8 +141,23 @@ class AttentionAction(nn.Module):
             # КРИТИЧНО: если есть class_hint, корректируем patch для лучшего фокуса
             if class_hint is not None:
                 class_id = int(class_hint[b].item()) if torch.is_tensor(class_hint[b]) else int(class_hint[b])
+                
+                # КРИТИЧНО: "Логика боли" для Ship/Plane - проверяем синий фон
+                if class_id in [0, 8]:  # Plane или Ship
+                    # Проверяем средний цвет фона (верхняя часть изображения)
+                    bg_color = x[b, :, :H//4, :].mean(dim=(1, 2))  # [3] - средний RGB верхней части
+                    # Синий фон: B > R и B > G
+                    is_blue_bg = (bg_color[2] > bg_color[0] + 0.1) and (bg_color[2] > bg_color[1] + 0.1)
+                    
+                    if is_blue_bg:
+                        # Синий фон - используем специфичные patches для различения
+                        if class_id == 0:  # Plane - верх (крылья)
+                            idx = 0 if idx not in [0, 1] else idx
+                        elif class_id == 8:  # Ship - низ (киль/мачта)
+                            idx = 2 if idx not in [2, 3] else idx
+                
+                # Обычная логика для других классов
                 if class_id in self.class_to_patch_preference:
-                    # Если выбранный patch не в предпочтительных, используем предпочтительный
                     preferred = self.class_to_patch_preference[class_id]
                     if idx not in preferred:
                         # Выбираем ближайший предпочтительный patch
@@ -1551,8 +1573,8 @@ class RecursiveAgent(nn.Module):
         # Lazarus v3 параметры
         w_cons = 1.0  # Consistency (главный компонент)
         w_stab = 0.5  # Stability
-        w_ent = 0.05  # Entropy Floor
-        H0 = 1.5      # Минимальная энтропия
+        w_ent = 0.08  # Entropy Floor (усилен с 0.05 для большей любознательности)
+        H0 = 2.1      # Минимальная энтропия (поднят с 1.5 для большей любознательности после пробуждения)
         epsilon = 0.05
         
         for epoch in range(15):
@@ -1605,6 +1627,42 @@ class RecursiveAgent(nn.Module):
                 print(f"   Epoch {epoch+1}/15: Loss={total_loss/batches:.4f}, H={entropy.item():.3f}")
         
         print("☀️ WAKING UP: Lazarus Consolidation Complete.")
+        
+        # КРИТИЧНО: Визуализация снов - сохраняем примеры снов для анализа
+        if self.use_vae_dreams and self.vae_trained:
+            try:
+                import matplotlib.pyplot as plt
+                import os
+                
+                # Генерируем несколько примеров снов для визуализации
+                num_dream_samples = 16
+                dream_samples = self.sample_dreams(num_dream_samples, device)
+                
+                # Денормализуем для визуализации (CIFAR-10 нормализация: mean=0.5, std=0.5)
+                dream_vis = dream_samples.detach().cpu()
+                dream_vis = torch.clamp((dream_vis + 1.0) / 2.0, 0.0, 1.0)  # [-1,1] -> [0,1]
+                
+                # Создаём grid 4x4
+                fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+                for i in range(num_dream_samples):
+                    row, col = i // 4, i % 4
+                    img = dream_vis[i].permute(1, 2, 0).numpy()
+                    axes[row, col].imshow(img)
+                    axes[row, col].axis('off')
+                    axes[row, col].set_title(f"Dream {i+1}", fontsize=8)
+                
+                plt.suptitle("VAE Dreams During SLEEP (Lazarus Consolidation)", fontsize=12)
+                plt.tight_layout()
+                
+                # Сохраняем
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in globals() else os.getcwd()
+                dream_path = os.path.join(project_root, "test_outputs", "test_outputs", "sleep_dreams.png")
+                os.makedirs(os.path.dirname(dream_path), exist_ok=True)
+                plt.savefig(dream_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"   [DREAMS] Saved {num_dream_samples} dream samples to {dream_path}")
+            except Exception as e:
+                print(f"   [WARNING] Could not save dream visualization: {e}")
         
         # Заменяем сложный мозг на одного Студента
         self.heads = nn.ModuleList([student_head])
