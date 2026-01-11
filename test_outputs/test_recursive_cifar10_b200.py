@@ -1938,6 +1938,102 @@ class RecursiveAgent(nn.Module):
         
         return budget_change
     
+    def _polyglot_synthesis(self, device, similarity_threshold=0.80):
+        """
+        КРИТИЧНО: "Синтез Полиглота" - умное слияние голов для разблокировки Head Limit.
+        
+        Когда достигнут лимит голов, система автоматически находит и сливает наиболее похожие пары,
+        освобождая место для новых знаний. Это превращает [CRITICAL] в [EVOLUTION].
+        
+        Args:
+            device: torch.device
+            similarity_threshold: float - порог косинусного сходства для слияния (0.80 = более агрессивный)
+        
+        Returns:
+            bool - True если хотя бы одна пара была слита, False если слияние невозможно
+        """
+        if len(self.heads) < 2:
+            return False  # Нужно минимум 2 головы для слияния
+        
+        print(f"   [POLYGLOT SYNTHESIS] Analyzing {len(self.heads)} heads for intelligent merging...")
+        
+        # Вычисляем косинусное сходство весов между всеми парами голов
+        similarities = []
+        head_pairs = []
+        
+        for i in range(len(self.heads)):
+            for j in range(i + 1, len(self.heads)):
+                # Получаем веса обеих голов
+                try:
+                    weights_i = torch.cat([p.flatten() for p in self.heads[i].parameters() if p.requires_grad])
+                    weights_j = torch.cat([p.flatten() for p in self.heads[j].parameters() if p.requires_grad])
+                    
+                    if weights_i.numel() == 0 or weights_j.numel() == 0:
+                        continue
+                    
+                    # Нормализуем для косинусного сходства
+                    weights_i_norm = F.normalize(weights_i, p=2, dim=0)
+                    weights_j_norm = F.normalize(weights_j, p=2, dim=0)
+                    
+                    # Косинусное сходство
+                    similarity = (weights_i_norm * weights_j_norm).sum().item()
+                    similarities.append(similarity)
+                    head_pairs.append((i, j))
+                except Exception as e:
+                    print(f"   [WARNING] Could not compute similarity for heads {i} and {j}: {e}")
+                    continue
+        
+        if len(similarities) == 0:
+            print(f"   [POLYGLOT SYNTHESIS] No valid head pairs found for comparison.")
+            return False
+        
+        # Находим пару с максимальным сходством
+        max_similarity_idx = np.argmax(similarities)
+        max_similarity = similarities[max_similarity_idx]
+        best_pair = head_pairs[max_similarity_idx]
+        i, j = best_pair
+        
+        if max_similarity >= similarity_threshold:
+            print(f"   [POLYGLOT SYNTHESIS] Found mergeable pair: Head {i} ↔ Head {j} (cosine={max_similarity:.3f})")
+            
+            # Сохраняем активные классы обеих голов перед слиянием
+            classes_i = self.active_classes_per_column.get(i, [])
+            classes_j = self.active_classes_per_column.get(j, [])
+            merged_classes = sorted(list(set(classes_i + classes_j)))  # объединяем классы
+            
+            # Сливаем веса: усредняем параметры двух голов
+            with torch.no_grad():
+                for param_i, param_j in zip(self.heads[i].parameters(), self.heads[j].parameters()):
+                    if param_i.requires_grad and param_j.requires_grad and param_i.shape == param_j.shape:
+                        # Усредняем веса: 50% от каждой головы
+                        merged_weight = 0.5 * param_i.data + 0.5 * param_j.data
+                        param_i.data.copy_(merged_weight)
+            
+            # Удаляем одну из голов (оставляем head i, удаляем head j)
+            # КРИТИЧНО: Обновляем active_classes_per_column перед удалением
+            self.active_classes_per_column[i] = merged_classes
+            # Удаляем head j из словаря и сдвигаем индексы
+            new_active_classes = {}
+            for old_idx, classes in self.active_classes_per_column.items():
+                if old_idx < j:
+                    new_active_classes[old_idx] = classes
+                elif old_idx > j:
+                    new_active_classes[old_idx - 1] = classes  # сдвигаем индексы
+            self.active_classes_per_column = new_active_classes
+            
+            # Удаляем head j из ModuleList
+            heads_list = list(self.heads)
+            del heads_list[j]
+            self.heads = nn.ModuleList(heads_list)
+            
+            print(f"   [POLYGLOT SYNTHESIS] ✓ Merged Head {j} into Head {i}. Classes: {merged_classes}")
+            print(f"   [POLYGLOT SYNTHESIS] Heads remaining: {len(self.heads)}")
+            
+            return True
+        else:
+            print(f"   [POLYGLOT SYNTHESIS] No mergeable heads found (max similarity={max_similarity:.3f} < {similarity_threshold})")
+            return False
+    
     def expand(self, new_classes_indices, use_fractal_time=False, train_late_backbone=True):
         """
         Расширяет агента новой головой. Кристаллизация теперь автоматическая через update_time_crystallization.
@@ -3646,9 +3742,20 @@ def run_drone_simulation():
                 remaining = COOLDOWN_STEPS - (step - last_expansion_step)
                 print(f"[COOLDOWN] Shock detected but refractory period ({remaining} steps)")
             elif is_shock and not has_budget:
-                # В элегантном режиме expansion не используется, поэтому не нужно проверять лимит
-                if not agent.use_elegant_mode:
-                    print(f"\n[CRITICAL] Head Limit ({MAX_LAYERS}) reached. Consider SLEEP here (disabled in this file).")
+                # КРИТИЧНО: "Синтез Полиглота" - умное слияние голов для разблокировки Head Limit
+                # Вместо блокировки сливаем похожие головы, освобождая место для новых
+                if not agent.use_elegant_mode and len(agent.heads) >= MAX_LAYERS:
+                    print(f"\n[EVOLUTION] Head Limit ({MAX_LAYERS}) reached. Initiating Polyglot Synthesis...")
+                    merge_success = agent._polyglot_synthesis(device, similarity_threshold=0.80)  # более агрессивный порог для слияния
+                    if merge_success:
+                        print(f"[EVOLUTION] Polyglot Synthesis successful! Heads: {len(agent.heads)}/{MAX_LAYERS}. Budget freed for expansion.")
+                        # После успешного слияния можно попробовать expansion снова
+                        has_budget = len(agent.heads) < MAX_LAYERS
+                    else:
+                        print(f"[EVOLUTION] Polyglot Synthesis: No mergeable heads found. Forcing SLEEP for consolidation.")
+                        # Если слияние невозможно, принудительно запускаем SLEEP
+                        if steps_since_sleep >= MIN_SLEEP_INTERVAL:
+                            should_sleep = True
 
             # Intelligent sleep: консолидация знаний из нескольких heads в один
             steps_since_sleep = step - last_sleep_step
