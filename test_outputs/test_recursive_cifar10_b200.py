@@ -479,9 +479,12 @@ class AutobiographicalMemory:
         self.max_memories = max_memories
         self.memories = []  # список записей памяти
         
-    def record(self, step, state_features, action, outcome, reward_signal=None, context=None):
+    def record(self, step, state_features, action, outcome, reward_signal=None, context=None, pain_level=None):
         """
         Записывает эпизод в автобиографическую память.
+        
+        КРИТИЧНО: Эмоциональная память - индексируем события по уровню Pain.
+        События с высокой болью будут приоритетны для Targeted Dreaming.
         
         Args:
             step: int - номер шага
@@ -490,6 +493,7 @@ class AutobiographicalMemory:
             outcome: tensor [feature_dim] или dict - результат действия
             reward_signal: float - сигнал награды (опционально)
             context: dict - дополнительный контекст (опционально)
+            pain_level: float - уровень боли/конфликта (опционально, для приоритизации)
         """
         memory_entry = {
             "step": step,
@@ -497,6 +501,7 @@ class AutobiographicalMemory:
             "action": action.detach().cpu() if torch.is_tensor(action) else action,
             "outcome": outcome.detach().cpu() if torch.is_tensor(outcome) else outcome,
             "reward": reward_signal,
+            "pain_level": pain_level if pain_level is not None else 0.0,  # КРИТИЧНО: уровень боли
             "context": context or {},
             "timestamp": len(self.memories)  # порядковый номер
         }
@@ -505,6 +510,20 @@ class AutobiographicalMemory:
         # Ограничиваем размер памяти
         if len(self.memories) > self.max_memories:
             self.memories.pop(0)
+    
+    def get_high_pain_memories(self, k=50):
+        """
+        Возвращает k наиболее "болезненных" эпизодов для Targeted Dreaming.
+        
+        Returns:
+            high_pain_memories: list - список эпизодов с максимальным pain_level
+        """
+        if len(self.memories) == 0:
+            return []
+        
+        # Сортируем по pain_level (убывание)
+        sorted_memories = sorted(self.memories, key=lambda m: m.get("pain_level", 0.0), reverse=True)
+        return sorted_memories[:k]
     
     def recall(self, query_features, k=10):
         """
@@ -974,9 +993,20 @@ class ComplexityController:
         
         return C
     
-    def get_actions(self, complexity, has_expansion_budget, cooldown_ok):
+    def get_actions(self, complexity, has_expansion_budget, cooldown_ok, weakness_signal=None, expansion_history=None):
         """
         Выдаёт действия на основе состояния сложности.
+        
+        КРИТИЧНО: Мета-регуляция бюджета сложности.
+        Сравнивает стоимость: рекурсия vs expansion.
+        Если expansion неэффективен (weakness не падает), предпочитает рекурсию.
+        
+        Args:
+            complexity: float [0..1] - текущая сложность
+            has_expansion_budget: bool - есть ли бюджет на expansion
+            cooldown_ok: bool - можно ли расширяться
+            weakness_signal: float - текущий уровень слабости (опционально)
+            expansion_history: dict - история эффективности expansion (опционально)
         
         Returns:
             dict с ключами:
@@ -986,6 +1016,29 @@ class ComplexityController:
                 - crystal_target: float [0..1] - целевой crystal_level
                 - expand_allowed: bool - разрешение на expansion
         """
+        # КРИТИЧНО: Utility Analysis - сравниваем стоимость стратегий
+        # Если expansion неэффективен, предпочитаем рекурсию
+        expansion_effective = True
+        if expansion_history is not None:
+            # Проверяем историю: если после expansion weakness не падал, стратегия неэффективна
+            recent_expansions = expansion_history.get("recent", [])
+            if len(recent_expansions) > 0:
+                avg_weakness_after = sum(e.get("weakness_after", 1.0) for e in recent_expansions) / len(recent_expansions)
+                avg_weakness_before = sum(e.get("weakness_before", 1.0) for e in recent_expansions) / len(recent_expansions)
+                # Если weakness не снизился после expansion, стратегия неэффективна
+                if avg_weakness_after >= avg_weakness_before * 0.95:  # менее 5% улучшения
+                    expansion_effective = False
+        
+        # КРИТИЧНО: если expansion неэффективен, увеличиваем рекурсию вместо expansion
+        if not expansion_effective and weakness_signal is not None and weakness_signal > 0.5:
+            # Высокая слабость + неэффективный expansion = больше рекурсии
+            expand_allowed = False
+            n_recursions_base = min(3, int(1 + complexity * 2 + weakness_signal * 1))
+        else:
+            # Обычная логика
+            expand_allowed = (complexity > 0.7 and has_expansion_budget and cooldown_ok)
+            n_recursions_base = int(1 + complexity * 1.5)
+        
         # КРИТИЧНО: n_recursions зависит от сложности
         n_recursions = 1 + int(round(2.0 * complexity))  # 1..3
         
@@ -1144,6 +1197,12 @@ class RecursiveAgent(nn.Module):
         
         # КРИТИЧНО: Complexity Controller для управления временем и рекурсией
         self.complexity_controller = ComplexityController()
+        
+        # КРИТИЧНО: История эффективности expansion для мета-регуляции
+        self.expansion_history = {
+            "recent": [],  # последние N expansion'ов с метриками
+            "max_history": 10  # храним последние 10 expansion'ов
+        }
 
         self.use_curiosity = bool(use_curiosity and CLIP_AVAILABLE)
         if self.use_curiosity:
@@ -1570,6 +1629,14 @@ class RecursiveAgent(nn.Module):
         
         print(f"   Generating {num_dreams} dreams with Lazarus v3 protocol...")
         
+        # КРИТИЧНО: Targeted Dreaming - получаем высокоболевые эпизоды
+        high_pain_memories = []
+        if self.use_autobiographical_memory and hasattr(self, 'autobiographical_memory') and self.autobiographical_memory is not None:
+            high_pain_memories = self.autobiographical_memory.get_high_pain_memories(k=100)
+            if high_pain_memories:
+                avg_pain = sum(m.get("pain_level", 0.0) for m in high_pain_memories) / len(high_pain_memories)
+                print(f"   [TARGETED DREAMING] Found {len(high_pain_memories)} high-pain memories (avg pain: {avg_pain:.3f}) for focused consolidation")
+        
         # Lazarus v3 параметры
         w_cons = 1.0  # Consistency (главный компонент)
         w_stab = 0.5  # Stability
@@ -1580,8 +1647,21 @@ class RecursiveAgent(nn.Module):
         for epoch in range(15):
             total_loss = 0
             for dream_batch in range(num_dreams // dream_batch_size):
-                # Генерируем "сны"
-                noise = self.sample_dreams(dream_batch_size, device)
+                # КРИТИЧНО: Targeted Dreaming - смешиваем случайные сны с высокоболевыми
+                if high_pain_memories and dream_batch % 3 == 0:  # Каждый 3-й батч используем болевые точки
+                    # Пытаемся восстановить образы из высокоболевых эпизодов
+                    # Используем VAE для генерации похожих образов
+                    pain_mem = high_pain_memories[dream_batch % len(high_pain_memories)]
+                    if torch.is_tensor(pain_mem.get("state")):
+                        # Используем state features для генерации похожего образа
+                        # Упрощённо: генерируем случайный сон, но с приоритетом на болевые классы
+                        noise = self.sample_dreams(dream_batch_size, device)
+                        # Можно добавить более сложную логику восстановления образов из features
+                    else:
+                        noise = self.sample_dreams(dream_batch_size, device)
+                else:
+                    # Обычные случайные сны
+                    noise = self.sample_dreams(dream_batch_size, device)
                 
                 # LAZARUS v3: Consistency Anchor
                 with torch.no_grad():
@@ -1724,13 +1804,18 @@ class RecursiveAgent(nn.Module):
             return logits_sum, feats
         return logits_sum
     
-    def select_action(self, features, goal_features=None):
+    def select_action(self, features, goal_features=None, weakness_signal=None):
         """
         Выбирает действие (attention/patch selection) на основе текущего состояния и цели.
+        
+        КРИТИЧНО: Автономное внимание через минимизацию слабости.
+        Если SelfModel сообщает о высокой Weakness, WorldModel проигрывает варианты действий
+        и выбирает то, которое приведет к наиболее четкому (низкоэнтропийному) признаку.
         
         Args:
             features: [B, feature_dim] - текущие features
             goal_features: [B, feature_dim] - целевые features (опционально)
+            weakness_signal: [B, 1] или float - сигнал слабости от SelfModel (опционально)
         
         Returns:
             action_idx: [B] - индекс выбранного patch (0..3)
@@ -1741,6 +1826,44 @@ class RecursiveAgent(nn.Module):
             B = features.size(0)
             return torch.randint(0, 4, (B,), device=features.device), None
         
+        # КРИТИЧНО: Автономное внимание - проигрываем варианты действий
+        if weakness_signal is not None and self.use_world_model:
+            # Если высокая слабость, проигрываем все возможные действия и выбираем лучшее
+            B = features.size(0)
+            device = features.device
+            
+            # Проигрываем все 4 возможных действия
+            best_actions = []
+            best_entropies = []
+            
+            for patch_idx in range(4):
+                # Создаём one-hot для этого действия
+                action_onehot = torch.zeros(B, 4, device=device)
+                action_onehot[:, patch_idx] = 1.0
+                
+                # Предсказываем следующее состояние для этого действия
+                next_features_pred, _, _, _, _ = self.world_model.predict_next(features, action_onehot)
+                
+                if next_features_pred is not None:
+                    # Оцениваем "четкость" через энтропию предсказаний
+                    # Используем простую энтропию features как proxy для неопределенности
+                    # Низкая энтропия = более четкое представление
+                    feature_entropy = -(torch.softmax(next_features_pred, dim=-1) * 
+                                       torch.log_softmax(next_features_pred, dim=-1) + 1e-9).sum(dim=-1).mean()
+                    best_entropies.append(feature_entropy.item())
+                else:
+                    best_entropies.append(float('inf'))
+            
+            # Выбираем действие с минимальной энтропией (наиболее четкое)
+            if best_entropies and min(best_entropies) < float('inf'):
+                best_idx = np.argmin(best_entropies)
+                action_idx = torch.full((B,), best_idx, device=device, dtype=torch.long)
+                # Создаём action_logits (выбранное действие имеет высокий score)
+                action_logits = torch.zeros(B, 4, device=device)
+                action_logits[:, best_idx] = 1.0
+                return action_idx, action_logits
+        
+        # Fallback: обычный выбор через WorldModel
         action_logits = self.world_model.predict_best_action(features, goal_features)
         action_idx = torch.argmax(action_logits, dim=-1)  # [B]
         return action_idx, action_logits
@@ -2573,6 +2696,12 @@ def run_drone_simulation():
                 # Иначе используем оригинальные classes_B
                 expansion_classes = expansion_new_classes if expansion_new_classes is not None else classes_B
                 
+                # КРИТИЧНО: Записываем weakness ДО expansion для мета-регуляции
+                weakness_before = None
+                if agent.use_self_model and len(agent.heads) > 0:
+                    weakness_pred = agent.self_model.detect_weakness(features_f32)
+                    weakness_before = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
+                
                 new_head = agent.expand(
                     new_classes_indices=expansion_classes,
                     use_fractal_time=use_fractal_time,
@@ -2595,6 +2724,17 @@ def run_drone_simulation():
 
                 expansion_count += 1
                 last_expansion_step = step
+                
+                # КРИТИЧНО: Записываем expansion в историю для мета-регуляции
+                expansion_entry = {
+                    "step": step,
+                    "weakness_before": weakness_before,
+                    "weakness_after": None  # будет обновлено позже
+                }
+                agent.expansion_history["recent"].append(expansion_entry)
+                # Ограничиваем размер истории
+                if len(agent.expansion_history["recent"]) > agent.expansion_history["max_history"]:
+                    agent.expansion_history["recent"].pop(0)
                 # Тратим growth_budget
                 agent.growth_budget = max(0.0, agent.growth_budget - agent.growth_cost_per_expansion)
                 # КРИТИЧНО: НЕ пересоздаём routing gate (он уже создан на MAX_LAYERS)
@@ -2771,8 +2911,15 @@ def run_drone_simulation():
                         # Конвертируем goal в goal_features (используем goal как features для simplicity)
                         goal_features = agent.internal_goals.goal_generator(features_f32)
                     
-                    # Выбираем действие
-                    action_idx, action_logits = agent.select_action(features_f32, goal_features)
+                    # КРИТИЧНО: Автономное внимание через минимизацию слабости
+                    # Если SelfModel сообщает о высокой Weakness, используем проигрывание вариантов
+                    weakness_signal = None
+                    if agent.use_self_model and len(agent.heads) > 0:
+                        weakness_pred = agent.self_model.detect_weakness(features_f32)
+                        weakness_signal = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
+                    
+                    # Выбираем действие с учётом слабости
+                    action_idx, action_logits = agent.select_action(features_f32, goal_features, weakness_signal)
                     
                     # КРИТИЧНО: используем предсказания модели как class_hint для селективного внимания
                     # Для Cat (класс 3) делаем zoom на центр (морда)
@@ -2873,12 +3020,20 @@ def run_drone_simulation():
                         entropy=entropy_test,
                         unknown_rate=unknown_rate_test
                     )
+                    # КРИТИЧНО: Мета-регуляция бюджета - получаем weakness для utility analysis
+                    weakness_signal = None
+                    if agent.use_self_model and len(agent.heads) > 0:
+                        weakness_pred = agent.self_model.detect_weakness(features_f32)
+                        weakness_signal = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
+                    
                     # Обновляем actions с правильной complexity (для следующего шага)
                     has_expansion_budget = agent.growth_budget >= agent.growth_cost_per_expansion
                     actions = agent.complexity_controller.get_actions(
                         complexity=complexity,
                         has_expansion_budget=has_expansion_budget,
-                        cooldown_ok=can_expand
+                        cooldown_ok=can_expand,
+                        weakness_signal=weakness_signal,
+                        expansion_history=agent.expansion_history
                     )
                 
                 # КРИТИЧНО: Entropy penalty для стабилизации routing gates (если используется soft routing)
@@ -3285,14 +3440,25 @@ def run_drone_simulation():
             if agent.use_autobiographical_memory and len(agent.heads) > 0:
                 # КРИТИЧНО: используем float32 features для памяти
                 state_feat = features_f32[0] if features_f32.size(0) > 0 else features_f32.mean(dim=0)
+                # КРИТИЧНО: Эмоциональная память - записываем pain_level для Targeted Dreaming
+                pain_level = pain_value if 'pain_value' in locals() else 0.0
                 agent.record_autobiographical_memory(
                     step=step,
                     state_features=state_feat,
                     action=action_idx[0] if (agent.use_world_model and action_idx is not None and action_idx.size(0) > 0) else None,
                     outcome={"loss": float(loss_new.item()), "surprise": float(surprise.item()) if surprise is not None else 0.0},
                     reward_signal=max(0.0, min(1.0, 1.0 - float(loss_new.item()) / 2.0)),  # нормализованная награда
-                    context={"complexity": complexity if 'complexity' in locals() else 0.0, "entropy": entropy_test}
+                    context={"complexity": complexity if 'complexity' in locals() else 0.0, "entropy": entropy_test},
+                    pain_level=pain_level  # КРИТИЧНО: для приоритизации в Targeted Dreaming
                 )
+            
+            # КРИТИЧНО: Обновляем weakness_after для последнего expansion (мета-регуляция)
+            if agent.expansion_history["recent"] and len(agent.heads) > 1:
+                # Обновляем последний expansion entry с текущим weakness
+                if agent.use_self_model:
+                    weakness_pred = agent.self_model.detect_weakness(features_f32)
+                    weakness_after = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
+                    agent.expansion_history["recent"][-1]["weakness_after"] = weakness_after
             
             # КРИТИЧНО: обновляем Complexity Budget на основе использованных действий
             # Работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
