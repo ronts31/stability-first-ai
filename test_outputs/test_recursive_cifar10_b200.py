@@ -1413,6 +1413,9 @@ def run_drone_simulation():
             else:
                 data_mix = data_real
 
+            # КРИТИЧНО: инициализируем pain_value до использования в Complexity Controller
+            pain_value = 0.0  # значение по умолчанию, будет обновлено позже если нужно
+            
             # 1) shock check (no grad) - используем только real данные
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
                 test_out = agent(data_real)
@@ -1906,9 +1909,9 @@ def run_drone_simulation():
                 ent_batch = (-(probs_m * torch.log(probs_m + 1e-9)).sum(dim=1)).mean().item()
 
             # ---- adaptive pain (MUST be computed BEFORE crystallization update) ----
-            pain_value = 0.0
+            # КРИТИЧНО: pain_value уже инициализирован выше, обновляем только если нужно
             adaptive_lambda = None
-            if use_adaptive_pain and (x_replay is not None) and expansion_count > 0:
+            if use_adaptive_pain and (x_replay is not None) and len(agent.heads) > 0:
                 backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
                 if len(backbone_params) > 0:
                     # КРИТИЧНО: замораживаем BN обновление во время pain-градиентов
