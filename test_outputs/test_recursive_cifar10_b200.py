@@ -3132,20 +3132,21 @@ def run_drone_simulation():
             data_real = data[:real_B]
             target_real = target[:real_B]
             
-            # КРИТИЧНО: Инициализируем features_f32 для элегантного режима (если еще не инициализирована)
-            # В стандартном режиме она будет инициализирована позже
-            if agent.use_elegant_mode and 'features_f32' not in locals():
-                features_f32 = None
+            # КРИТИЧНО: Инициализируем features_f32 в начале цикла (будет обновлена позже)
+            features_f32 = None
             
-            # КРИТИЧНО: В элегантном режиме получаем features_f32 из data_real (если еще не получены)
-            if agent.use_elegant_mode and features_f32 is None:
-                with torch.no_grad():
-                    _, features_f32, _ = agent.elegant_core(data_real[:min(64, real_B)].to(device), max_steps=1)
+            # КРИТИЧНО: В элегантном режиме получаем features_f32 из data_real сразу (после перемещения на device)
+            # Но сначала нужно переместить data_real на device
             
             # КРИТИЧНО: перемещаем data_real и target_real на device сразу после создания
             # чтобы избежать проблем с device mismatch в pain-блоке
             data_real = data_real.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             target_real = target_real.to(device, non_blocking=True)
+            
+            # КРИТИЧНО: В элегантном режиме получаем features_f32 из data_real (после перемещения на device)
+            if agent.use_elegant_mode:
+                with torch.no_grad():
+                    _, features_f32, _ = agent.elegant_core(data_real[:min(64, real_B)], max_steps=1)
 
             dreams = None
             if dream_B > 0 and use_vae_dreams and agent.vae_trained:
