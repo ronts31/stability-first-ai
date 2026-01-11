@@ -502,10 +502,10 @@ class RecursiveAgent(nn.Module):
         entropy = -torch.sum(probs_known * torch.log(probs_known + 1e-9), dim=1)
         max_prob_known, _ = probs_known.max(dim=1)
 
-        unknown_mask = (max_prob_known < 0.2) | (entropy > 1.8)
+        unknown_mask = (max_prob_known < 0.18) | (entropy > 1.95)
         if unknown_mask.any():
             max_logit_known, _ = logits_sum[:, :10].max(dim=1)
-            logits_sum[unknown_mask, self.unknown_class_idx] = max_logit_known[unknown_mask] + 1.5
+            logits_sum[unknown_mask, self.unknown_class_idx] = max_logit_known[unknown_mask] + 0.8
 
         if return_features:
             return logits_sum, feats
@@ -552,6 +552,25 @@ def get_cifar_split():
         vehicles,
         animals,
     )
+
+
+def pair_margin_loss(logits10, targets, pairs=((0, 8), (1, 9), (3, 5)), margin=0.2):
+    """
+    Enforce margin separation for confusing pairs (Plane↔Ship, Car↔Truck, Cat↔Dog).
+    logits10: [B, 10]
+    targets: [B]
+    pairs: list of (class_a, class_b) tuples
+    margin: minimum logit difference
+    """
+    loss = 0.0
+    for a, b in pairs:
+        mask_a = targets == a
+        mask_b = targets == b
+        if mask_a.any():
+            loss = loss + F.relu(margin - (logits10[mask_a, a] - logits10[mask_a, b])).mean()
+        if mask_b.any():
+            loss = loss + F.relu(margin - (logits10[mask_b, b] - logits10[mask_b, a])).mean()
+    return loss
 
 
 @torch.no_grad()
@@ -666,6 +685,9 @@ def run_drone_simulation():
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 logits, features = agent(data, return_features=True)
                 loss = criterion_train(logits[:, :10], target)
+                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck, Cat↔Dog confusion
+                pm = pair_margin_loss(logits[:, :10], target, margin=0.15)
+                loss = loss + 0.05 * pm
 
                 surprise = None
                 if use_subjective_time:
@@ -830,8 +852,9 @@ def run_drone_simulation():
             )
             if should_sleep:
                 print(f"\n[INTELLIGENT SLEEP] Would trigger after {steps_since_sleep} steps and {error_count_phase2} errors (sleep disabled).")
+                # sleep disabled => do NOT reset counters, only mark last_sleep_step for throttle
                 last_sleep_step = step
-                error_count_phase2 = 0
+                # error_count_phase2 remains accumulated
 
             # 2) training step
             current_opt = optimizer_phase2 if optimizer_phase2 is not None else optimizer
@@ -843,6 +866,9 @@ def run_drone_simulation():
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 outputs, features = agent(data, return_features=True)
                 loss_new = criterion_train(outputs[:, :10], target)
+                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck, Cat↔Dog confusion
+                pm = pair_margin_loss(outputs[:, :10], target, margin=0.15)
+                loss_new = loss_new + 0.05 * pm
 
                 replay_loss = 0.0
                 if x_replay is not None:
@@ -937,7 +963,7 @@ def run_drone_simulation():
                 if len(backbone_params) > 0:
                     # compute gradients for new and old tasks
                     # Use fp32 for grad vectors
-                    with torch.cuda.amp.autocast(enabled=False):
+                    with torch.amp.autocast("cuda", enabled=False):
                         out_new = agent(data.float())
                         ln = criterion_train(out_new[:, :10], target)
                         out_old = agent(x_replay.float())
