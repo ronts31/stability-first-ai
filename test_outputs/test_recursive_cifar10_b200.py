@@ -1825,7 +1825,7 @@ class RecursiveAgent(nn.Module):
         else:
             self.eval()
 
-    def _semantic_merging(self, device, similarity_threshold=0.85):
+    def _semantic_merging(self, device, similarity_threshold=0.85, test_loader=None, test_acc_before=None):
         """
         КРИТИЧНО: Семантическое Слияние - слияние похожих голов в "Полиглотов".
         
@@ -1833,10 +1833,13 @@ class RecursiveAgent(nn.Module):
         Сливает (усредняет) те головы, которые стали слишком похожи.
         Освободившийся "бюджет" отдается новой голове, если Pain (конфликт) снова вырастет.
         
+        КРИТИЧНО: "Когнитивный Кэшбэк" - бонус к бюджету при успешном слиянии.
+        КРИТИЧНО: "Градиентный Штраф" - наказание при неудачном слиянии.
+        
         Это превращает "Рой" в саморегулируемую файловую систему знаний.
         """
         if len(self.heads) <= 1:
-            return
+            return 0.0  # Возвращаем изменение бюджета (0 = нет изменений)
         
         print(f"   [SEMANTIC MERGING] Analyzing {len(self.heads)} heads for similarity...")
         
@@ -1862,10 +1865,15 @@ class RecursiveAgent(nn.Module):
         # Находим пары голов, которые слишком похожи
         merged_indices = set()
         merge_operations = []
+        budget_change = 0.0  # Изменение бюджета (положительное = бонус, отрицательное = штраф)
         
         for idx, (i, j) in enumerate(head_pairs):
             if similarities[idx] >= similarity_threshold and i not in merged_indices and j not in merged_indices:
                 print(f"   [MERGE] Head {i} and Head {j} are similar (cosine={similarities[idx]:.3f}). Merging...")
+                
+                # Сохраняем веса до слияния для возможного отката
+                weights_before_i = [p.data.clone() for p in self.heads[i].parameters()]
+                weights_before_j = [p.data.clone() for p in self.heads[j].parameters()]
                 
                 # Сливаем веса: усредняем параметры двух голов
                 with torch.no_grad():
@@ -1876,15 +1884,59 @@ class RecursiveAgent(nn.Module):
                             param_i.data.copy_(merged_weight)
                             param_j.data.copy_(merged_weight)  # Обе головы получают усредненные веса
                 
-                merged_indices.add(i)
-                merged_indices.add(j)
-                merge_operations.append((i, j))
+                # КРИТИЧНО: Проверяем успешность слияния через тест accuracy
+                merge_successful = True
+                if test_loader is not None and test_acc_before is not None:
+                    # Быстрая проверка на небольшом батче
+                    self.eval()
+                    correct = 0
+                    total = 0
+                    with torch.no_grad():
+                        for test_data, test_target in test_loader:
+                            test_data = test_data[:32].to(device)  # небольшой батч для быстрой проверки
+                            test_target = test_target[:32].to(device)
+                            test_output = self(test_data)
+                            pred = test_output[:, :10].argmax(dim=1)
+                            correct += (pred == test_target).sum().item()
+                            total += test_target.size(0)
+                            break  # только один батч для скорости
+                    test_acc_after = 100.0 * correct / max(1, total)
+                    self.train()
+                    
+                    # КРИТИЧНО: "Когнитивный Кэшбэк" - если accuracy не упала значительно (>= 98%)
+                    if test_acc_after >= test_acc_before * 0.98:
+                        # УСПЕХ: Даем плюшку
+                        budget_change += 0.2  # Бонус к бюджету
+                        print(f"   🎉 SYNERGY BONUS: Heads merged successfully. Accuracy: {test_acc_before:.2f}% -> {test_acc_after:.2f}%")
+                        print(f"   [BUDGET] +0.2 bonus added to complexity_budget")
+                    else:
+                        # ОШИБКА: Откатываем слияние и наказываем
+                        merge_successful = False
+                        with torch.no_grad():
+                            for param_i, param_j, w_before_i, w_before_j in zip(
+                                self.heads[i].parameters(), 
+                                self.heads[j].parameters(),
+                                weights_before_i,
+                                weights_before_j
+                            ):
+                                param_i.data.copy_(w_before_i)
+                                param_j.data.copy_(w_before_j)
+                        budget_change -= 0.1  # Штраф к бюджету
+                        print(f"   ⚠️ MERGE PENALTY: Knowledge conflict detected! Accuracy: {test_acc_before:.2f}% -> {test_acc_after:.2f}%")
+                        print(f"   [BUDGET] -0.1 penalty. Merge rolled back.")
+                
+                if merge_successful:
+                    merged_indices.add(i)
+                    merged_indices.add(j)
+                    merge_operations.append((i, j))
         
         if merge_operations:
             print(f"   [SEMANTIC MERGING] Merged {len(merge_operations)} pairs of similar heads.")
             print(f"   [BUDGET] Freed capacity for future expansion.")
         else:
             print(f"   [SEMANTIC MERGING] No similar heads found (threshold={similarity_threshold}). All heads remain distinct.")
+        
+        return budget_change
     
     def expand(self, new_classes_indices, use_fractal_time=False, train_late_backbone=True):
         """
@@ -2033,10 +2085,13 @@ class RecursiveAgent(nn.Module):
         noise = torch.randn(n, 3, 32, 32, device=device)
         return torch.tanh(noise * 0.5)
     
-    def dream_and_compress(self, num_dreams=1000, dream_batch_size=100, device=None):
+    def dream_and_compress(self, num_dreams=1000, dream_batch_size=100, device=None, test_loader=None):
         """
         🌙 МОДУЛЬ СНОВИДЕНИЙ (CONSOLIDATION) + LAZARUS v3
         Объединяет знания из нескольких heads в один через dream distillation.
+        
+        КРИТИЧНО: Добавлена поддержка "Когнитивного Кэшбека" и "Градиентного Штрафа"
+        через проверку успешности слияния голов.
         """
         if device is None:
             device = next(self.parameters()).device
@@ -2046,12 +2101,31 @@ class RecursiveAgent(nn.Module):
         
         if len(self.heads) <= 1:
             print("   Only one head exists. No compression needed.")
-            return
+            return 0.0  # Возвращаем изменение бюджета
+        
+        # КРИТИЧНО: Вычисляем тестовую accuracy до слияния для проверки успешности
+        test_acc_before = None
+        if test_loader is not None:
+            self.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for test_data, test_target in test_loader:
+                    test_data = test_data[:64].to(device)  # небольшой батч для быстрой проверки
+                    test_target = test_target[:64].to(device)
+                    test_output = self(test_data)
+                    pred = test_output[:, :10].argmax(dim=1)
+                    correct += (pred == test_target).sum().item()
+                    total += test_target.size(0)
+                    break  # только один батч для скорости
+            test_acc_before = 100.0 * correct / max(1, total)
+            self.train()
         
         # КРИТИЧНО: Семантическое Слияние - слияние похожих голов перед консолидацией
         # Это превращает "Рой" в саморегулируемую файловую систему знаний
+        budget_change = 0.0
         if len(self.heads) > 1:
-            self._semantic_merging(device, similarity_threshold=0.85)
+            budget_change = self._semantic_merging(device, similarity_threshold=0.85, test_loader=test_loader, test_acc_before=test_acc_before)
         
         # 1. Создаем "Студента" - одну компактную сеть
         student_head = ExpandableHead(self.hidden_size, self.output_size).to(device)
@@ -2216,6 +2290,9 @@ class RecursiveAgent(nn.Module):
                 print(f"   Epoch {epoch+1}/15: Loss={total_loss/batches:.4f}, H={entropy.item():.3f}")
         
         print("☀️ WAKING UP: Lazarus Consolidation Complete.")
+        
+        # КРИТИЧНО: Возвращаем изменение бюджета для "Когнитивного Кэшбека"
+        return budget_change
         
         # КРИТИЧНО: Визуализация снов - сохраняем примеры снов для анализа
         if self.use_vae_dreams and self.vae_trained:
@@ -3584,7 +3661,12 @@ def run_drone_simulation():
                 print(f"[ACTION] Initiating SLEEP PHASE to consolidate knowledge and reduce confusion...")
                 
                 # Запускаем консолидацию через dream distillation
-                agent.dream_and_compress(num_dreams=1500, dream_batch_size=100, device=device)
+                # КРИТИЧНО: Передаем test_loader для проверки успешности слияния ("Когнитивный Кэшбек")
+                budget_change = agent.dream_and_compress(num_dreams=1500, dream_batch_size=100, device=device, test_loader=test_loader_all)
+                # Применяем изменение бюджета ("Когнитивный Кэшбек" или "Градиентный Штраф")
+                if budget_change != 0.0:
+                    agent.complexity_controller.complexity_budget = min(1.0, max(0.0, agent.complexity_controller.complexity_budget + budget_change))
+                    print(f"   [BUDGET UPDATE] Complexity budget updated: {agent.complexity_controller.complexity_budget:.3f} (change: {budget_change:+.3f})")
                 
                 # Перезагружаем optimizer после консолидации
                 # После SLEEP остаётся только один head, создаём новый optimizer
@@ -3639,7 +3721,7 @@ def run_drone_simulation():
             if features_f32 is None:
                 if agent.use_elegant_mode:
                     with torch.no_grad():
-                        _, features_f32, _ = agent.elegant_core(x[:1], max_steps=1)
+                        _, features_f32, _ = agent.elegant_core(data_real[:min(64, real_B)], max_steps=1)
                 elif len(agent.heads) > 0:
                     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
                         _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
@@ -4524,6 +4606,14 @@ def run_drone_simulation():
                 # Показывает, насколько хорошо Soft Routing Gate научился переключать контексты
                 # Используем комбинированный loader со всеми 10 классами, а не только animals
                 acc_global = eval_global(agent, test_loader_all, device)
+                
+                # КРИТИЧНО: Коэффициент Когнитивной Эффективности (η = Global Accuracy / Number of Active Heads)
+                # Система должна стремиться максимизировать η
+                # Слияние (Merge): Если Acc падает незначительно, а Heads уменьшается — η растет. Профит!
+                # Раздувание (Expansion): Если Acc растет медленнее, чем количество голов — η падает. Наказание!
+                num_active_heads = len(agent.heads) if not agent.use_elegant_mode else 1
+                cognitive_efficiency = acc_global / max(1, num_active_heads)  # η
+                
                 acc_A_hist.append(acc_A)
                 acc_B_hist.append(acc_B)
 
@@ -4576,7 +4666,7 @@ def run_drone_simulation():
                 
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} ({loss_components}) | Mem(M): {acc_A:.1f}% | "
-                    f"New(A): {acc_B:.1f}% | Global: {acc_global:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
+                    f"New(A): {acc_B:.1f}% | Global: {acc_global:.1f}% | η: {cognitive_efficiency:.2f} | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
                     f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}{complexity_info}"
                 )
 
