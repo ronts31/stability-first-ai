@@ -1867,13 +1867,48 @@ class RecursiveAgent(nn.Module):
                         with torch.no_grad():
                             features_after_zoom = self.shared_backbone(image_zoomed)
                             
-                            # КРИТИЧНО: Прогнозируем Weakness после реального Zoom
+                            # КРИТИЧНО: Комбинированная оценка полезности патча
+                            # Используем не только Weakness, но и Confidence и Entropy для более точной оценки
+                            
+                            # 1. Weakness reduction
                             predicted_weakness = self.self_model.detect_weakness(features_after_zoom)
                             predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness
-                            
-                            # Вычисляем снижение Weakness (чем больше снижение, тем лучше)
                             weakness_reduction = current_weakness - predicted_weakness_mean
-                            weakness_reductions.append(weakness_reduction)
+                            
+                            # 2. Confidence increase (чем выше confidence, тем лучше)
+                            current_confidence = self.self_model.estimate_confidence(features).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
+                            predicted_confidence = self.self_model.estimate_confidence(features_after_zoom).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
+                            confidence_increase = predicted_confidence - current_confidence
+                            
+                            # 3. Entropy reduction (чем ниже entropy, тем увереннее модель)
+                            # Получаем logits для вычисления entropy
+                            if len(self.heads) > 0:
+                                logits_after_zoom = self.heads[0](features_after_zoom)[0] if hasattr(self.heads[0], '__call__') else None
+                                if logits_after_zoom is not None and logits_after_zoom.size(1) >= 10:
+                                    probs_after = torch.softmax(logits_after_zoom[:, :10], dim=1)
+                                    entropy_after = -(probs_after * torch.log(probs_after + 1e-9)).sum(dim=1).mean().item()
+                                    
+                                    # Сравниваем с текущей entropy (из features)
+                                    logits_current = self.heads[0](features)[0] if hasattr(self.heads[0], '__call__') else None
+                                    if logits_current is not None and logits_current.size(1) >= 10:
+                                        probs_current = torch.softmax(logits_current[:, :10], dim=1)
+                                        entropy_current = -(probs_current * torch.log(probs_current + 1e-9)).sum(dim=1).mean().item()
+                                        entropy_reduction = entropy_current - entropy_after
+                                    else:
+                                        entropy_reduction = 0.0
+                                else:
+                                    entropy_reduction = 0.0
+                            else:
+                                entropy_reduction = 0.0
+                            
+                            # КРИТИЧНО: Комбинированный score = weighted sum всех сигналов
+                            # Веса: weakness_reduction (главный), confidence_increase, entropy_reduction
+                            combined_score = (
+                                1.0 * weakness_reduction +  # главный сигнал
+                                0.5 * confidence_increase +  # дополнительный сигнал
+                                0.3 * entropy_reduction      # дополнительный сигнал
+                            )
+                            weakness_reductions.append(combined_score)
                     else:
                         # FALLBACK: прогнозирование через WorldModel (если изображение недоступно)
                         action_onehot = torch.zeros(B, 4, device=device)
@@ -1896,10 +1931,13 @@ class RecursiveAgent(nn.Module):
                     action_logits = torch.zeros(B, 4, device=device)
                     action_logits[:, best_idx] = 1.0
                     
-                    # Логирование для отладки
-                    if B > 0 and current_weakness > 0.4:
+                    # Логирование для отладки (только при значительном улучшении)
+                    # КРИТИЧНО: логируем только статистику, а не каждый элемент батча (чтобы не засорять логи)
+                    if B > 0 and current_weakness > 0.4 and weakness_reductions[best_idx] > 0.01:
                         sim_type = "REAL" if use_real_simulation else "PREDICTED"
-                        print(f"   [ACTIVE IMAGINATION] {sim_type} Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, reduction: {weakness_reductions[best_idx]:.3f})")
+                        # Логируем только для первого элемента батча (чтобы не дублировать)
+                        # В будущем можно добавить статистику по всему батчу
+                        pass  # Логирование отключено для уменьшения шума (можно включить при необходимости)
                     
                     return action_idx, action_logits
         
