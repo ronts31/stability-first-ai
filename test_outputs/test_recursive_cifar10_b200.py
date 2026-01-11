@@ -1042,8 +1042,9 @@ class ComplexityController:
             expand_allowed = (complexity > 0.7 and has_expansion_budget and cooldown_ok)
             n_recursions_base = int(1 + complexity * 1.5)
         
-        # КРИТИЧНО: n_recursions зависит от сложности
-        n_recursions = 1 + int(round(2.0 * complexity))  # 1..3
+        # КРИТИЧНО: используем n_recursions_base для плавного наращивания "времени на раздумья"
+        # Это позволяет системе наращивать рекурсию перед радикальным шагом (expansion)
+        n_recursions = min(3, max(1, n_recursions_base))  # 1..3, используем вычисленный base
         
         # replay_ratio: высокая сложность → больше памяти
         replay_ratio = 0.10 + 0.30 * complexity  # 10%..40%
@@ -1054,8 +1055,7 @@ class ComplexityController:
         # crystal_target: высокая сложность → меньше кристаллизации (больше пластичности)
         crystal_target = 1.0 - complexity
         
-        # expand_allowed: только при высокой сложности и наличии ресурсов
-        expand_allowed = (complexity > 0.7 and has_expansion_budget and cooldown_ok)
+        # КРИТИЧНО: expand_allowed уже вычислен выше, не перезаписываем
         
         return {
             "n_recursions": n_recursions,
@@ -2307,6 +2307,31 @@ def eval_masked(agent, loader, allowed_classes, device, block_unknown=True):
     return 100.0 * correct / max(1, total)
 
 
+@torch.no_grad()
+def eval_global(agent, loader, device):
+    """
+    Глобальная метрика точности по всем 10 классам без маскирования.
+    Настоящий интеллект должен сам понимать, где он находится.
+    Показывает, насколько хорошо Soft Routing Gate научился переключать контексты.
+    """
+    was_training = agent.training
+    agent.eval()
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        out = agent(x)
+        # Без маскирования - берём предсказание по всем 10 классам (без Unknown)
+        out_10 = out[:, :10]  # [B, 10] - только известные классы
+        pred = out_10.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        total += int(y.size(0))
+    if was_training:
+        agent.train()
+    return 100.0 * correct / max(1, total)
+
+
 # ----------------------------
 # Main run
 # ----------------------------
@@ -2408,9 +2433,21 @@ def run_drone_simulation():
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 logits, features = agent(data, return_features=True)
-                loss = criterion_train(logits[:, :10], target)
-                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck, Cat↔Dog confusion
-                pm = pair_margin_loss(logits[:, :10], target, margin=0.15)
+                # КРИТИЧНО: Phase 1 локальный лосс - только по активным классам (classes_A)
+                # Это создаёт чистый фундамент знаний перед выходом в "дикую природу"
+                # Убираем лишний шум от неактивных нейронов Unknown класса на старте
+                classes_A_t = torch.tensor(classes_A, device=device, dtype=torch.long)
+                logits10 = logits[:, :10]
+                logitsA = logits10.index_select(1, classes_A_t)  # [B, len(classes_A)] - только активные классы
+                
+                # Глобальные -> локальные targets
+                g2l = {c: i for i, c in enumerate(classes_A)}
+                targetA = torch.tensor([g2l[int(t.item())] for t in target], device=device, dtype=torch.long)
+                
+                # Локальный loss только по активным классам
+                loss = criterion_train(logitsA, targetA)
+                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck, Cat↔Dog confusion (только по активным)
+                pm = pair_margin_loss(logitsA, targetA, margin=0.15)
                 loss = loss + 0.05 * pm
 
                 surprise = None
@@ -2554,6 +2591,23 @@ def run_drone_simulation():
         if agent.use_soft_routing:
             gate_params = list(agent.routing_gate.parameters())
             param_groups.append({"params": gate_params, "lr": 1e-3, "tag": "routing_gate"})
+        
+        # КРИТИЧНО: добавляем параметры AGI компонентов (WorldModel, SelfModel, InternalGoals)
+        # Это обеспечивает непрерывную эволюцию когнитивных функций при расширении
+        if agent.use_world_model and hasattr(agent, 'world_model') and agent.world_model is not None:
+            wm_params = list(agent.world_model.parameters())
+            if len(wm_params) > 0:
+                param_groups.append({"params": wm_params, "lr": 1e-3, "tag": "world_model"})
+        
+        if agent.use_self_model and hasattr(agent, 'self_model') and agent.self_model is not None:
+            sm_params = list(agent.self_model.parameters())
+            if len(sm_params) > 0:
+                param_groups.append({"params": sm_params, "lr": 1e-3, "tag": "self_model"})
+        
+        if agent.use_internal_goals and hasattr(agent, 'internal_goals') and agent.internal_goals is not None:
+            ig_params = list(agent.internal_goals.parameters())
+            if len(ig_params) > 0:
+                param_groups.append({"params": ig_params, "lr": 1e-3, "tag": "internal_goals"})
 
         opt = optim.AdamW(param_groups, weight_decay=1e-4)
         
@@ -3048,7 +3102,22 @@ def run_drone_simulation():
                 loss_world_model = torch.zeros((), device=device, dtype=torch.float32)
                 wm_error_signal = 0.0
                 action_idx = None
+                # КРИТИЧНО: Warm-up для Active Imagination - необученная WorldModel это генератор галлюцинаций
+                # Сначала "насмотренность" (обучение на данных), затем "аналитика" (активное воображение)
+                # Проверяем weakness или счетчик шагов перед использованием WorldModel для управления вниманием
+                world_model_ready = False
                 if agent.use_world_model and len(agent.heads) > 0:
+                    # Проверка 1: Weakness threshold (WorldModel должна быть достаточно обучена)
+                    if agent.use_self_model:
+                        weakness_pred = agent.self_model.detect_weakness(features_f32)
+                        weakness_val = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 1.0
+                        # Если weakness низкая (< 0.7), WorldModel достаточно обучена
+                        world_model_ready = (weakness_val < 0.7)
+                    else:
+                        # Проверка 2: Счетчик шагов Phase2 (минимум 100 шагов для прогрева)
+                        world_model_ready = (phase2_steps >= 100)
+                
+                if agent.use_world_model and len(agent.heads) > 0 and world_model_ready:
                     # Генерируем цель (если включены goals)
                     goal_features = None
                     if agent.use_internal_goals:
@@ -3209,11 +3278,12 @@ def run_drone_simulation():
                         print(f"[ERROR] Cannot fix outputs, skipping step {step}")
                         continue
                 
-                # Инициализация AGI loss переменных (до их использования)
-                loss_world_model = torch.zeros((), device=device, dtype=torch.float32)
-                loss_concept_recon = torch.zeros((), device=device, dtype=torch.float32)
-                wm_error_signal = 0.0
-                action_idx = None
+                # КРИТИЧНО: НЕ обнуляем loss_world_model и loss_concept_recon здесь!
+                # Они уже вычислены выше в блоке AGI COMPONENTS INTEGRATION (строки 3166, 3205)
+                # Повторная инициализация здесь приводит к "амнезии" - градиенты от AGI-модулей не доходят до весов
+                # loss_world_model и loss_concept_recon уже инициализированы выше (строка 3102, 3193)
+                # и вычислены если условия выполнились (строки 3166, 3205)
+                # Если они не были вычислены, они остаются zeros, что правильно
 
                 # Supervised loss на real данных
                 # КРИТИЧНО: Phase2 loss только по активным классам (2..7), не по всем 10
@@ -3710,6 +3780,9 @@ def run_drone_simulation():
             if step % 50 == 0:
                 acc_A = eval_masked(agent, test_loader_A, classes_A, device, block_unknown=True)
                 acc_B = eval_masked(agent, test_loader_B, classes_B, device, block_unknown=True)
+                # КРИТИЧНО: Глобальная метрика (10-классовая точность без маскирования)
+                # Показывает, насколько хорошо Soft Routing Gate научился переключать контексты
+                acc_global = eval_global(agent, test_loader_B, device)
                 acc_A_hist.append(acc_A)
                 acc_B_hist.append(acc_B)
 
@@ -3762,7 +3835,7 @@ def run_drone_simulation():
                 
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} ({loss_components}) | Mem(M): {acc_A:.1f}% | "
-                    f"New(A): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
+                    f"New(A): {acc_B:.1f}% | Global: {acc_global:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
                     f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}{complexity_info}"
                 )
 
