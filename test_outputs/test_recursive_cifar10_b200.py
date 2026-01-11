@@ -2332,6 +2332,9 @@ class RecursiveAgent(nn.Module):
         self.active_classes_per_column = {0: list(range(10))}  # Объединяем все классы
         
         print(f"   Memory compressed: {len(self.heads)} head(s) remaining (shared backbone).")
+        
+        # КРИТИЧНО: Возвращаем изменение бюджета для "Когнитивного Кэшбека" или "Градиентного Штрафа"
+        return budget_change
 
     def forward(self, x, return_features=False):
         # КРИТИЧНО: Элегантный режим - единый рекурсивный блок
