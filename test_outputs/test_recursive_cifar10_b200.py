@@ -377,17 +377,18 @@ class RecursiveAgent(nn.Module):
         """
         c = float(self.crystal_level)  # 0..1
 
+        # КРИТИЧНО: уменьшены alpha примерно в 10 раз для предотвращения взрыва loss
         # late кристаллизуется быстрее: уже при c~0.3-0.5 заметно растёт
         if group == "late":
-            return 0.10 + 0.90 * (c ** 1.0)
+            return 0.01 + 0.09 * (c ** 1.0)
 
         # mid умеренно
         if group == "mid":
-            return 0.05 + 0.60 * (c ** 1.5)
+            return 0.005 + 0.045 * (c ** 1.5)
 
         # early — остаётся жидким дольше: растёт медленно и поздно
         # при c<0.5 почти не мешает учиться новым текстурам
-        return 0.02 + 0.30 * (c ** 3.0)
+        return 0.002 + 0.020 * (c ** 3.0)
 
     def crystallization_regularizer(self):
         """
@@ -452,11 +453,12 @@ class RecursiveAgent(nn.Module):
         """
         c = float(self.crystal_level)
         # чем выше кристалл, тем сильнее заморозка (early сильнее late)
+        # КРИТИЧНО: head ослаблен (было min 0.50, теперь min 0.80) для лучшей адаптации в Phase2
         return {
             "early": max(0.02, 1.0 - 0.98 * c),   # при c=1 => 0.02
             "mid":   max(0.05, 1.0 - 0.90 * c),   # при c=1 => 0.10
             "late":  max(0.15, 1.0 - 0.70 * c),   # при c=1 => 0.30
-            "head":  max(0.50, 1.0 - 0.30 * c),   # голова почти всегда учится
+            "head":  max(0.80, 1.0 - 0.10 * c),   # голова почти всегда учится (ослаблено с 0.50)
         }
 
     def set_initial_responsibility(self, classes):
@@ -1372,6 +1374,12 @@ def run_drone_simulation():
             if use_adaptive_pain and (x_replay is not None) and expansion_count > 0:
                 backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
                 if len(backbone_params) > 0:
+                    # КРИТИЧНО: замораживаем BN обновление во время pain-градиентов
+                    # чтобы не портить статистики BN дополнительными forward проходами
+                    was_training = agent.training
+                    agent.train()  # градиенты нужны
+                    agent._set_bn_train(False)  # BN в eval режиме (не обновляет running stats)
+                    
                     # fp32 grads (используем полный forward для надежности)
                     try:
                         with torch.amp.autocast("cuda", enabled=False):
@@ -1391,6 +1399,11 @@ def run_drone_simulation():
                             print(f"[WARNING] Pain computation failed: {e}, skipping pain")
                         ln = None
                         lo = None
+                    finally:
+                        # Восстанавливаем BN режим
+                        agent._set_bn_train(True)
+                        if not was_training:
+                            agent.eval()
 
                     if ln is not None and lo is not None and torch.isfinite(ln) and torch.isfinite(lo):
                         try:
@@ -1500,28 +1513,43 @@ def run_drone_simulation():
                 current_opt.zero_grad(set_to_none=True)
                 continue
 
+            # КРИТИЧНО: сохраняем компоненты loss для диагностики
+            loss_new_val = float(loss_new.item())
+            
             # Добавляем dream distillation loss (сон с удержанием структуры)
+            dream_val = 0.0
             if loss_dream != 0.0 and torch.isfinite(loss_dream):
+                dream_val = float(loss_dream.item())
                 total_loss = total_loss + 0.2 * loss_dream  # вес для dreams
 
+            replay_val = 0.0
             if x_replay is not None:
                 replay_term = 0.25 * replay_loss
                 if torch.isfinite(replay_term):
+                    replay_val = float(replay_term.item())
                     total_loss = total_loss + replay_term
                 else:
                     if step % 50 == 0:
                         print(f"[WARNING] replay_loss is NaN/inf, skipping")
 
+            kl_val = 0.0
             if kl_loss != 0.0 and torch.isfinite(kl_loss):
+                if isinstance(kl_loss, torch.Tensor):
+                    kl_val = float(kl_loss.item())
+                else:
+                    kl_val = float(kl_loss)
                 total_loss = total_loss + kl_loss
+            
+            # reg_val будет вычислен ниже в блоке crystallization regularizer
 
             # crystallization regularizer replaces old current_lambda * stability_loss
+            reg_val = 0.0  # инициализация для диагностики
             if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
                 cryst_reg = agent.crystallization_regularizer()
                 if cryst_reg != 0.0 and torch.isfinite(cryst_reg):
+                    # КРИТИЧНО: base_strength уменьшен с 300 до 30 для предотвращения взрыва loss
                     # crystal strength controlled by crystal_level and optionally pain (adaptive_lambda)
-                    # base strength: crystal_level (ослаблено для лучшей пластичности)
-                    base_strength = 300.0 * agent.crystal_level
+                    base_strength = 30.0 * agent.crystal_level
 
                     # КРИТИЧНО: pain должен УМЕНЬШАТЬ защиту (больше пластичности при конфликте)
                     # pain_value in [0..1], чем выше тем больше конфликт
@@ -1535,6 +1563,7 @@ def run_drone_simulation():
                     base_strength = base_strength * cryst_strength_warmup_mult
                     reg_term = base_strength * cryst_reg
                     if torch.isfinite(reg_term):
+                        reg_val = float(reg_term.item())
                         total_loss = total_loss + reg_term
                     else:
                         if step % 50 == 0:
@@ -1668,8 +1697,11 @@ def run_drone_simulation():
                 
                 pred_info = f" | Pred: {top3_str}" if expansion_count > 0 else ""
                 
+                # КРИТИЧНО: диагностика компонентов loss для выявления источника взрыва
+                loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} Reg:{reg_val:.2f}"
+                
                 print(
-                    f"Step {step}: Loss {float(total_loss.item()):.2f} | Mem(M): {acc_A:.1f}% | "
+                    f"Step {step}: Loss {float(total_loss.item()):.2f} ({loss_components}) | Mem(M): {acc_A:.1f}% | "
                     f"New(A): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
                     f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}"
                 )
