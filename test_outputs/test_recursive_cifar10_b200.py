@@ -2446,9 +2446,16 @@ def run_drone_simulation():
                 
                 # Локальный loss только по активным классам
                 loss = criterion_train(logitsA, targetA)
-                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck, Cat↔Dog confusion (только по активным)
-                pm = pair_margin_loss(logitsA, targetA, margin=0.15)
-                loss = loss + 0.05 * pm
+                # Add pair margin loss to reduce Plane↔Ship, Car↔Truck confusion (только по активным)
+                # КРИТИЧНО: преобразуем глобальные пары в локальные индексы
+                # Пары для Phase 1 (Machines): (0, 8) -> Plane↔Ship, (1, 9) -> Car↔Truck
+                pairs_local = []
+                for g_a, g_b in ((0, 8), (1, 9)):  # глобальные пары
+                    if g_a in g2l and g_b in g2l:
+                        pairs_local.append((g2l[g_a], g2l[g_b]))  # локальные индексы
+                if pairs_local:
+                    pm = pair_margin_loss(logitsA, targetA, pairs=tuple(pairs_local), margin=0.15)
+                    loss = loss + 0.05 * pm
 
                 surprise = None
                 if use_subjective_time:
