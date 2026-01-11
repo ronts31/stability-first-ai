@@ -41,11 +41,11 @@ class ComplexitySensor:
         z_score = (loss - self.mean) / self.std
         return z_score > self.sensitivity
 
-class TemporalColumn(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, prev_dims=[]):
+# C) Общий CNN Backbone (используется всеми головами)
+class SharedBackbone(nn.Module):
+    def __init__(self):
         super().__init__()
-        # A) CNN вместо MLP для CIFAR-10 (3-4 conv слоя + GAP + linear)
-        # CIFAR-10: 32x32x3
+        # A) CNN для CIFAR-10 (3-4 conv слоя + GAP)
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
@@ -54,35 +54,35 @@ class TemporalColumn(nn.Module):
         self.bn3 = nn.BatchNorm2d(256)
         self.conv4 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
         self.bn4 = nn.BatchNorm2d(512)
-        
-        # Global Average Pooling
         self.gap = nn.AdaptiveAvgPool2d(1)
-        
-        # Адаптеры для интеграции прошлых слоев
-        self.adapters = nn.ModuleList([nn.Linear(p, 512) for p in prev_dims])
-        
-        # Финальный классификатор
-        self.fc = nn.Linear(512, output_size)
         self.hidden_size = 512
-
-    def forward(self, x, prev_hiddens):
-        # x shape: [batch, 3072] -> reshape to [batch, 3, 32, 32]
-        if x.dim() == 2:
-            x = x.view(-1, 3, 32, 32)
-        
-        # CNN backbone
+    
+    def forward(self, x):
+        # x: [B, 3, 32, 32]
         h = F.relu(self.bn1(self.conv1(x)))
         h = F.max_pool2d(h, 2)  # 32x32 -> 16x16
-        
         h = F.relu(self.bn2(self.conv2(h)))
         h = F.max_pool2d(h, 2)  # 16x16 -> 8x8
-        
         h = F.relu(self.bn3(self.conv3(h)))
         h = F.max_pool2d(h, 2)  # 8x8 -> 4x4
-        
         h = F.relu(self.bn4(self.conv4(h)))
         h = self.gap(h)  # 4x4 -> 1x1
-        h = h.view(h.size(0), -1)  # [batch, 512]
+        h = h.view(h.size(0), -1)  # [B, 512]
+        return h
+
+# C) Расширяемая голова (только классификатор, без backbone)
+class ExpandableHead(nn.Module):
+    def __init__(self, hidden_size, output_size, prev_dims=[]):
+        super().__init__()
+        # Адаптеры для интеграции прошлых представлений
+        self.adapters = nn.ModuleList([nn.Linear(p, hidden_size) for p in prev_dims])
+        # Финальный классификатор
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.hidden_size = hidden_size
+    
+    def forward(self, backbone_features, prev_hiddens):
+        # backbone_features: [B, 512]
+        h = backbone_features
         
         # Интеграция прошлого
         for i, adapter in enumerate(self.adapters):
@@ -90,6 +90,21 @@ class TemporalColumn(nn.Module):
                 h = h + adapter(prev_hiddens[i])
         
         return self.fc(h), h
+
+# Старая TemporalColumn для обратной совместимости (используется только в dream_and_compress)
+class TemporalColumn(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, prev_dims=[]):
+        super().__init__()
+        # Полная колонка (backbone + head) для сжатия
+        self.backbone = SharedBackbone()
+        self.head = ExpandableHead(hidden_size, output_size, prev_dims)
+        self.hidden_size = hidden_size
+
+    def forward(self, x, prev_hiddens):
+        if x.dim() == 2:
+            x = x.view(-1, 3, 32, 32)
+        backbone_features = self.backbone(x)
+        return self.head(backbone_features, prev_hiddens)
 
 # --- МОДУЛЬ ЛЮБОПЫТСТВА (ORACLE) ---
 class CuriosityModule:
@@ -162,11 +177,19 @@ class CuriosityModule:
 class RecursiveAgent(nn.Module):
     def __init__(self, use_curiosity=False):
         super().__init__()
-        # A) CNN работает с изображениями напрямую, не нужен input_size
+        # C) Общий backbone + расширяемые головы
         self.hidden_size = 512  # Размер скрытого представления после CNN
         self.output_size = 11  # 10 классов + 1 "unknown/ambiguous"
         
+        # C) Общий backbone (один для всех)
+        self.shared_backbone = SharedBackbone()
+        
+        # C) Расширяемые головы (создаются при expand)
+        self.heads = nn.ModuleList([ExpandableHead(self.hidden_size, self.output_size)])
+        
+        # Для обратной совместимости (используется в dream_and_compress)
         self.columns = nn.ModuleList([TemporalColumn(0, self.hidden_size, self.output_size)])
+        
         self.sensor = ComplexitySensor()
         self.active_classes_per_column = {}
         
@@ -187,23 +210,32 @@ class RecursiveAgent(nn.Module):
 
     def freeze_past(self):
         print("[FREEZING] Memory (Crystallization)...")
-        for param in self.parameters():
+        # C) Замораживаем backbone и старые головы
+        self.shared_backbone.eval()
+        for param in self.shared_backbone.parameters():
             param.requires_grad = False
+        # Замораживаем все старые головы кроме последней
+        for i in range(len(self.heads) - 1):
+            for param in self.heads[i].parameters():
+                param.requires_grad = False
 
     def expand(self, new_classes_indices):
         self.freeze_past()
-        prev_dims = [c.hidden_size for c in self.columns]
-        new_col = TemporalColumn(0, self.hidden_size, self.output_size, prev_dims)
-        
-        # Переносим на то же устройство (GPU/CPU), где живет агент
+        # C) Создаем только новую голову (backbone общий)
+        prev_dims = [h.hidden_size for h in self.heads]
         device = next(self.parameters()).device
-        new_col.to(device)
         
+        new_head = ExpandableHead(self.hidden_size, self.output_size, prev_dims).to(device)
+        self.heads.append(new_head)
+        
+        # Для обратной совместимости (dream_and_compress использует columns)
+        new_col = TemporalColumn(0, self.hidden_size, self.output_size, prev_dims).to(device)
         self.columns.append(new_col)
-        self.active_classes_per_column[len(self.columns)-1] = new_classes_indices
+        
+        self.active_classes_per_column[len(self.heads)-1] = new_classes_indices
         self.sensor = ComplexitySensor() 
-        print(f"[EMERGENCE] Layer {len(self.columns)} created. Scope: {new_classes_indices}")
-        return new_col.parameters()
+        print(f"[EMERGENCE] Head {len(self.heads)} created (shared backbone). Scope: {new_classes_indices}")
+        return new_head.parameters()  # Обучаем только новую голову
     
     def record_conflict(self, confidence_model, entropy_model, clip_class, clip_label, clip_conf, image, true_label=None):
         """Запоминаем конфликт между моделью и CLIP для дальнейшего использования"""
@@ -286,18 +318,21 @@ class RecursiveAgent(nn.Module):
         Генерирует "сны" (псевдо-данные) и сжимает знания всех слоев в один "Студент"
         """
         print("\n🌙 ENTERING SLEEP PHASE (Consolidating Memories)...")
-        print(f"   Current layers: {len(self.columns)}")
+        print(f"   Current heads: {len(self.heads)}")
         
-        if len(self.columns) <= 1:
-            print("   Only one layer exists. No compression needed.")
+        if len(self.heads) <= 1:
+            print("   Only one head exists. No compression needed.")
             return
         
         device = next(self.parameters()).device
         
         # 1. Создаем "Студента" - одну компактную сеть
-        # Она должна быть такой же мощной, как сумма всех прошлых слоев
+        # Она должна быть такой же мощной, как сумма всех прошлых голов
+        # C) Используем общий backbone, создаем только новую голову
+        student_head = ExpandableHead(self.hidden_size * 2, self.output_size).to(device)
+        # Для обратной совместимости создаем полную колонку
         student = TemporalColumn(0, self.hidden_size * 2, self.output_size).to(device)
-        optimizer = optim.Adam(student.parameters(), lr=0.001)
+        optimizer = optim.Adam(student_head.parameters(), lr=0.001)
         
         # 2. Генерируем сны (Псевдо-данные)
         # Так как мы не храним картинки (Zero Replay), мы генерируем случайный шум
@@ -319,7 +354,10 @@ class RecursiveAgent(nn.Module):
                     teacher_probs = torch.softmax(teacher_logits[:, :10], dim=1)  # Только известные классы
                 
                 # 3. Учим Студента подражать Учителю
-                student_logits, _ = student(noise, prev_hiddens=[])  # Студент пытается угадать
+                # C) Используем общий backbone для студента
+                with torch.no_grad():
+                    backbone_features = self.shared_backbone(noise)
+                student_logits, _ = student_head(backbone_features, prev_hiddens=[])  # Студент пытается угадать
                 
                 # Loss: Студент должен выдавать те же вероятности, что и Учитель (Distillation Loss)
                 loss = kl_loss_fn(
@@ -339,21 +377,27 @@ class RecursiveAgent(nn.Module):
         print("☀️ WAKING UP: Consolidation Complete.")
         
         # 4. Заменяем сложный мозг на одного Студента
-        self.columns = nn.ModuleList([student])
+        # C) Заменяем все головы на одну, backbone остается общим
+        self.heads = nn.ModuleList([student_head])
+        self.columns = nn.ModuleList([student])  # Для обратной совместимости
         self.active_classes_per_column = {}  # Сброс зон ответственности, теперь Студент знает всё
         
-        print(f"   Memory compressed: {len(self.columns)} layer(s) remaining.")
+        print(f"   Memory compressed: {len(self.heads)} head(s) remaining (shared backbone).")
         return "Knowledge Compressed!"
 
     def forward(self, x, raw_image=None, return_curiosity_info=False):
-        # A) CNN работает с изображениями напрямую (x уже [B, 3, 32, 32])
+        # C) Используем общий backbone + расширяемые головы
+        # x: [B, 3, 32, 32]
+        backbone_features = self.shared_backbone(x)  # [B, 512]
+        
         hiddens = []
         final_logits = torch.zeros(x.size(0), self.output_size).to(x.device)
         
         curiosity_info = None
         
-        for i, col in enumerate(self.columns):
-            out, h = col(x, hiddens)
+        # C) Проходим через все головы с общим backbone
+        for i, head in enumerate(self.heads):
+            out, h = head(backbone_features, hiddens)
             hiddens.append(h)
             
             if i in self.active_classes_per_column:
@@ -367,17 +411,21 @@ class RecursiveAgent(nn.Module):
                 # Если зона не определена, добавляем все (для первого слоя до расширения)
                 final_logits = final_logits + out
         
-        # 3️⃣ КЛАСС "UNKNOWN": Если энтропия очень высокая, активируем класс "не знаю"
+        # 3️⃣ КЛАСС "UNKNOWN": E) Улучшенный механизм с калибровкой
         probs_known = torch.softmax(final_logits[:, :10], dim=1)  # Только известные классы
         entropy = -torch.sum(probs_known * torch.log(probs_known + 1e-9), dim=1)
         max_prob_known, _ = torch.max(probs_known, dim=1)
         
+        # E) Адаптивные пороги на основе распределения уверенности
         # Если энтропия высокая И максимальная вероятность низкая -> "не знаю"
+        # Пороги: entropy > 2.0 (высокая неопределенность) И max_prob < 0.3 (низкая уверенность)
         unknown_mask = (entropy > 2.0) & (max_prob_known < 0.3)
-        # C) Unknown logit относительный (устойчивее) + защита от пустого mask
+        
+        # E) Unknown logit относительный (устойчивее) + защита от пустого mask
         if unknown_mask.any():
             max_logit_known, _ = final_logits[:, :10].max(dim=1)
-            final_logits[unknown_mask, self.unknown_class_idx] = max_logit_known[unknown_mask] + 1.0
+            # Делаем unknown немного выше максимального, но не слишком доминирующим
+            final_logits[unknown_mask, self.unknown_class_idx] = max_logit_known[unknown_mask] + 1.5
         
         # Модуль любопытства: если энтропия высокая, спрашиваем CLIP
         curiosity_info = None
@@ -538,11 +586,11 @@ def run_drone_simulation():
             # ПРОВЕРКА НА ШОК И ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ
             is_shock = agent.sensor.is_shock(test_loss.item())
             can_expand = (step - last_expansion_step) > COOLDOWN_STEPS
-            has_budget = len(agent.columns) < MAX_LAYERS
+            has_budget = len(agent.heads) < MAX_LAYERS
             
             if not expanded and is_shock and can_expand and has_budget:
                 print(f"\n[VISUAL CORTEX SHOCK] Loss {test_loss.item():.2f} detected (High Surprise).")
-                print(f"[SAFETY] Checking expansion conditions: Cooldown OK, Budget OK ({len(agent.columns)}/{MAX_LAYERS} layers)")
+                print(f"[SAFETY] Checking expansion conditions: Cooldown OK, Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
                 
                 # Принудительно спрашиваем CLIP, потому что нам "больно" (высокий Loss)
                 if agent.use_curiosity:
@@ -594,11 +642,11 @@ def run_drone_simulation():
                     print(f"[COOLDOWN] Shock detected but in refractory period ({remaining} steps remaining)")
             
             elif is_shock and not has_budget:
-                print(f"\n[CRITICAL] Layer Limit ({MAX_LAYERS}) Reached. Brain is full.")
+                print(f"\n[CRITICAL] Head Limit ({MAX_LAYERS}) Reached. Brain is full.")
                 print(f"[ACTION] Initiating SLEEP PHASE to compress knowledge...")
                 
                 # 1. ЗАПУСК СНА (Сжатие знаний)
-                # Учитель (5 слоев) учит Студента (1 слой) на псевдо-снах
+                # Учитель (5 голов) учит Студента (1 голова) на псевдо-снах
                 agent.dream_and_compress(num_dreams=1000, dream_batch_size=100)
                 
                 # 2. ПЕРЕЗАГРУЗКА
@@ -692,12 +740,12 @@ def run_drone_simulation():
                     mp, _ = pk.max(dim=1)
                     unk_rate = ((ent > 2.0) & (mp < 0.3)).float().mean().item()
                 
-                print(f"Step {step}: Loss {loss.item():.2f} | Mem (Machines): {acc_A:.1f}% | New (Animals): {acc_B:.1f}% | Layers: {len(agent.columns)} | UnknownRate: {unk_rate*100:.1f}%")
+                print(f"Step {step}: Loss {loss.item():.2f} | Mem (Machines): {acc_A:.1f}% | New (Animals): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}%")
             step += 1
     
-    # 🌙 СОН: Консолидация памяти (если накопилось много слоев)
-    if len(agent.columns) >= 3:
-        print(f"\n🌙 SLEEP PHASE: {len(agent.columns)} layers detected. Consolidating memories...")
+    # 🌙 СОН: Консолидация памяти (если накопилось много голов)
+    if len(agent.heads) >= 3:
+        print(f"\n🌙 SLEEP PHASE: {len(agent.heads)} heads detected. Consolidating memories...")
         agent.dream_and_compress(num_dreams=500, dream_batch_size=50)
         
         # Пересоздаем оптимизатор для нового сжатого мозга
