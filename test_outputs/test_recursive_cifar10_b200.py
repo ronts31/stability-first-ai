@@ -794,6 +794,66 @@ def compute_class_weights_from_dataset(dataset, num_classes=10, beta=0.9999):
     return weights
 
 
+def compute_class_weights_for_active_classes(dataset_subset, active_classes, beta=0.9999):
+    """
+    Вычисляет веса классов только для активных классов в subset.
+    Это исправляет проблему когда subset содержит только часть классов (например, только animals).
+    
+    Args:
+        dataset_subset: torch.utils.data.Subset с данными только для active_classes
+        active_classes: список глобальных индексов классов (например [2,3,4,5,6,7])
+        beta: параметр для Class-Balanced Loss
+    
+    Returns:
+        torch.Tensor[10] - веса для всех 10 классов, но только active_classes имеют ненулевые веса
+    """
+    import numpy as np
+    from torch.utils.data import Subset
+    
+    # Создаем маппинг глобальный индекс -> локальный индекс
+    class_to_local = {c: i for i, c in enumerate(active_classes)}
+    
+    # Подсчитываем counts только для активных классов
+    counts = torch.zeros(len(active_classes), dtype=torch.float32)
+    
+    # Оптимизация для Subset
+    if isinstance(dataset_subset, Subset):
+        base = dataset_subset.dataset
+        indices = dataset_subset.indices
+        if hasattr(base, 'targets'):
+            targets = np.array(base.targets)[indices]
+        else:
+            targets = np.array([dataset_subset[i][1] for i in range(len(dataset_subset))])
+        
+        for target in targets:
+            if target in class_to_local:
+                counts[class_to_local[target]] += 1.0
+    else:
+        # Медленный способ для обычных датасетов
+        for i in range(len(dataset_subset)):
+            y = dataset_subset[i][1]
+            if isinstance(y, torch.Tensor):
+                y = y.item()
+            y = int(y)
+            if y in class_to_local:
+                counts[class_to_local[y]] += 1.0
+    
+    # Правильная формула Class-Balanced Loss (Cui et al.)
+    beta_tensor = torch.tensor(beta, dtype=torch.float32)
+    effective_num = 1.0 - torch.pow(beta_tensor, counts)
+    w = (1.0 - beta) / (effective_num + 1e-8)
+    
+    # Нормализация: средний вес = 1.0 (только по активным классам)
+    w = w / w.mean()
+    
+    # Создаем выходной тензор для всех 10 классов
+    out = torch.zeros(10, dtype=torch.float32)
+    for c, wi in zip(active_classes, w):
+        out[c] = wi
+    
+    return out
+
+
 def class_balanced_loss(logits, targets, class_weights, num_classes=10):
     """
     Class-balanced loss с фиксированными весами (вычисленными по датасету).
@@ -1012,11 +1072,13 @@ def run_drone_simulation():
         print("[SLEEP] Teacher ready for dream supervision")
     
     # Вычисляем фиксированные веса классов для class-balanced loss (один раз по датасету)
-    # Используем train_B (Subset), а не train_B.dataset (полный CIFAR10)
-    print("[PHASE2] Computing class weights for balanced loss...")
-    class_weights_phase2 = compute_class_weights_from_dataset(train_B, num_classes=10, beta=0.9999)
+    # КРИТИЧНО: train_B содержит только классы 2..7 (animals), поэтому нужно считать веса
+    # только для активных классов, иначе получим неправильные веса (0 для отсутствующих классов)
+    print("[PHASE2] Computing class weights for balanced loss (active classes only)...")
+    class_weights_phase2 = compute_class_weights_for_active_classes(train_B, classes_B, beta=0.9999)
     class_weights_phase2 = class_weights_phase2.to(device)
     print(f"[PHASE2] Class weights: {class_weights_phase2.cpu().numpy()}")
+    print(f"[PHASE2] Active classes {classes_B} weights: {class_weights_phase2[torch.tensor(classes_B, device=device)].cpu().numpy()}")
 
     expansion_count = 0
     last_expansion_step = -1000
