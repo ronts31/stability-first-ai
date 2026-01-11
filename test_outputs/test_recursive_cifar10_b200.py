@@ -1916,12 +1916,15 @@ class RecursiveAgent(nn.Module):
                                     current_features = features_after_zoom
                                     current_weakness_step = predicted_weakness_mean
                                     
-                                    # КРИТИЧНО: Решаем, нужно ли смотреть еще ближе
-                                    # Если weakness все еще высокая, пробуем другой патч или тот же патч еще раз
+                                    # КРИТИЧНО: Решаем, нужно ли смотреть еще ближе или переключиться на другой патч
+                                    # Если weakness все еще высокая, пробуем соседний патч для поиска более информативной области
                                     if current_weakness_step > 0.3 and imagination_step < max_imagination_steps - 1:
-                                        # Пробуем соседний патч или тот же патч (для "еще ближе")
-                                        # Упрощенно: остаемся на том же патче для "приближения"
-                                        action_chain.append(action_chain[-1])  # остаемся на том же патче
+                                        # КРИТИЧНО: Пробуем соседние патчи для поиска более информативных областей
+                                        # Например, если начали с patch 0, пробуем patch 1 или 2
+                                        current_patch = action_chain[-1]
+                                        # Пробуем соседние патчи (циклически)
+                                        next_patch = (current_patch + 1) % 4  # следующий патч
+                                        action_chain.append(next_patch)
                                     else:
                                         # Достаточно улучшения, останавливаемся
                                         break
