@@ -572,7 +572,7 @@ def run_drone_simulation():
     MAX_LAYERS = 5               # Защита от переполнения памяти
     
     # Обучение Фаза 2 (увеличиваем эпохи для лучшего обучения животных)
-    for epoch in range(5): # Больше эпох для лучшего обучения
+    for epoch in range(8): # Еще больше эпох для дифференциации животных
         for batch_idx, (data, target) in enumerate(loader_B):
             data, target = data.to(device), target.to(device)
             
@@ -629,7 +629,8 @@ def run_drone_simulation():
                             
                             # Расширяем сознание
                             new_params = agent.expand(new_classes_indices=classes_B)
-                            optimizer = optim.Adam(new_params, lr=0.001)
+                            # Увеличиваем LR для новой головы для быстрого обучения животных
+                            optimizer = optim.Adam(new_params, lr=0.002)  # x2 для новой головы
                             expanded = True
                             last_expansion_step = step
                         else:
