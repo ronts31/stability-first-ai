@@ -313,6 +313,103 @@ class RecursiveAgent(nn.Module):
         self.replay_buffer = {"X": [], "Y": []}
         self.max_replay_size = 1000
 
+        # --- TIME CRYSTALLIZATION STATE ---
+        self.crystal_level = 0.0       # [0..1]
+        self.crystal_momentum = 0.98   # EMA для сглаживания
+        self.crystal_lock_threshold = 0.92
+        self.crystal_unlock_threshold = 0.70
+        self.crystal_lock_steps = 0
+        self.crystal_lock_patience = 150  # сколько шагов держать высокий уровень, чтобы hard-freeze
+        self.hard_frozen_layers = set()
+
+        # фрактальные веса защиты по группам слоёв (ранние сильнее)
+        self.fractal_alpha = {
+            "early": 1.00,   # conv1/conv2/bn1/bn2
+            "mid":   0.35,   # conv3/bn3
+            "late":  0.15,   # conv4/bn4
+        }
+
+    def _layer_group(self, name: str) -> str:
+        """Определяет группу слоя для фрактальной защиты."""
+        if any(k in name for k in ["conv1", "conv2", "bn1", "bn2"]):
+            return "early"
+        if any(k in name for k in ["conv3", "bn3"]):
+            return "mid"
+        if any(k in name for k in ["conv4", "bn4"]):
+            return "late"
+        return "late"
+
+    @torch.no_grad()
+    def update_time_crystallization(self, surprise: float, pain: float, entropy: float):
+        """
+        Обновляет уровень кристаллизации времени на основе неожиданности, конфликта и энтропии.
+        
+        Args:
+            surprise: чем выше, тем больше пластичность (меньше кристаллизация)
+            pain: конфликт градиентов [0..1], чем выше тем больше пластичность
+            entropy: неопределенность, чем выше тем больше пластичность
+        """
+        # Нормируем входы (важно: без резких скачков)
+        s = float(surprise)
+        p = float(pain)
+        e = float(entropy)
+
+        # Стабильность мира = низкая неожиданность/конфликт/неопределенность
+        # Значения под CIFAR-10: surprise ~ 0..2, entropy ~ 0..2.3
+        s_n = min(1.0, s / 1.2)          # 0..1
+        e_n = min(1.0, e / 2.0)          # 0..1
+        p_n = min(1.0, p)                # 0..1
+
+        instability = 0.55 * s_n + 0.25 * p_n + 0.20 * e_n
+        target_crystal = 1.0 - instability  # чем стабильнее, тем больше кристалл
+
+        # EMA
+        self.crystal_level = self.crystal_momentum * self.crystal_level + (1 - self.crystal_momentum) * target_crystal
+        self.crystal_level = float(max(0.0, min(1.0, self.crystal_level)))
+
+    def crystallization_regularizer(self):
+        """
+        Пер-слойная защита (EWC-lite): ||W - W_ref||^2 с весом = crystal_level * fractal_alpha
+        Требует наличия self.ref_backbone (снимок).
+        """
+        if (not self.use_subjective_time) or (self.ref_backbone is None):
+            return 0.0
+
+        reg = 0.0
+        for (name, p), (_, p_ref) in zip(self.shared_backbone.named_parameters(), self.ref_backbone.named_parameters()):
+            if not p.requires_grad:
+                continue
+            group = self._layer_group(name)
+            alpha = self.fractal_alpha.get(group, 0.15)
+            reg = reg + (alpha * (p - p_ref).pow(2).sum())
+        return reg
+
+    def auto_hard_freeze_if_needed(self):
+        """
+        Опционально: если crystal_level долго высокий — замораживаем ранние слои автоматически.
+        Если упал — размораживаем.
+        """
+        # lock/unlock ранних слоёв
+        if self.crystal_level >= self.crystal_lock_threshold:
+            self.crystal_lock_steps += 1
+        else:
+            self.crystal_lock_steps = max(0, self.crystal_lock_steps - 2)
+
+        # LOCK
+        if self.crystal_lock_steps >= self.crystal_lock_patience:
+            for name, p in self.shared_backbone.named_parameters():
+                if self._layer_group(name) == "early":
+                    if p.requires_grad:  # только если еще не заморожен
+                        p.requires_grad = False
+                        self.hard_frozen_layers.add(name)
+
+        # UNLOCK (если мир снова нестабилен)
+        if self.crystal_level <= self.crystal_unlock_threshold and len(self.hard_frozen_layers) > 0:
+            for name, p in self.shared_backbone.named_parameters():
+                if name in self.hard_frozen_layers:
+                    p.requires_grad = True
+            self.hard_frozen_layers.clear()
+
     def set_initial_responsibility(self, classes):
         self.active_classes_per_column[0] = classes
 
@@ -364,7 +461,21 @@ class RecursiveAgent(nn.Module):
             self.eval()
 
     def expand(self, new_classes_indices, use_fractal_time=False, train_late_backbone=True):
-        self.freeze_past(use_fractal_time=use_fractal_time, train_late_backbone=train_late_backbone)
+        """
+        Расширяет агента новой головой. Кристаллизация теперь автоматическая через update_time_crystallization.
+        """
+        # Freeze old heads (все кроме последней после расширения)
+        for i in range(len(self.heads) - 1):
+            for p in self.heads[i].parameters():
+                p.requires_grad = False
+
+        # Обновляем ref_backbone для кристаллизации (если используется SubjectiveTimeCritic)
+        if self.use_subjective_time:
+            self.ref_backbone = copy.deepcopy(self.shared_backbone)
+            self.ref_backbone.eval()
+            for p in self.ref_backbone.parameters():
+                p.requires_grad = False
+            print("[CRYSTALLIZATION] Reference backbone snapshot created for automatic time crystallization")
 
         prev_dims = [h.hidden_size for h in self.heads]
         device = next(self.parameters()).device
@@ -378,6 +489,7 @@ class RecursiveAgent(nn.Module):
         self.active_classes_per_column[len(self.heads) - 1] = new_classes_indices
         self.sensor = ComplexitySensor()
         print(f"[EMERGENCE] Head {len(self.heads)} created (shared backbone). Scope: {new_classes_indices}")
+        print(f"[CRYSTALLIZATION] Automatic time crystallization enabled (crystal_level will adapt dynamically)")
         return new_head
 
     def add_to_replay_buffer(self, X, Y):
@@ -827,12 +939,7 @@ def run_drone_simulation():
 
                             expansion_count += 1
                             last_expansion_step = step
-
-                            if use_subjective_time:
-                                agent.ref_backbone = copy.deepcopy(agent.shared_backbone)
-                                agent.ref_backbone.eval()
-                                for p in agent.ref_backbone.parameters():
-                                    p.requires_grad = False
+                            # ref_backbone уже создан в agent.expand()
                         else:
                             print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
             elif is_shock and not can_expand and (step % 50 == 0):
@@ -875,6 +982,11 @@ def run_drone_simulation():
                     out_rep = agent(x_replay)
                     replay_loss = criterion_train(out_rep[:, :10], y_replay)
 
+                # Compute entropy for crystallization (before other losses)
+                with torch.no_grad():
+                    probs_m = torch.softmax(outputs[:, :10], dim=1)
+                    ent_batch = (-(probs_m * torch.log(probs_m + 1e-9)).sum(dim=1)).mean().item()
+
                 # subjective time critic + stability anchor (normalized)
                 surprise = None
                 stability_loss = 0.0
@@ -901,6 +1013,7 @@ def run_drone_simulation():
 
                 # adaptive pain: gradient conflict -> adaptive lambda
                 adaptive_lambda = current_lambda
+                pain_value = 0.0  # default if not computed
                 if use_adaptive_pain and (x_replay is not None):
                     # only params that are actually updated by optimizer
                     backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
@@ -951,6 +1064,21 @@ def run_drone_simulation():
                 if kl_loss != 0.0:
                     total_loss = total_loss + kl_loss
 
+            # Update time crystallization (after computing surprise, pain, entropy)
+            if expansion_count > 0 and use_subjective_time:
+                surp_val = surprise.item() if surprise is not None else 0.0
+                agent.update_time_crystallization(surp_val, pain_value, ent_batch)
+                
+                # Auto hard-freeze if needed
+                agent.auto_hard_freeze_if_needed()
+                
+                # Crystallization regularizer (replaces old hard stability_loss with adaptive strength)
+                cryst_reg = agent.crystallization_regularizer()
+                if cryst_reg != 0.0:
+                    # Сила защиты: чем выше crystal_level, тем сильнее закрепление
+                    cryst_strength = 2000.0 * agent.crystal_level
+                    total_loss = total_loss + cryst_strength * cryst_reg
+
             # critic update (separate)
             if use_subjective_time and critic_loss is not None:
                 critic_optimizer.zero_grad(set_to_none=True)
@@ -981,8 +1109,8 @@ def run_drone_simulation():
                         n1 = float(gn.pow(2).sum().sqrt().item()) + 1e-8
                         n2 = float(go.pow(2).sum().sqrt().item()) + 1e-8
                         cos = dot / (n1 * n2)
-                        pain = max(0.0, min(1.0, (1.0 - cos) * 0.5))
-                        adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain
+                        pain_value = max(0.0, min(1.0, (1.0 - cos) * 0.5))
+                        adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain_value
 
                         # if stability loss exists, replace lambda (re-weight stability)
                         if use_subjective_time and agent.ref_backbone is not None and stability_loss != 0.0:
@@ -1026,10 +1154,11 @@ def run_drone_simulation():
                     unk_rate = ((mp < 0.2) | (ent > 1.8)).float().mean().item()
 
                 s = f"{float(surprise.item()):.4f}" if surprise is not None else "n/a"
+                cryst_info = f" | Crystal: {agent.crystal_level:.3f}" if expansion_count > 0 else ""
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} | Mem(M): {acc_A:.1f}% | "
                     f"New(A): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
-                    f"Errors: {error_count_phase2} | Surprise: {s}"
+                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}"
                 )
 
             step += 1
