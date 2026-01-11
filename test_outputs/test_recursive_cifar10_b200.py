@@ -2513,10 +2513,104 @@ def run_drone_simulation():
                     else:
                         surprise = None
                 
+                # --- AGI COMPONENTS INTEGRATION ---
+                # 1. World Model: предсказание следующего состояния и обучение
+                loss_world_model = torch.zeros((), device=device, dtype=torch.float32)
+                wm_error_signal = 0.0
+                action_idx = None
+                if agent.use_world_model and len(agent.heads) > 0:
+                    # Генерируем цель (если включены goals)
+                    goal_features = None
+                    if agent.use_internal_goals:
+                        goal = agent.generate_internal_goal(features[:real_B])
+                        # Конвертируем goal в goal_features (используем goal как features для simplicity)
+                        goal_features = agent.internal_goals.goal_generator(features[:real_B])
+                    
+                    # Выбираем действие
+                    action_idx, action_logits = agent.select_action(features[:real_B], goal_features)
+                    
+                    # Применяем действие к изображению
+                    x_next = agent.apply_action_to_image(data_real, action_idx)
+                    with torch.no_grad():
+                        features_next = agent.shared_backbone(x_next)
+                    
+                    # Предсказываем следующее состояние
+                    next_features_pred, z_mean, z_logvar, next_z_mean, next_z_logvar = agent.predict_next_state(
+                        features[:real_B], action_idx
+                    )
+                    
+                    if next_features_pred is not None:
+                        # World Model Loss: reconstruction + KL
+                        loss_wm_recon = F.mse_loss(next_features_pred, features_next.detach())
+                        loss_wm_kl = -0.5 * torch.sum(1 + next_z_logvar - next_z_mean.pow(2) - next_z_logvar.exp()) / features[:real_B].size(0)
+                        loss_world_model = loss_wm_recon + 0.1 * loss_wm_kl
+                        
+                        # World Model error для Complexity Controller
+                        wm_error_signal = float(loss_wm_recon.item())
+                        agent._last_wm_error = wm_error_signal
+                
+                # 2. Goal-conditioned Policy: модифицируем actions на основе целей
+                if agent.use_internal_goals and actions is not None and len(agent.heads) > 0:
+                    goal = agent.generate_internal_goal(features[:real_B])
+                    policy_mod = agent.internal_goals.get_goal_policy_modifier(features[:real_B], goal)
+                    
+                    # Модифицируем actions
+                    policy_mod_mean = policy_mod.mean(dim=0)  # [3] - [recursion_boost, replay_boost, temperature_mod]
+                    actions["n_recursions"] = max(1, min(3, int(actions["n_recursions"] + policy_mod_mean[0].item())))
+                    actions["replay_ratio"] = max(0.1, min(0.4, actions["replay_ratio"] + policy_mod_mean[1].item() * 0.1))
+                    actions["gate_temperature"] = max(0.7, min(2.0, actions["gate_temperature"] + policy_mod_mean[2].item() * 0.2))
+                
+                # 3. Memory → Decision: вспоминаем похожие эпизоды и модифицируем policy
+                if agent.use_autobiographical_memory and len(agent.heads) > 0 and complexity > 0.5:
+                    similar_memories = agent.recall_similar_experiences(features[0] if features.size(0) > 0 else features.mean(dim=0), k=5)
+                    if similar_memories and actions is not None:
+                        memory_mod = agent.autobiographical_memory.get_recall_policy_modifier(similar_memories)
+                        actions["n_recursions"] = max(1, min(3, int(actions["n_recursions"] + memory_mod["recursion_boost"])))
+                        actions["replay_ratio"] = max(0.1, min(0.4, actions["replay_ratio"] + memory_mod["replay_boost"]))
+                
+                # 4. Concepts в управлении: модифицируем routing на основе концептов
+                loss_concept_recon = torch.zeros((), device=device, dtype=torch.float32)
+                if agent.use_own_concepts and len(agent.heads) > 0:
+                    concept_activations, concept_importance = agent.extract_own_concepts(features[:real_B])
+                    routing_signal = agent.own_concepts.get_concept_based_routing(concept_activations, concept_importance)
+                    
+                    # Модифицируем routing gate temperature на основе концептов
+                    if actions is not None and agent.use_soft_routing:
+                        concept_temp_mod = routing_signal.mean().item() * 0.3  # [-0.3..0.3]
+                        actions["gate_temperature"] = max(0.7, min(2.0, actions["gate_temperature"] + concept_temp_mod))
+                    
+                    # Concept reconstruction loss
+                    reconstructed = agent.own_concepts.reconstruct_from_concepts(concept_activations)
+                    loss_concept_recon = F.mse_loss(reconstructed, features[:real_B].detach())
+                
+                # 5. Self-Model Supervision: обучаем на внутренних метриках
+                loss_self_model = torch.zeros((), device=device, dtype=torch.float32)
+                if agent.use_self_model and len(agent.heads) > 0:
+                    # Вычисляем реальные метрики (упрощённо)
+                    capabilities_real = torch.ones(len(agent.heads), device=device) * 0.8  # placeholder
+                    confidence_real = max(0.0, min(1.0, 1.0 - float(loss_new.item()) / 2.0)) if 'loss_new' in locals() else 0.5
+                    weakness_real = min(1.0, (float(surprise.item()) if surprise is not None else 0.0) + pain_value + entropy_test / 2.3)
+                    
+                    # Обновляем EMA targets (будет использовано после вычисления loss_new)
+                    # Пока сохраняем для использования позже
+                    agent._self_model_targets = {
+                        "capabilities": capabilities_real,
+                        "confidence": confidence_real,
+                        "weakness": weakness_real
+                    }
+                
                 # КРИТИЧНО: обновляем complexity после вычисления surprise (для следующего шага)
                 # Работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
-                if len(agent.heads) > 0 and surprise is not None:
-                    surp_val = float(surprise.item())
+                # 6. Complexity Controller с World Model Error (если доступен)
+                if len(agent.heads) > 0:
+                    if agent.use_world_model and wm_error_signal > 0:
+                        # Используем prediction error от World Model как сигнал сложности
+                        surp_val = wm_error_signal
+                    elif surprise is not None:
+                        surp_val = float(surprise.item())
+                    else:
+                        surp_val = entropy_test * 0.5  # fallback
+                    
                     complexity = agent.complexity_controller.compute_complexity(
                         surprise=surp_val,
                         pain=pain_value,  # будет обновлён позже в pain-блоке
@@ -2553,6 +2647,12 @@ def run_drone_simulation():
                     if not torch.isfinite(outputs).all():
                         print(f"[ERROR] Cannot fix outputs, skipping step {step}")
                         continue
+                
+                # Инициализация AGI loss переменных (до их использования)
+                loss_world_model = torch.zeros((), device=device, dtype=torch.float32)
+                loss_concept_recon = torch.zeros((), device=device, dtype=torch.float32)
+                wm_error_signal = 0.0
+                action_idx = None
 
                 # Supervised loss на real данных
                 # КРИТИЧНО: Phase2 loss только по активным классам (2..7), не по всем 10
@@ -2797,6 +2897,15 @@ def run_drone_simulation():
             # Это предотвращает доминирование Unknown (10000 предсказаний)
             if isinstance(loss_unk_id, torch.Tensor) and loss_unk_id.item() != 0.0 and torch.isfinite(loss_unk_id):
                 total_loss = total_loss + 0.2 * loss_unk_id  # вес 0.1..0.3 для margin loss
+            
+            # --- AGI Components Losses ---
+            # World Model Loss
+            if isinstance(loss_world_model, torch.Tensor) and loss_world_model.item() != 0.0 and torch.isfinite(loss_world_model):
+                total_loss = total_loss + 0.1 * loss_world_model
+            
+            # Concept Reconstruction Loss
+            if isinstance(loss_concept_recon, torch.Tensor) and loss_concept_recon.item() != 0.0 and torch.isfinite(loss_concept_recon):
+                total_loss = total_loss + 0.02 * loss_concept_recon
 
             # Добавляем loss для Unknown класса (Outlier Exposure) - отключено для рекурсивной эмергенции
             # if isinstance(loss_unknown, torch.Tensor) and loss_unknown.item() != 0.0 and torch.isfinite(loss_unknown):
@@ -2879,6 +2988,40 @@ def run_drone_simulation():
                     else:
                         if step % 50 == 0:
                             print(f"[WARNING] cryst_reg term is NaN/inf, skipping")
+            
+            # Self-Model Supervision Loss (вычисляем после loss_new)
+            if agent.use_self_model and len(agent.heads) > 0 and hasattr(agent, '_self_model_targets'):
+                targets = agent._self_model_targets
+                agent.self_model.update_ema_targets(
+                    targets["capabilities"],
+                    targets["confidence"],
+                    targets["weakness"]
+                )
+                
+                # Self-Model Loss
+                capabilities_pred = agent.self_model.predict_capabilities(features[:real_B])
+                confidence_pred = agent.self_model.estimate_confidence(features[:real_B])
+                weakness_pred = agent.self_model.detect_weakness(features[:real_B])
+                
+                ema_targets = agent.self_model.get_targets()
+                loss_self_cap = F.mse_loss(capabilities_pred.mean(dim=0), ema_targets["capabilities"].to(features.device))
+                loss_self_conf = F.mse_loss(confidence_pred.mean(), torch.tensor(ema_targets["confidence"], device=features.device))
+                loss_self_weak = F.mse_loss(weakness_pred.mean(), torch.tensor(ema_targets["weakness"], device=features.device))
+                
+                loss_self_model = loss_self_cap + loss_self_conf + loss_self_weak
+                if torch.isfinite(loss_self_model):
+                    total_loss = total_loss + 0.05 * loss_self_model
+            
+            # Записываем эпизод в автобиографическую память
+            if agent.use_autobiographical_memory and len(agent.heads) > 0:
+                agent.record_autobiographical_memory(
+                    step=step,
+                    state_features=features[0] if features.size(0) > 0 else features.mean(dim=0),
+                    action=action_idx[0] if (agent.use_world_model and action_idx is not None and action_idx.size(0) > 0) else None,
+                    outcome={"loss": float(loss_new.item()), "surprise": float(surprise.item()) if surprise is not None else 0.0},
+                    reward_signal=max(0.0, min(1.0, 1.0 - float(loss_new.item()) / 2.0)),  # нормализованная награда
+                    context={"complexity": complexity if 'complexity' in locals() else 0.0, "entropy": entropy_test}
+                )
             
             # КРИТИЧНО: обновляем Complexity Budget на основе использованных действий
             # Работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
