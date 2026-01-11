@@ -985,19 +985,19 @@ def run_drone_simulation():
                     out_rep = agent(x_replay)
                     replay_loss = criterion_train(out_rep[:, :10], y_replay)
 
+                # ---- subjective time critic (per-sample, inside autocast) ----
+                surprise = None
+                critic_loss = None
+                if use_subjective_time and agent.ref_backbone is not None:
+                    pred_ps = agent.critic(features.detach())          # [B]
+                    real_ps = criterion_none(outputs[:, :10], target)  # [B]
+                    surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
+                    critic_loss = F.mse_loss(pred_ps, real_ps.detach())
+
             # entropy (no grad)
             with torch.no_grad():
                 probs_m = torch.softmax(outputs[:, :10], dim=1)
                 ent_batch = (-(probs_m * torch.log(probs_m + 1e-9)).sum(dim=1)).mean().item()
-
-            # ---- subjective time critic (per-sample) ----
-            surprise = None
-            critic_loss = None
-            if use_subjective_time and agent.ref_backbone is not None:
-                pred_ps = agent.critic(features.detach())          # [B]
-                real_ps = criterion_none(outputs[:, :10], target)  # [B]
-                surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
-                critic_loss = F.mse_loss(pred_ps, real_ps.detach())
 
             # ---- adaptive pain (MUST be computed BEFORE crystallization update) ----
             pain_value = 0.0
