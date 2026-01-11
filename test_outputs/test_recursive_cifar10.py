@@ -1117,13 +1117,19 @@ def run_drone_simulation():
                 x_replay, y_replay = agent.sample_replay_batch(batch_size=32, device=device)
                 if x_replay is not None:
                     # Вычисляем градиенты для нового и старого loss
-                    backbone_params = list(agent.shared_backbone.parameters())
+                    # Используем только параметры, которые требуют градиента (не заморожены)
+                    backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
                     
-                    loss_new = criterion(outputs[:, :10], target)
-                    loss_old = criterion(agent(x_replay)[:, :10], y_replay)
-                    
-                    g_new = torch.autograd.grad(loss_new, backbone_params, retain_graph=True, create_graph=False)
-                    g_old = torch.autograd.grad(loss_old, backbone_params, retain_graph=True, create_graph=False)
+                    if len(backbone_params) > 0:  # Проверяем, что есть параметры для обучения
+                        loss_new = criterion(outputs[:, :10], target)
+                        loss_old = criterion(agent(x_replay)[:, :10], y_replay)
+                        
+                        g_new = torch.autograd.grad(loss_new, backbone_params, retain_graph=True, create_graph=False, allow_unused=True)
+                        g_old = torch.autograd.grad(loss_old, backbone_params, retain_graph=True, create_graph=False, allow_unused=True)
+                        
+                        # Фильтруем None градиенты (для замороженных параметров)
+                        g_new = [g for g in g_new if g is not None]
+                        g_old = [g for g in g_old if g is not None]
                     
                     # Вычисляем косинус между градиентами
                     g_new_flat = torch.cat([gi.detach().flatten() for gi in g_new])
