@@ -1072,6 +1072,102 @@ class TimeMixer(nn.Module):
         return mixed_features
 
 
+class ElegantRecursiveCore(nn.Module):
+    """
+    Элегантный рекурсивный блок - фрактальная простота вместо модульности.
+    
+    Вместо отдельных модулей (Backbone + WorldModel + Critic) используем один итеративный блок.
+    Рекурсивное время встроено в цикл: чем сложнее картинка (сюрприз), тем больше итераций.
+    """
+    def __init__(self, input_dim=3, hidden_dim=512, output_dim=11):
+        super().__init__()
+        # Единый блок: encode + refine + classify
+        self.encode = nn.Sequential(
+            nn.Conv2d(input_dim, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 32->16
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 16->8
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 8->4
+            nn.Conv2d(256, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)  # [B, hidden_dim, 1, 1]
+        )
+        
+        # Рекурсивный refine блок - уточняет представление на каждой итерации
+        self.refine = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Классификатор
+        self.classify = nn.Linear(hidden_dim, output_dim)
+        
+        self.hidden_dim = hidden_dim
+    
+    def forward(self, x, max_steps=None, surprise_threshold=0.3):
+        """
+        Рекурсивный forward с автоматическим определением числа итераций.
+        
+        Args:
+            x: [B, 3, 32, 32] - входное изображение
+            max_steps: int - максимальное число итераций (опционально)
+            surprise_threshold: float - порог сюрприза для продолжения рекурсии
+        
+        Returns:
+            logits: [B, output_dim] - предсказания
+            h_final: [B, hidden_dim] - финальное представление
+            reconstruction_error: float - ошибка восстановления (энергия/сюрприз)
+        """
+        B = x.size(0)
+        device = x.device
+        
+        # 1. Encode: начальное представление
+        h = self.encode(x)  # [B, hidden_dim, 1, 1]
+        h = h.view(B, -1)  # [B, hidden_dim]
+        
+        # 2. Рекурсивное уточнение: h зависит от h прошлого шага
+        # Сюрприз как энергия: если вход сильно отличается от ожидаемого, продолжаем итерации
+        reconstruction_error = None
+        h_prev = None
+        
+        if max_steps is None:
+            max_steps = 3  # по умолчанию 3 итерации
+        
+        for step in range(max_steps):
+            h_prev = h.clone()
+            # Refine: уточняем представление
+            h = self.refine(h)  # [B, hidden_dim]
+            
+            # КРИТИЧНО: Сюрприз как энергия - вычисляем ошибку восстановления
+            # Если h сильно изменился, значит есть "напряжение" (сложность)
+            if step > 0 and h_prev is not None:
+                reconstruction_error = F.mse_loss(h, h_prev.detach()).item()
+                # Если ошибка мала (h стабилизировался), можно остановиться раньше
+                if reconstruction_error < surprise_threshold * 0.1:
+                    break
+        
+        # 3. Classify: финальное предсказание
+        logits = self.classify(h)  # [B, output_dim]
+        
+        # Если reconstruction_error не был вычислен, используем разницу между последними двумя шагами
+        if reconstruction_error is None:
+            reconstruction_error = 0.0
+        
+        return logits, h, reconstruction_error
+
+
 # КРИТИЧНО: Complexity Controller - единый метаконтроллер для управления временем и рекурсией
 class ComplexityController:
     """
@@ -1354,15 +1450,27 @@ class CuriosityModule:
 class RecursiveAgent(nn.Module):
     def __init__(self, use_curiosity=False, use_subjective_time=False, use_vae_dreams=False, 
                  use_world_model=False, use_internal_goals=False, use_own_concepts=False,
-                 use_autobiographical_memory=False, use_self_model=False):
+                 use_autobiographical_memory=False, use_self_model=False, use_elegant_mode=False):
         super().__init__()
         self.hidden_size = 512
         self.output_size = 11
         self.unknown_class_idx = 10
 
-        self.shared_backbone = SharedBackbone()
-        self.heads = nn.ModuleList([ExpandableHead(self.hidden_size, self.output_size)])
-        self.columns = nn.ModuleList([TemporalColumn(self.hidden_size, self.output_size)])
+        # КРИТИЧНО: Элегантный режим - фрактальная простота вместо модульности
+        self.use_elegant_mode = bool(use_elegant_mode)  # опционально: можно включить для упрощенной архитектуры
+        if self.use_elegant_mode:
+            # Единый рекурсивный блок вместо Backbone + WorldModel + Critic
+            self.elegant_core = ElegantRecursiveCore(input_dim=3, hidden_dim=self.hidden_size, output_dim=self.output_size)
+            # "Медленные веса" для кристаллизации через EMA
+            self.memory_weights = copy.deepcopy(self.elegant_core)
+            for p in self.memory_weights.parameters():
+                p.requires_grad = False
+            self.ema_decay = 0.999  # медленное обновление памяти
+        else:
+            # Стандартный режим с модульностью
+            self.shared_backbone = SharedBackbone()
+            self.heads = nn.ModuleList([ExpandableHead(self.hidden_size, self.output_size)])
+            self.columns = nn.ModuleList([TemporalColumn(self.hidden_size, self.output_size)])
 
         self.sensor = ComplexitySensor()
         self.active_classes_per_column = {}
@@ -1435,6 +1543,11 @@ class RecursiveAgent(nn.Module):
 
         self.replay_buffer = {"X": [], "Y": []}
         self.max_replay_size = 1000
+        
+        # КРИТИЧНО: Упрощенная кристаллизация через EMA весов (для элегантного режима)
+        if self.use_elegant_mode:
+            self.ema_update_counter = 0
+            self.ema_update_frequency = 10  # обновляем memory_weights каждые 10 шагов
 
         # --- TIME CRYSTALLIZATION STATE ---
         self.crystal_level = 0.0       # [0..1]
@@ -1513,6 +1626,53 @@ class RecursiveAgent(nn.Module):
         # при c<0.5 почти не мешает учиться новым текстурам
         return 0.002 + 0.020 * (c ** 3.0)
 
+    def update_memory_weights_ema(self):
+        """
+        КРИТИЧНО: Упрощенная кристаллизация через весовую инерцию (EMA).
+        Вместо сложной логики заморозки слоев используем просто EMA копию весов.
+        "Медленные" веса (memory_weights) плавно догоняют "быстрые" (elegant_core).
+        Это одна строчка кода в функции потерь - элегантность вместо модульности.
+        """
+        if not self.use_elegant_mode or not hasattr(self, 'elegant_core') or not hasattr(self, 'memory_weights'):
+            return
+        
+        # EMA обновление: memory_weights = ema_decay * memory_weights + (1 - ema_decay) * elegant_core
+        with torch.no_grad():
+            for (name, param_fast), (_, param_slow) in zip(
+                self.elegant_core.named_parameters(),
+                self.memory_weights.named_parameters()
+            ):
+                param_slow.data = self.ema_decay * param_slow.data + (1.0 - self.ema_decay) * param_fast.data
+    
+    def elegant_stability_loss(self):
+        """
+        КРИТИЧНО: Stability Loss - просто не даем весам быстро меняться.
+        Это попытка текущих весов не уходить далеко от "медленных" (памяти).
+        Одна строчка кода вместо сложной логики кристаллизации.
+        """
+        if not self.use_elegant_mode or not hasattr(self, 'elegant_core') or not hasattr(self, 'memory_weights'):
+            # Fallback: возвращаем нулевой тензор на правильном устройстве
+            if hasattr(self, 'elegant_core'):
+                device = next(self.elegant_core.parameters()).device
+            elif hasattr(self, 'shared_backbone'):
+                device = next(self.shared_backbone.parameters()).device
+            else:
+                device = torch.device('cpu')
+            return torch.tensor(0.0, device=device)
+        
+        # Просто MSE между быстрыми и медленными весами
+        total_loss = 0.0
+        count = 0
+        device = next(self.elegant_core.parameters()).device
+        for (name, param_fast), (_, param_slow) in zip(
+            self.elegant_core.named_parameters(),
+            self.memory_weights.named_parameters()
+        ):
+            total_loss += F.mse_loss(param_fast, param_slow.detach())
+            count += 1
+        
+        return total_loss / max(1, count) if count > 0 else torch.tensor(0.0, device=device)
+    
     def crystallization_regularizer(self):
         """
         Пер-слойная защита (EWC-lite): ||W - W_ref||^2 с динамическим весом в зависимости от crystal_level.
@@ -1978,6 +2138,18 @@ class RecursiveAgent(nn.Module):
         print(f"   Memory compressed: {len(self.heads)} head(s) remaining (shared backbone).")
 
     def forward(self, x, return_features=False):
+        # КРИТИЧНО: Элегантный режим - единый рекурсивный блок
+        if self.use_elegant_mode and hasattr(self, 'elegant_core'):
+            # Рекурсивное время встроено в цикл: чем сложнее картинка, тем больше итераций
+            logits, h_final, reconstruction_error = self.elegant_core(x, max_steps=3)
+            
+            # КРИТИЧНО: Сюрприз как энергия - reconstruction_error автоматически определяет сложность
+            # Не нужен отдельный Critic - энергия встроена в сам forward
+            if return_features:
+                return logits, h_final
+            return logits
+        
+        # Стандартный режим с модульностью
         feats = self.shared_backbone(x)
         
         # КРИТИЧНО: Time Mixer - смешивает текущие features с прошлыми состояниями
@@ -2638,6 +2810,13 @@ def run_drone_simulation():
     use_autobiographical_memory = True  # Автобиографическая память: запись опыта
     use_self_model = True  # Self Model: модель самого себя
     
+    # КРИТИЧНО: Элегантный режим - фрактальная простота вместо модульности
+    #   - Единый рекурсивный блок вместо Backbone + WorldModel + Critic
+    #   - Сюрприз как энергия (reconstruction error) вместо отдельного Critic
+    #   - Кристаллизация через EMA весов (одна строчка) вместо сложной логики
+    #   - Экономия памяти: одна модель вместо 5 разных
+    use_elegant_mode = True  # ВКЛЮЧЕН: элегантная архитектура с фрактальной простотой
+    
     agent = RecursiveAgent(
         use_curiosity=use_curiosity,
         use_subjective_time=use_subjective_time,
@@ -2647,6 +2826,7 @@ def run_drone_simulation():
         use_own_concepts=use_own_concepts,
         use_autobiographical_memory=use_autobiographical_memory,
         use_self_model=use_self_model,
+        use_elegant_mode=use_elegant_mode,  # Элегантный режим: фрактальная простота
     ).to(device)
 
     # memory format optimization
@@ -3881,6 +4061,17 @@ def run_drone_simulation():
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
+            
+            # КРИТИЧНО: Элегантный режим - упрощенная кристаллизация через EMA весов
+            # Stability Loss - просто не даем весам быстро меняться (одна строчка вместо сложной логики)
+            if agent.use_elegant_mode and hasattr(agent, 'elegant_stability_loss'):
+                stability_loss = agent.elegant_stability_loss()
+                if isinstance(stability_loss, torch.Tensor) and stability_loss.item() > 0.0 and torch.isfinite(stability_loss):
+                    total_loss = total_loss + 0.1 * stability_loss  # вес для стабильности
+                
+                # Обновляем memory_weights через EMA (каждые N шагов)
+                if step % agent.ema_update_frequency == 0:
+                    agent.update_memory_weights_ema()
 
             # КРИТИЧНО: Unknown-margin на ID данных - Unknown должен быть НИЖЕ known на реальных CIFAR-10
             # Это предотвращает доминирование Unknown (10000 предсказаний)
