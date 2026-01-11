@@ -74,6 +74,389 @@ class ComplexitySensor:
 
 
 # ----------------------------
+# AGI Components: World Model, Goals, Concepts, Autobiographical Memory, Self-Model
+# ----------------------------
+
+class WorldModel(nn.Module):
+    """
+    World Model: предсказывает будущие состояния и причинно-следственные связи.
+    Использует latent space для предсказания следующего состояния на основе текущего состояния и действия.
+    """
+    def __init__(self, feature_dim=512, action_dim=10, hidden_dim=256, latent_dim=128):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim
+        
+        # Encoder: features -> latent
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim * 2)  # mean, logvar
+        )
+        
+        # Transition: (latent, action) -> next_latent
+        self.transition = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim * 2)
+        )
+        
+        # Decoder: latent -> predicted_features
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim)
+        )
+        
+        # Causality predictor: предсказывает последствия действий
+        self.causality_head = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim)  # предсказывает "результат" действия
+        )
+    
+    def encode(self, features):
+        """Кодирует features в latent space"""
+        z_params = self.encoder(features)
+        z_mean, z_logvar = z_params.chunk(2, dim=-1)
+        return z_mean, z_logvar
+    
+    def reparameterize(self, mean, logvar):
+        """Reparameterization trick для VAE"""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+    
+    def predict_next(self, features, action_onehot):
+        """
+        Предсказывает следующее состояние на основе текущего состояния и действия.
+        
+        Args:
+            features: [B, feature_dim] - текущие features
+            action_onehot: [B, action_dim] - действие (one-hot или soft)
+        
+        Returns:
+            next_features_pred: [B, feature_dim] - предсказанные features следующего состояния
+            causality_pred: [B, action_dim] - предсказанные последствия действия
+        """
+        # Encode current state
+        z_mean, z_logvar = self.encode(features)
+        z = self.reparameterize(z_mean, z_logvar)
+        
+        # Predict next latent
+        z_action = torch.cat([z, action_onehot], dim=-1)
+        next_z_params = self.transition(z_action)
+        next_z_mean, next_z_logvar = next_z_params.chunk(2, dim=-1)
+        next_z = self.reparameterize(next_z_mean, next_z_logvar)
+        
+        # Decode to features
+        next_features_pred = self.decoder(next_z)
+        
+        # Predict causality (consequences)
+        causality_pred = self.causality_head(next_z)
+        
+        return next_features_pred, causality_pred, z_mean, z_logvar, next_z_mean, next_z_logvar
+
+
+class InternalGoals(nn.Module):
+    """
+    Внутренние цели: система целей, независимая от внешних наград.
+    Генерирует собственные цели на основе curiosity, novelty, и внутренней мотивации.
+    """
+    def __init__(self, feature_dim=512, goal_dim=64, hidden_dim=256):
+        super().__init__()
+        self.goal_dim = goal_dim
+        
+        # Goal generator: features -> goal vector
+        self.goal_generator = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, goal_dim)
+        )
+        
+        # Goal evaluator: (features, goal) -> achievement_score
+        self.goal_evaluator = nn.Sequential(
+            nn.Linear(feature_dim + goal_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()  # [0..1] - насколько цель достигнута
+        )
+        
+        # Curiosity signal: novelty detector
+        self.novelty_detector = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Active goals buffer
+        self.active_goals = []  # список текущих активных целей
+        self.max_active_goals = 5
+    
+    def generate_goal(self, features, novelty_signal=None):
+        """
+        Генерирует новую внутреннюю цель на основе текущего состояния.
+        
+        Args:
+            features: [B, feature_dim] - текущие features
+            novelty_signal: float [0..1] - сигнал новизны (опционально)
+        
+        Returns:
+            goal: [B, goal_dim] - вектор цели
+        """
+        goal = self.goal_generator(features)
+        return goal
+    
+    def evaluate_goal_achievement(self, features, goal):
+        """
+        Оценивает, насколько цель достигнута.
+        
+        Returns:
+            achievement_score: [B, 1] - [0..1], где 1 = цель полностью достигнута
+        """
+        goal_feat = torch.cat([features, goal], dim=-1)
+        achievement = self.goal_evaluator(goal_feat)
+        return achievement
+    
+    def compute_novelty(self, features):
+        """
+        Вычисляет сигнал новизны (curiosity).
+        
+        Returns:
+            novelty: [B, 1] - [0..1], где 1 = максимальная новизна
+        """
+        return self.novelty_detector(features)
+
+
+class OwnConcepts(nn.Module):
+    """
+    Собственные концепты: генерация и использование внутренних концептов,
+    не заданных извне (в отличие от CLIP, который использует внешние концепты).
+    """
+    def __init__(self, feature_dim=512, concept_dim=128, num_concepts=32, hidden_dim=256):
+        super().__init__()
+        self.concept_dim = concept_dim
+        self.num_concepts = num_concepts
+        
+        # Concept encoder: features -> concept activations
+        self.concept_encoder = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_concepts)
+        )
+        
+        # Concept bank: хранилище концептов (trainable embeddings)
+        self.concept_bank = nn.Parameter(torch.randn(num_concepts, concept_dim))
+        
+        # Concept decoder: (concept_activations, concept_bank) -> reconstructed_features
+        self.concept_decoder = nn.Sequential(
+            nn.Linear(num_concepts * concept_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim)
+        )
+        
+        # Concept importance: какие концепты важны для текущего состояния
+        self.importance_net = nn.Sequential(
+            nn.Linear(feature_dim, num_concepts),
+            nn.Softmax(dim=-1)
+        )
+    
+    def extract_concepts(self, features):
+        """
+        Извлекает активации концептов из features.
+        
+        Returns:
+            concept_activations: [B, num_concepts] - активации концептов
+            concept_importance: [B, num_concepts] - важность каждого концепта
+        """
+        concept_activations = torch.sigmoid(self.concept_encoder(features))  # [B, num_concepts]
+        concept_importance = self.importance_net(features)  # [B, num_concepts]
+        return concept_activations, concept_importance
+    
+    def reconstruct_from_concepts(self, concept_activations):
+        """
+        Восстанавливает features из концептов.
+        
+        Args:
+            concept_activations: [B, num_concepts]
+        
+        Returns:
+            reconstructed_features: [B, feature_dim]
+        """
+        # Weighted combination of concepts
+        weighted_concepts = concept_activations.unsqueeze(-1) * self.concept_bank.unsqueeze(0)  # [B, num_concepts, concept_dim]
+        concept_flat = weighted_concepts.view(concept_activations.size(0), -1)  # [B, num_concepts * concept_dim]
+        reconstructed = self.concept_decoder(concept_flat)
+        return reconstructed
+    
+    def discover_new_concept(self, features, threshold=0.3):
+        """
+        Обнаруживает новый концепт, если текущие концепты недостаточны.
+        
+        Returns:
+            new_concept_found: bool - обнаружен ли новый концепт
+        """
+        concept_activations, importance = self.extract_concepts(features)
+        max_activation = concept_activations.max(dim=-1)[0].mean()
+        # Если максимальная активация низкая, значит нужен новый концепт
+        return max_activation.item() < threshold
+
+
+class AutobiographicalMemory:
+    """
+    Автобиографическая память: запись собственных действий, решений и опыта.
+    Хранит не только данные, но и контекст: "что я делал", "почему", "что произошло".
+    """
+    def __init__(self, max_memories=10000):
+        self.max_memories = max_memories
+        self.memories = []  # список записей памяти
+        
+    def record(self, step, state_features, action, outcome, reward_signal=None, context=None):
+        """
+        Записывает эпизод в автобиографическую память.
+        
+        Args:
+            step: int - номер шага
+            state_features: tensor [feature_dim] - состояние
+            action: tensor или int - действие
+            outcome: tensor [feature_dim] или dict - результат действия
+            reward_signal: float - сигнал награды (опционально)
+            context: dict - дополнительный контекст (опционально)
+        """
+        memory_entry = {
+            "step": step,
+            "state": state_features.detach().cpu() if torch.is_tensor(state_features) else state_features,
+            "action": action.detach().cpu() if torch.is_tensor(action) else action,
+            "outcome": outcome.detach().cpu() if torch.is_tensor(outcome) else outcome,
+            "reward": reward_signal,
+            "context": context or {},
+            "timestamp": len(self.memories)  # порядковый номер
+        }
+        self.memories.append(memory_entry)
+        
+        # Ограничиваем размер памяти
+        if len(self.memories) > self.max_memories:
+            self.memories.pop(0)
+    
+    def recall(self, query_features, k=10):
+        """
+        Вспоминает похожие эпизоды по query_features.
+        
+        Returns:
+            similar_memories: list - список k наиболее похожих записей
+        """
+        if len(self.memories) == 0:
+            return []
+        
+        # Вычисляем similarity (cosine similarity)
+        similarities = []
+        query_norm = query_features.norm()
+        if query_norm == 0:
+            return []
+        
+        for mem in self.memories:
+            if torch.is_tensor(mem["state"]):
+                state = mem["state"]
+                if state.numel() == query_features.numel():
+                    state_flat = state.flatten()
+                    query_flat = query_features.flatten()
+                    sim = torch.dot(state_flat, query_flat) / (state_flat.norm() * query_flat.norm() + 1e-8)
+                    similarities.append((sim.item(), mem))
+        
+        # Сортируем по similarity
+        similarities.sort(key=lambda x: x[0], reverse=True)
+        return [mem for _, mem in similarities[:k]]
+    
+    def get_statistics(self):
+        """Возвращает статистику по памяти"""
+        return {
+            "total_memories": len(self.memories),
+            "oldest_step": self.memories[0]["step"] if self.memories else None,
+            "newest_step": self.memories[-1]["step"] if self.memories else None,
+        }
+
+
+class SelfModel(nn.Module):
+    """
+    Явный self-model: модель самого себя и своих способностей.
+    Отвечает на вопросы: "Что я умею?", "Насколько я уверен?", "Где мои слабые места?"
+    """
+    def __init__(self, feature_dim=512, num_heads=5, hidden_dim=256):
+        super().__init__()
+        self.num_heads = num_heads
+        
+        # Capability predictor: предсказывает способности на разных задачах
+        self.capability_predictor = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_heads)  # способности для каждого head
+        )
+        
+        # Confidence estimator: оценивает уверенность в предсказаниях
+        self.confidence_estimator = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Weakness detector: обнаруживает слабые места
+        self.weakness_detector = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()  # [0..1], где 1 = максимальная слабость
+        )
+        
+        # Self-awareness: мета-оценка собственного состояния
+        self.self_awareness = nn.Sequential(
+            nn.Linear(feature_dim + num_heads, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3)  # [capability, confidence, weakness]
+        )
+    
+    def predict_capabilities(self, features):
+        """
+        Предсказывает способности на разных задачах (heads).
+        
+        Returns:
+            capabilities: [B, num_heads] - [0..1], способности для каждого head
+        """
+        return torch.sigmoid(self.capability_predictor(features))
+    
+    def estimate_confidence(self, features):
+        """
+        Оценивает уверенность в предсказаниях.
+        
+        Returns:
+            confidence: [B, 1] - [0..1], где 1 = максимальная уверенность
+        """
+        return self.confidence_estimator(features)
+    
+    def detect_weakness(self, features):
+        """
+        Обнаруживает слабые места в знаниях.
+        
+        Returns:
+            weakness: [B, 1] - [0..1], где 1 = максимальная слабость
+        """
+        return self.weakness_detector(features)
+    
+    def self_assess(self, features, head_capabilities):
+        """
+        Мета-оценка собственного состояния.
+        
+        Returns:
+            assessment: [B, 3] - [capability, confidence, weakness]
+        """
+        feat_cap = torch.cat([features, head_capabilities], dim=-1)
+        assessment = self.self_awareness(feat_cap)
+        return assessment
+
+
+# ----------------------------
 # Subjective Time Critic
 # ----------------------------
 class SubjectiveTimeCritic(nn.Module):
@@ -445,7 +828,9 @@ class CuriosityModule:
 # Recursive agent
 # ----------------------------
 class RecursiveAgent(nn.Module):
-    def __init__(self, use_curiosity=False, use_subjective_time=False, use_vae_dreams=False):
+    def __init__(self, use_curiosity=False, use_subjective_time=False, use_vae_dreams=False, 
+                 use_world_model=False, use_internal_goals=False, use_own_concepts=False,
+                 use_autobiographical_memory=False, use_self_model=False):
         super().__init__()
         self.hidden_size = 512
         self.output_size = 11
@@ -486,6 +871,27 @@ class RecursiveAgent(nn.Module):
         if self.use_vae_dreams:
             self.dream_vae = DreamVAE(z_dim=128)
             self.vae_trained = False
+
+        # --- AGI COMPONENTS ---
+        self.use_world_model = bool(use_world_model)
+        if self.use_world_model:
+            self.world_model = WorldModel(feature_dim=self.hidden_size, action_dim=self.output_size)
+        
+        self.use_internal_goals = bool(use_internal_goals)
+        if self.use_internal_goals:
+            self.internal_goals = InternalGoals(feature_dim=self.hidden_size)
+        
+        self.use_own_concepts = bool(use_own_concepts)
+        if self.use_own_concepts:
+            self.own_concepts = OwnConcepts(feature_dim=self.hidden_size, num_concepts=32)
+        
+        self.use_autobiographical_memory = bool(use_autobiographical_memory)
+        if self.use_autobiographical_memory:
+            self.autobiographical_memory = AutobiographicalMemory(max_memories=10000)
+        
+        self.use_self_model = bool(use_self_model)
+        if self.use_self_model:
+            self.self_model = SelfModel(feature_dim=self.hidden_size, num_heads=5)
 
         self.conflict_buffer = []
         self.max_conflicts = 100
@@ -901,6 +1307,64 @@ class RecursiveAgent(nn.Module):
         if return_features:
             return logits_sum, feats
         return logits_sum
+    
+    def use_world_model_prediction(self, features, action_logits):
+        """
+        Использует World Model для предсказания следующего состояния.
+        
+        Args:
+            features: [B, feature_dim] - текущие features
+            action_logits: [B, output_size] - логиты действий (предсказания)
+        
+        Returns:
+            next_features_pred: [B, feature_dim] - предсказанные features
+            causality_pred: [B, output_size] - предсказанные последствия
+        """
+        if not self.use_world_model:
+            return None, None
+        
+        # Конвертируем логиты в one-hot/soft action
+        action_probs = torch.softmax(action_logits, dim=-1)
+        
+        # Предсказываем следующее состояние
+        next_features_pred, causality_pred, _, _, _, _ = self.world_model.predict_next(
+            features, action_probs
+        )
+        return next_features_pred, causality_pred
+    
+    def generate_internal_goal(self, features):
+        """Генерирует внутреннюю цель на основе текущего состояния"""
+        if not self.use_internal_goals:
+            return None
+        return self.internal_goals.generate_goal(features)
+    
+    def extract_own_concepts(self, features):
+        """Извлекает собственные концепты из features"""
+        if not self.use_own_concepts:
+            return None, None
+        return self.own_concepts.extract_concepts(features)
+    
+    def record_autobiographical_memory(self, step, state_features, action, outcome, reward_signal=None, context=None):
+        """Записывает эпизод в автобиографическую память"""
+        if not self.use_autobiographical_memory:
+            return
+        self.autobiographical_memory.record(step, state_features, action, outcome, reward_signal, context)
+    
+    def recall_similar_experiences(self, query_features, k=10):
+        """Вспоминает похожие эпизоды из автобиографической памяти"""
+        if not self.use_autobiographical_memory:
+            return []
+        return self.autobiographical_memory.recall(query_features, k)
+    
+    def self_assess_capabilities(self, features):
+        """Оценивает собственные способности через Self Model"""
+        if not self.use_self_model:
+            return None, None, None
+        
+        capabilities = self.self_model.predict_capabilities(features)
+        confidence = self.self_model.estimate_confidence(features)
+        weakness = self.self_model.detect_weakness(features)
+        return capabilities, confidence, weakness
 
 
 # ----------------------------
@@ -1173,10 +1637,22 @@ def run_drone_simulation():
     train_late_backbone = True      # IMPORTANT: if True, include late backbone params into optimizer_phase2
     use_adaptive_pain = True
 
+    # AGI Components (опционально, можно включить для экспериментов)
+    use_world_model = False  # World Model: предсказание будущих состояний
+    use_internal_goals = False  # Внутренние цели: независимые от внешних наград
+    use_own_concepts = False  # Собственные концепты: генерируемые системой
+    use_autobiographical_memory = False  # Автобиографическая память: запись опыта
+    use_self_model = False  # Self Model: модель самого себя
+    
     agent = RecursiveAgent(
         use_curiosity=use_curiosity,
         use_subjective_time=use_subjective_time,
         use_vae_dreams=use_vae_dreams,
+        use_world_model=use_world_model,
+        use_internal_goals=use_internal_goals,
+        use_own_concepts=use_own_concepts,
+        use_autobiographical_memory=use_autobiographical_memory,
+        use_self_model=use_self_model,
     ).to(device)
 
     # memory format optimization
