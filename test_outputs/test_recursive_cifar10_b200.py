@@ -1501,6 +1501,27 @@ def run_drone_simulation():
                 float(test_loss.item()) > 2.0
             )
 
+            # КРИТИЧНО: вычисляем complexity и actions ДО блока expansion decision
+            # Используем приближение surprise из entropy_test для первого прохода
+            complexity = 0.0
+            actions = None
+            if len(agent.heads) > 0:
+                # Для первого прохода используем приближение: surprise ≈ 0.5 * entropy_test
+                surp_approx = 0.5 * entropy_test if entropy_test > 0 else 0.0
+                complexity = agent.complexity_controller.compute_complexity(
+                    surprise=surp_approx,
+                    pain=pain_value,  # будет обновлён позже в pain-блоке
+                    entropy=entropy_test,
+                    unknown_rate=unknown_rate_test
+                )
+                # Получаем действия от контроллера
+                has_expansion_budget = agent.growth_budget >= agent.growth_cost_per_expansion
+                actions = agent.complexity_controller.get_actions(
+                    complexity=complexity,
+                    has_expansion_budget=has_expansion_budget,
+                    cooldown_ok=can_expand
+                )
+
             # КРИТИЧНО: формализованный контроллер expansion
             # Используем Complexity Controller для разрешения expansion
             should_expand = False
