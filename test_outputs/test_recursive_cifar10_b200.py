@@ -1903,11 +1903,11 @@ class RecursiveAgent(nn.Module):
                                 entropy_reduction = 0.0
                             
                             # КРИТИЧНО: Комбинированный score = weighted sum всех сигналов
-                            # Веса: weakness_reduction (главный), confidence_increase, entropy_reduction
+                            # Увеличиваем веса для confidence и entropy для лучшего различения патчей
                             combined_score = (
                                 1.0 * weakness_reduction +  # главный сигнал
-                                0.5 * confidence_increase +  # дополнительный сигнал
-                                0.3 * entropy_reduction      # дополнительный сигнал
+                                1.0 * confidence_increase +  # увеличен с 0.5 до 1.0 для лучшего различения
+                                0.5 * entropy_reduction      # увеличен с 0.3 до 0.5 для лучшего различения
                             )
                             weakness_reductions.append(combined_score)
                     else:
@@ -1932,13 +1932,15 @@ class RecursiveAgent(nn.Module):
                     action_logits = torch.zeros(B, 4, device=device)
                     action_logits[:, best_idx] = 1.0
                     
-                    # Логирование для отладки (только при значительном улучшении)
-                    # КРИТИЧНО: логируем только статистику, а не каждый элемент батча (чтобы не засорять логи)
-                    if B > 0 and current_weakness > 0.4 and weakness_reductions[best_idx] > 0.01:
+                    # Логирование для отладки (только при значительном улучшении и редко)
+                    # КРИТИЧНО: логируем только статистику, а не каждый элемент батча
+                    # Используем глобальную переменную step через замыкание или передаем как параметр
+                    # Пока логируем только для первого элемента батча при значительном улучшении
+                    if B > 0 and current_weakness > 0.4 and weakness_reductions[best_idx] > 0.02:
                         sim_type = "REAL" if use_real_simulation else "PREDICTED"
-                        # Логируем только для первого элемента батча (чтобы не дублировать)
-                        # В будущем можно добавить статистику по всему батчу
-                        pass  # Логирование отключено для уменьшения шума (можно включить при необходимости)
+                        # Логируем только при значительном улучшении (score > 0.02) и только для первого элемента
+                        # Это уменьшит шум, но покажет важные решения
+                        print(f"   [ACTIVE IMAGINATION] {sim_type} Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, score: {weakness_reductions[best_idx]:.3f})")
                     
                     return action_idx, action_logits
         
