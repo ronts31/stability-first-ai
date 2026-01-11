@@ -400,9 +400,14 @@ class RecursiveAgent(nn.Module):
 
         reg = 0.0
         cnt = 0
-        for (name, p), (_, p_ref) in zip(self.shared_backbone.named_parameters(), self.ref_backbone.named_parameters()):
+        # КРИТИЧНО: матчим параметры по имени, а не через zip (более надежно)
+        ref_params = dict(self.ref_backbone.named_parameters())
+        for name, p in self.shared_backbone.named_parameters():
             if not p.requires_grad:
                 continue
+            if name not in ref_params:
+                continue  # пропускаем если параметр отсутствует в ref
+            p_ref = ref_params[name]
             group = self._layer_group(name)
             # Динамический alpha в зависимости от crystal_level и группы
             alpha = self._alpha_by_group(group)
@@ -497,7 +502,9 @@ class RecursiveAgent(nn.Module):
             for i, (x, _) in enumerate(loader):
                 if i >= num_batches:
                     break
-                _ = self.shared_backbone(x.to(device))
+                # КРИТИЧНО: используем memory_format для консистентности с тренировкой
+                x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                _ = self.shared_backbone(x)
         self._set_bn_train(False)
         if was_training:
             self.train()
@@ -667,14 +674,16 @@ class RecursiveAgent(nn.Module):
                 logits_sum = logits_sum + out
 
         # Unknown heuristic (not trained)
-        probs_known = torch.softmax(logits_sum[:, :10], dim=1)
-        entropy = -torch.sum(probs_known * torch.log(probs_known + 1e-9), dim=1)
-        max_prob_known, _ = probs_known.max(dim=1)
+        # КРИТИЧНО: применяем только в eval режиме, чтобы не влиять на backprop при обучении
+        if not self.training:
+            probs_known = torch.softmax(logits_sum[:, :10], dim=1)
+            entropy = -torch.sum(probs_known * torch.log(probs_known + 1e-9), dim=1)
+            max_prob_known, _ = probs_known.max(dim=1)
 
-        unknown_mask = (max_prob_known < 0.18) | (entropy > 1.95)
-        if unknown_mask.any():
-            max_logit_known, _ = logits_sum[:, :10].max(dim=1)
-            logits_sum[unknown_mask, self.unknown_class_idx] = max_logit_known[unknown_mask] + 0.8
+            unknown_mask = (max_prob_known < 0.18) | (entropy > 1.95)
+            if unknown_mask.any():
+                max_logit_known, _ = logits_sum[:, :10].max(dim=1)
+                logits_sum[unknown_mask, self.unknown_class_idx] = max_logit_known[unknown_mask] + 0.8
 
         if return_features:
             return logits_sum, feats
@@ -746,20 +755,37 @@ def compute_class_weights_from_dataset(dataset, num_classes=10, beta=0.9999):
     """
     Вычисляет веса классов на основе глобальных counts по датасету (не по батчу).
     Возвращает фиксированные веса для использования в loss.
+    Оптимизировано для torch.utils.data.Subset.
     """
-    # Подсчитываем количество примеров каждого класса в датасете
-    class_counts = torch.zeros(num_classes, dtype=torch.float32)
-    for i in range(len(dataset)):
-        target = dataset[i][1]  # (image, target)
-        if isinstance(target, torch.Tensor):
-            target = target.item()
-        class_counts[target] += 1.0
+    import numpy as np
+    from torch.utils.data import Subset
+    
+    # КРИТИЧНО: оптимизация для Subset - используем targets напрямую
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        indices = dataset.indices
+        # Используем targets исходного датасета (быстрее чем dataset[i][1])
+        if hasattr(base, 'targets'):
+            targets = np.array(base.targets)[indices]
+        else:
+            # Fallback на медленный способ если targets нет
+            targets = np.array([dataset[i][1] for i in range(len(dataset))])
+        counts = torch.bincount(torch.tensor(targets, dtype=torch.long), minlength=num_classes).float()
+    else:
+        # Медленный способ для обычных датасетов
+        class_counts = torch.zeros(num_classes, dtype=torch.float32)
+        for i in range(len(dataset)):
+            target = dataset[i][1]  # (image, target)
+            if isinstance(target, torch.Tensor):
+                target = target.item()
+            class_counts[target] += 1.0
+        counts = class_counts
     
     # Правильная формула Class-Balanced Loss (Cui et al.)
     # effective_num = 1 - beta^n
     # weight = (1 - beta) / (1 - beta^n)
     beta_tensor = torch.tensor(beta, dtype=torch.float32)
-    effective_num = 1.0 - torch.pow(beta_tensor, class_counts)
+    effective_num = 1.0 - torch.pow(beta_tensor, counts)
     weights = (1.0 - beta) / (effective_num + 1e-8)
     
     # Нормализация: средний вес = 1.0
@@ -1069,6 +1095,11 @@ def run_drone_simulation():
 
             data_real = data[:real_B]
             target_real = target[:real_B]
+            
+            # КРИТИЧНО: перемещаем data_real и target_real на device сразу после создания
+            # чтобы избежать проблем с device mismatch в pain-блоке
+            data_real = data_real.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            target_real = target_real.to(device, non_blocking=True)
 
             dreams = None
             if dream_B > 0 and use_vae_dreams and agent.vae_trained:
@@ -1077,15 +1108,9 @@ def run_drone_simulation():
                 dreams = dreams.to(device=device, non_blocking=True)
                 dreams = dreams.to(memory_format=torch.channels_last)
                 
-                # Перемещаем data_real на устройство перед cat
-                data_real = data_real.to(device, non_blocking=True)
                 data_mix = torch.cat([data_real, dreams], dim=0)
             else:
                 data_mix = data_real
-
-            # Убеждаемся что data_mix на правильном устройстве и формате
-            data_mix = data_mix.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-            target_real = target_real.to(device, non_blocking=True)
 
             # 1) shock check (no grad) - используем только real данные
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
@@ -1149,6 +1174,8 @@ def run_drone_simulation():
                                 use_fractal_time=use_fractal_time,
                                 train_late_backbone=train_late_backbone,
                             )
+                            # КРИТИЧНО: применяем fractal-freeze после expand()
+                            agent.freeze_past(use_fractal_time=use_fractal_time, train_late_backbone=train_late_backbone)
                             agent.recalibrate_bn(loader_B, device, num_batches=20)
 
                             optimizer_phase2 = build_phase2_optimizer(new_head)
@@ -1275,9 +1302,10 @@ def run_drone_simulation():
                     # fp32 grads (используем полный forward для надежности)
                     try:
                         with torch.amp.autocast("cuda", enabled=False):
-                            # Используем полный forward (но без unknown для чистоты)
-                            out_new_fp32 = agent(data.float())
-                            ln = criterion_train(out_new_fp32[:, :10], target)
+                            # КРИТИЧНО: используем data_real и target_real (уже на device)
+                            # вместо data и target (которые могут быть на CPU)
+                            out_new_fp32 = agent(data_real.float())
+                            ln = criterion_train(out_new_fp32[:, :10], target_real)
 
                             out_old_fp32 = agent(x_replay.float())
                             lo = criterion_train(out_old_fp32[:, :10], y_replay)
