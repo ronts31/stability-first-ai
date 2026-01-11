@@ -2706,13 +2706,12 @@ def run_drone_simulation():
                     
                     # КРИТИЧНО: используем предсказания модели как class_hint для селективного внимания
                     # Для Cat (класс 3) делаем zoom на центр (морда)
-                    with torch.no_grad():
-                        # Получаем предсказания для подсказки о классе
-                        pred_logits = outputs[:real_B, :10] if 'outputs' in locals() else None
-                        class_hint = None
-                        if pred_logits is not None:
-                            # Используем текущие предсказания как подсказку
-                            class_hint = pred_logits.argmax(dim=1)  # [real_B]
+                    # Используем outputs из текущего forward pass
+                    class_hint = None
+                    if len(all_outputs) > 0:
+                        # Берём последний output для предсказания класса
+                        pred_outputs = all_outputs[-1][:real_B, :10] if all_outputs[-1].size(0) >= real_B else all_outputs[-1][:, :10]
+                        class_hint = pred_outputs.argmax(dim=1)  # [real_B]
                     
                     # Применяем действие к изображению с селективным вниманием
                     x_next = agent.apply_action_to_image(data_real, action_idx, class_hint)
