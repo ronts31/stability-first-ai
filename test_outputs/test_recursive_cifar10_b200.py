@@ -1076,10 +1076,14 @@ def run_drone_simulation():
                 # Убеждаемся что dreams на правильном устройстве и формате
                 dreams = dreams.to(device=device, non_blocking=True)
                 dreams = dreams.to(memory_format=torch.channels_last)
+                
+                # Перемещаем data_real на устройство перед cat
+                data_real = data_real.to(device, non_blocking=True)
                 data_mix = torch.cat([data_real, dreams], dim=0)
             else:
                 data_mix = data_real
 
+            # Убеждаемся что data_mix на правильном устройстве и формате
             data_mix = data_mix.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             target_real = target_real.to(device, non_blocking=True)
 
