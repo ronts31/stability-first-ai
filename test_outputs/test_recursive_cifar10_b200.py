@@ -410,6 +410,21 @@ class RecursiveAgent(nn.Module):
                     p.requires_grad = True
             self.hard_frozen_layers.clear()
 
+    def time_lr_scale(self):
+        """
+        Возвращает коэффициенты скорости обучения для групп слоёв в зависимости от crystal_level.
+        crystal_level=0 => всё пластично (scale=1.0)
+        crystal_level=1 => всё почти заморожено (особенно early)
+        """
+        c = float(self.crystal_level)
+        # чем выше кристалл, тем сильнее заморозка (early сильнее late)
+        return {
+            "early": max(0.02, 1.0 - 0.98 * c),   # при c=1 => 0.02
+            "mid":   max(0.05, 1.0 - 0.90 * c),   # при c=1 => 0.10
+            "late":  max(0.15, 1.0 - 0.70 * c),   # при c=1 => 0.30
+            "head":  max(0.50, 1.0 - 0.30 * c),   # голова почти всегда учится
+        }
+
     def set_initial_responsibility(self, classes):
         self.active_classes_per_column[0] = classes
 
@@ -859,23 +874,40 @@ def run_drone_simulation():
     steps_per_epoch_B = len(loader_B)
     total_steps_phase2 = steps_per_epoch_B * 8
 
-    # Helper to build phase2 optimizer (head + optionally late backbone)
+    # Helper to build phase2 optimizer (head + optionally late backbone with groups)
     def build_phase2_optimizer(new_head: nn.Module):
         head_params = list(new_head.parameters())
-        late_backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
 
-        if train_late_backbone and len(late_backbone_params) > 0:
-            # two param groups: head fast, late backbone slow
-            opt = optim.AdamW(
-                [
-                    {"params": head_params, "lr": 2e-3},
-                    {"params": late_backbone_params, "lr": 5e-4},
-                ],
-                weight_decay=1e-4,
-            )
-        else:
-            # head only
-            opt = optim.AdamW(head_params, lr=2e-3, weight_decay=1e-4)
+        early, mid, late = [], [], []
+        for name, p in agent.shared_backbone.named_parameters():
+            if not p.requires_grad:
+                continue
+            g = agent._layer_group(name)
+            if g == "early":
+                early.append(p)
+            elif g == "mid":
+                mid.append(p)
+            else:
+                late.append(p)
+
+        # базовые LR (до scaling кристаллом)
+        base_lr_head = 2e-3
+        base_lr_early = 1e-4
+        base_lr_mid = 2e-4
+        base_lr_late = 5e-4
+
+        param_groups = [
+            {"params": head_params, "lr": base_lr_head, "tag": "head"},
+        ]
+        if train_late_backbone:
+            if len(late):
+                param_groups.append({"params": late, "lr": base_lr_late, "tag": "late"})
+            if len(mid):
+                param_groups.append({"params": mid, "lr": base_lr_mid, "tag": "mid"})
+            if len(early):
+                param_groups.append({"params": early, "lr": base_lr_early, "tag": "early"})
+
+        opt = optim.AdamW(param_groups, weight_decay=1e-4)
         return opt
 
     for epoch in range(8):
@@ -932,6 +964,10 @@ def run_drone_simulation():
                             agent.recalibrate_bn(loader_B, device, num_batches=20)
 
                             optimizer_phase2 = build_phase2_optimizer(new_head)
+                            
+                            # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
+                            for pg in optimizer_phase2.param_groups:
+                                pg["lr_base"] = pg["lr"]
 
                             steps_already_done = 0
                             remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
@@ -976,8 +1012,12 @@ def run_drone_simulation():
 
                 # base loss (new task)
                 loss_new = criterion_train(outputs[:, :10], target)
-                pm = pair_margin_loss(outputs[:, :10], target, margin=0.15)
-                loss_new = loss_new + 0.05 * pm
+                # Усиленная pair margin loss для cat/dog в Phase2 (животные)
+                pm_catdog = pair_margin_loss(outputs[:, :10], target, pairs=((3, 5),), margin=0.20)
+                loss_new = loss_new + 0.12 * pm_catdog
+                # Остальные пары (plane/ship, car/truck) слабее
+                pm_other = pair_margin_loss(outputs[:, :10], target, pairs=((0, 8), (1, 9)), margin=0.15)
+                loss_new = loss_new + 0.05 * pm_other
 
                 # replay loss
                 replay_loss = 0.0
@@ -1065,6 +1105,14 @@ def run_drone_simulation():
                 surp_val = float(surprise.item()) if surprise is not None else 0.0
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
                 agent.auto_hard_freeze_if_needed()
+                
+                # Apply LR scaling based on crystal_level (crystal controls learning speed)
+                if optimizer_phase2 is not None:
+                    scales = agent.time_lr_scale()
+                    for pg in optimizer_phase2.param_groups:
+                        tag = pg.get("tag", None)
+                        if tag in scales and "lr_base" in pg:
+                            pg["lr"] = pg["lr_base"] * scales[tag]
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
@@ -1080,8 +1128,8 @@ def run_drone_simulation():
                 cryst_reg = agent.crystallization_regularizer()
                 if cryst_reg != 0.0:
                     # crystal strength controlled by crystal_level and optionally pain (adaptive_lambda)
-                    # base strength: crystal_level
-                    base_strength = 2000.0 * agent.crystal_level
+                    # base strength: crystal_level (ослаблено для лучшей пластичности)
+                    base_strength = 300.0 * agent.crystal_level
 
                     # optional: pain makes protection stronger when gradients conflict
                     if adaptive_lambda is not None:
