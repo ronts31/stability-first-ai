@@ -1130,20 +1130,21 @@ def run_drone_simulation():
                         # Фильтруем None градиенты (для замороженных параметров)
                         g_new = [g for g in g_new if g is not None]
                         g_old = [g for g in g_old if g is not None]
-                    
-                    # Вычисляем косинус между градиентами
-                    g_new_flat = torch.cat([gi.detach().flatten() for gi in g_new])
-                    g_old_flat = torch.cat([gi.detach().flatten() for gi in g_old])
-                    
-                    dot = torch.dot(g_new_flat, g_old_flat).item()
-                    n1 = (g_new_flat.pow(2).sum().item() ** 0.5) + 1e-8
-                    n2 = (g_old_flat.pow(2).sum().item() ** 0.5) + 1e-8
-                    cos = dot / (n1 * n2)
-                    
-                    # Pain = (1 - cos) / 2, lambda = lambda_min + (lambda_max - lambda_min) * pain
-                    pain = max(0.0, min(1.0, (1.0 - cos) * 0.5))
-                    adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain
-                    current_lambda = adaptive_lambda  # Используем adaptive lambda
+                        
+                        if len(g_new) > 0 and len(g_old) > 0:
+                            # Вычисляем косинус между градиентами
+                            g_new_flat = torch.cat([gi.detach().flatten() for gi in g_new])
+                            g_old_flat = torch.cat([gi.detach().flatten() for gi in g_old])
+                            
+                            dot = torch.dot(g_new_flat, g_old_flat).item()
+                            n1 = (g_new_flat.pow(2).sum().item() ** 0.5) + 1e-8
+                            n2 = (g_old_flat.pow(2).sum().item() ** 0.5) + 1e-8
+                            cos = dot / (n1 * n2)
+                            
+                            # Pain = (1 - cos) / 2, lambda = lambda_min + (lambda_max - lambda_min) * pain
+                            pain = max(0.0, min(1.0, (1.0 - cos) * 0.5))
+                            adaptive_lambda = 100.0 + (20000.0 - 100.0) * pain
+                            current_lambda = adaptive_lambda  # Используем adaptive lambda
             
             # 2️⃣ ДОБАВЛЯЕМ KL-DIVERGENCE С CLIP (если высокая энтропия)
             kl_loss = 0.0
