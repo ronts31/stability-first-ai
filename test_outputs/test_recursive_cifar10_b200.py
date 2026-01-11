@@ -1849,67 +1849,88 @@ class RecursiveAgent(nn.Module):
                 current_weakness_pred = self.self_model.detect_weakness(features)
                 current_weakness = current_weakness_pred.mean().item() if current_weakness_pred.numel() > 0 else 0.0
             
-            # 2. Если есть слабость (>0.3), проигрываем все возможные действия через реальную симуляцию
+            # 2. Если есть слабость (>0.3), проигрываем все возможные действия через ГЛУБОКОЕ ВООБРАЖЕНИЕ
+            # КРИТИЧНО: Multi-step Active Inference - цепочка виртуальных действий
             if current_weakness > 0.3:
                 weakness_reductions = []  # насколько снизится Weakness для каждого действия
                 
                 # КРИТИЧНО: Реальная симуляция Zoom на изображении (если доступно)
                 use_real_simulation = (image is not None and hasattr(self, 'attention_action') and self.attention_action is not None)
                 
+                # КРИТИЧНО: Параметры глубокого воображения
+                max_imagination_steps = 3  # максимум 3 виртуальных шага
+                min_improvement_per_step = 0.005  # минимальное улучшение для продолжения цепочки
+                
                 for patch_idx in range(4):
                     if use_real_simulation:
-                        # РЕАЛЬНАЯ СИМУЛЯЦИЯ: применяем Zoom к изображению и получаем новые features
-                        # Это превращает систему в "активного наблюдателя"
-                        action_idx_temp = torch.full((B,), patch_idx, device=device, dtype=torch.long)
-                        image_zoomed = self.attention_action.apply_action(image, action_idx_temp, class_hint)
+                        # ГЛУБОКОЕ ВООБРАЖЕНИЕ: цепочка виртуальных действий
+                        # Посмотрел → Увидел деталь → Решил посмотреть еще ближе → Принял решение
+                        current_image = image
+                        current_features = features
+                        current_weakness_step = current_weakness
+                        total_improvement = 0.0
+                        action_chain = [patch_idx]  # запоминаем цепочку действий
                         
-                        # Получаем features после Zoom через backbone
-                        with torch.no_grad():
-                            features_after_zoom = self.shared_backbone(image_zoomed)
+                        for imagination_step in range(max_imagination_steps):
+                            # Применяем текущее действие (Zoom)
+                            action_idx_temp = torch.full((B,), action_chain[-1], device=device, dtype=torch.long)
+                            image_zoomed = self.attention_action.apply_action(current_image, action_idx_temp, class_hint)
                             
-                            # КРИТИЧНО: Комбинированная оценка полезности патча
-                            # Используем не только Weakness, но и Confidence и Entropy для более точной оценки
-                            
-                            # 1. Weakness reduction
-                            predicted_weakness = self.self_model.detect_weakness(features_after_zoom)
-                            predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness
-                            weakness_reduction = current_weakness - predicted_weakness_mean
-                            
-                            # 2. Confidence increase (чем выше confidence, тем лучше)
-                            current_confidence = self.self_model.estimate_confidence(features).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
-                            predicted_confidence = self.self_model.estimate_confidence(features_after_zoom).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
-                            confidence_increase = predicted_confidence - current_confidence
-                            
-                            # 3. Entropy reduction (чем ниже entropy, тем увереннее модель)
-                            # Получаем logits для вычисления entropy
-                            if len(self.heads) > 0:
-                                # КРИТИЧНО: ExpandableHead требует prev_hiddens аргумент
-                                logits_after_zoom, _ = self.heads[0](features_after_zoom, prev_hiddens=[]) if hasattr(self.heads[0], '__call__') else (None, None)
-                                if logits_after_zoom is not None and logits_after_zoom.size(1) >= 10:
-                                    probs_after = torch.softmax(logits_after_zoom[:, :10], dim=1)
-                                    entropy_after = -(probs_after * torch.log(probs_after + 1e-9)).sum(dim=1).mean().item()
+                            # Получаем features после Zoom
+                            with torch.no_grad():
+                                features_after_zoom = self.shared_backbone(image_zoomed)
+                                
+                                # Оцениваем улучшение
+                                predicted_weakness = self.self_model.detect_weakness(features_after_zoom)
+                                predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness_step
+                                weakness_reduction_step = current_weakness_step - predicted_weakness_mean
+                                
+                                # Confidence и Entropy
+                                current_confidence_step = self.self_model.estimate_confidence(current_features).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
+                                predicted_confidence = self.self_model.estimate_confidence(features_after_zoom).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
+                                confidence_increase_step = predicted_confidence - current_confidence_step
+                                
+                                # Entropy reduction
+                                entropy_reduction_step = 0.0
+                                if len(self.heads) > 0:
+                                    logits_after, _ = self.heads[0](features_after_zoom, prev_hiddens=[])
+                                    logits_current_step, _ = self.heads[0](current_features, prev_hiddens=[])
+                                    if logits_after is not None and logits_current_step is not None and logits_after.size(1) >= 10:
+                                        probs_after = torch.softmax(logits_after[:, :10], dim=1)
+                                        probs_current_step = torch.softmax(logits_current_step[:, :10], dim=1)
+                                        entropy_after = -(probs_after * torch.log(probs_after + 1e-9)).sum(dim=1).mean().item()
+                                        entropy_current_step = -(probs_current_step * torch.log(probs_current_step + 1e-9)).sum(dim=1).mean().item()
+                                        entropy_reduction_step = entropy_current_step - entropy_after
+                                
+                                # Комбинированный score для этого шага
+                                step_score = (
+                                    1.0 * weakness_reduction_step +
+                                    1.0 * confidence_increase_step +
+                                    0.5 * entropy_reduction_step
+                                )
+                                
+                                # Если улучшение значительное, продолжаем цепочку
+                                if step_score > min_improvement_per_step:
+                                    total_improvement += step_score
+                                    current_image = image_zoomed  # обновляем для следующего шага
+                                    current_features = features_after_zoom
+                                    current_weakness_step = predicted_weakness_mean
                                     
-                                    # Сравниваем с текущей entropy (из features)
-                                    logits_current, _ = self.heads[0](features, prev_hiddens=[]) if hasattr(self.heads[0], '__call__') else (None, None)
-                                    if logits_current is not None and logits_current.size(1) >= 10:
-                                        probs_current = torch.softmax(logits_current[:, :10], dim=1)
-                                        entropy_current = -(probs_current * torch.log(probs_current + 1e-9)).sum(dim=1).mean().item()
-                                        entropy_reduction = entropy_current - entropy_after
+                                    # КРИТИЧНО: Решаем, нужно ли смотреть еще ближе
+                                    # Если weakness все еще высокая, пробуем другой патч или тот же патч еще раз
+                                    if current_weakness_step > 0.3 and imagination_step < max_imagination_steps - 1:
+                                        # Пробуем соседний патч или тот же патч (для "еще ближе")
+                                        # Упрощенно: остаемся на том же патче для "приближения"
+                                        action_chain.append(action_chain[-1])  # остаемся на том же патче
                                     else:
-                                        entropy_reduction = 0.0
+                                        # Достаточно улучшения, останавливаемся
+                                        break
                                 else:
-                                    entropy_reduction = 0.0
-                            else:
-                                entropy_reduction = 0.0
-                            
-                            # КРИТИЧНО: Комбинированный score = weighted sum всех сигналов
-                            # Увеличиваем веса для confidence и entropy для лучшего различения патчей
-                            combined_score = (
-                                1.0 * weakness_reduction +  # главный сигнал
-                                1.0 * confidence_increase +  # увеличен с 0.5 до 1.0 для лучшего различения
-                                0.5 * entropy_reduction      # увеличен с 0.3 до 0.5 для лучшего различения
-                            )
-                            weakness_reductions.append(combined_score)
+                                    # Улучшение недостаточное, останавливаемся
+                                    break
+                        
+                        # Сохраняем общее улучшение для этого начального патча
+                        weakness_reductions.append(total_improvement)
                     else:
                         # FALLBACK: прогнозирование через WorldModel (если изображение недоступно)
                         action_onehot = torch.zeros(B, 4, device=device)
@@ -1925,22 +1946,19 @@ class RecursiveAgent(nn.Module):
                         else:
                             weakness_reductions.append(0.0)
                 
-                # 3. Выбираем действие с максимальным снижением Weakness
+                # 3. Выбираем действие с максимальным улучшением (после глубокого воображения)
                 if weakness_reductions and max(weakness_reductions) > 0.005:
                     best_idx = np.argmax(weakness_reductions)
                     action_idx = torch.full((B,), best_idx, device=device, dtype=torch.long)
                     action_logits = torch.zeros(B, 4, device=device)
                     action_logits[:, best_idx] = 1.0
                     
-                    # Логирование для отладки (только при значительном улучшении и редко)
-                    # КРИТИЧНО: логируем только статистику, а не каждый элемент батча
-                    # Используем глобальную переменную step через замыкание или передаем как параметр
-                    # Пока логируем только для первого элемента батча при значительном улучшении
-                    if B > 0 and current_weakness > 0.4 and weakness_reductions[best_idx] > 0.02:
-                        sim_type = "REAL" if use_real_simulation else "PREDICTED"
-                        # Логируем только при значительном улучшении (score > 0.02) и только для первого элемента
-                        # Это уменьшит шум, но покажет важные решения
-                        print(f"   [ACTIVE IMAGINATION] {sim_type} Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, score: {weakness_reductions[best_idx]:.3f})")
+                    # Логирование для отладки (только при значительном улучшении)
+                    if B > 0 and current_weakness > 0.4 and weakness_reductions[best_idx] > 0.01:
+                        sim_type = "DEEP" if use_real_simulation else "PREDICTED"
+                        # Логируем только при значительном улучшении (score > 0.01)
+                        # Показываем, что это результат глубокого воображения (несколько шагов)
+                        print(f"   [DEEP IMAGINATION] {sim_type} Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, total_score: {weakness_reductions[best_idx]:.3f})")
                     
                     return action_idx, action_logits
         
