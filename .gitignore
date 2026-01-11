@@ -66,6 +66,14 @@ results/
 !11-temporal-lora-large-model/results/*.json
 !11-temporal-lora-large-model/results/*.png
 
+# Test outputs (excluded from repository)
+# test_outputs/  # Временно раскомментировано для загрузки на Runpod
+# Но разрешаем графики результатов
+!test_outputs/*.png
+!test_outputs/*.md
+!test_outputs/*.sh
+!test_outputs/*.py
+
 # Temporary files
 *.tmp
 *.temp
