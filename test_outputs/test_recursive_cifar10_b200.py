@@ -469,14 +469,22 @@ class RecursiveAgent(nn.Module):
         if use_fractal_time and train_late_backbone:
             print("[FRACTAL TIME] Freeze early backbone; keep late backbone trainable")
             for name, p in self.shared_backbone.named_parameters():
-                if ("conv1" in name) or ("conv2" in name) or ("bn1" in name) or ("bn2" in name):
+                # КРИТИЧНО: не трогаем уже замороженные hard-freeze слои
+                if name in self.hard_frozen_layers:
+                    continue  # сохраняем hard-freeze состояние
+                group = self._layer_group(name)
+                if group == "early":
                     p.requires_grad = False
-                else:
+                elif group in ["mid", "late"]:
+                    # Размораживаем mid/late только если они не были hard-frozen
                     p.requires_grad = True
+                # else (head layers) не трогаем
         else:
-            # Full freeze backbone
-            for p in self.shared_backbone.parameters():
-                p.requires_grad = False
+            # Full freeze backbone (но сохраняем hard-frozen состояние)
+            for name, p in self.shared_backbone.named_parameters():
+                if name not in self.hard_frozen_layers:
+                    p.requires_grad = False
+                # hard-frozen остаются замороженными
 
         # Freeze old heads (all except the last after expansion)
         for i in range(len(self.heads) - 1):
@@ -576,13 +584,14 @@ class RecursiveAgent(nn.Module):
         return X, Y
 
     def record_conflict(self, confidence_model, entropy_model, clip_class, clip_label, clip_conf, image, true_label=None):
+        # КРИТИЧНО: сохраняем image на CPU для экономии памяти буфера
         self.conflict_buffer.append({
             "confidence_model": float(confidence_model),
             "entropy_model": float(entropy_model),
             "clip_class": int(clip_class) if clip_class is not None else None,
             "clip_label": str(clip_label),
             "clip_conf": float(clip_conf),
-            "image": image.detach().clone(),
+            "image": image.detach().cpu().clone(),
             "true_label": int(true_label) if true_label is not None else None
         })
         if len(self.conflict_buffer) > self.max_conflicts:
@@ -1190,8 +1199,9 @@ def run_drone_simulation():
                 if agent.use_curiosity:
                     print("[CURIOSITY] Querying Oracle (CLIP)...")
                     # CLIP Diversity Check: требуем минимум 3 разных концепта
+                    # КРИТИЧНО: используем data_real (уже на GPU и channels_last) вместо data (CPU)
                     is_diverse, detected_classes, diversity_info = check_clip_diversity(
-                        agent, data, classes_B, 
+                        agent, data_real, classes_B, 
                         min_diversity=CLIP_MIN_DIVERSITY, 
                         confidence_threshold=CLIP_TRUST_THRESHOLD
                     )
@@ -1205,16 +1215,16 @@ def run_drone_simulation():
                         print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
                         
                         # Берем первый уверенный ответ для логирования
-                        best_idx, best_label, conf = agent.curiosity.what_is_this(data[0:1])
+                        # КРИТИЧНО: используем data_real вместо data (уже на GPU)
+                        best_idx, best_label, conf = agent.curiosity.what_is_this(data_real[0:1])
                         if best_idx is not None and conf > CLIP_TRUST_THRESHOLD:
                             print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}' (one of {len(detected_classes)} detected)")
                             print(f"[ADAPTATION] Triggering Phase Transition with diverse concepts: {sorted(detected_classes)}...")
 
                             with torch.no_grad():
                                 agent.eval()
-                                # Перемещаем data на устройство перед вызовом agent
-                                data_sample = data[0:1].to(device, non_blocking=True)
-                                mo = agent(data_sample)
+                                # Используем data_real (уже на device)
+                                mo = agent(data_real[0:1])
                                 agent.train()
                                 mp = torch.softmax(mo[:, :10], dim=1)
                                 model_conf, model_pred = mp.max(dim=1)
@@ -1227,8 +1237,8 @@ def run_drone_simulation():
                                     clip_class=best_idx,
                                     clip_label=best_label,
                                     clip_conf=conf,
-                                    image=data[0:1],
-                                    true_label=int(target[0].item()) if target.numel() > 0 else None,
+                                    image=data_real[0:1],
+                                    true_label=int(target_real[0].item()) if target_real.numel() > 0 else None,
                                 )
 
                             new_head = agent.expand(
@@ -1303,8 +1313,9 @@ def run_drone_simulation():
                 # Supervised loss на real данных
                 # Используем class-balanced loss если веса вычислены (только в Phase2 после expansion)
                 if expansion_count > 0 and class_weights_phase2 is not None:
-                    # Проверка на валидность весов
-                    if torch.isfinite(class_weights_phase2).all() and (class_weights_phase2 > 0).all():
+                    # КРИТИЧНО: проверяем только веса активных классов (неактивные = 0)
+                    active_w = class_weights_phase2[torch.tensor(classes_B, device=device)]
+                    if torch.isfinite(active_w).all() and (active_w > 0).all():
                         loss_new = class_balanced_loss(outputs[:real_B, :10], target_real, class_weights_phase2, num_classes=10)
                     else:
                         # Fallback на обычный loss если веса проблемные
@@ -1438,6 +1449,22 @@ def run_drone_simulation():
                                 print(f"[LOG] High entropy: {int(idx2.numel())}, KL: {float(kl_loss.item()):.4f}")
 
             # ---- UPDATE TIME CRYSTALLIZATION (NOW sees pain_value correctly) ----
+            # КРИТИЧНО: вычисляем warmup множители ОДИН РАЗ перед использованием
+            lr_warmup_mult_backbone = 1.0
+            cryst_strength_warmup_mult = 1.0
+            if expansion_count > 0:
+                steps_since_expand = step - last_expansion_step
+                if steps_since_expand < WARMUP_STEPS:
+                    lr_warmup_mult_backbone = 1.5
+                    cryst_strength_warmup_mult = 0.0
+                elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                    decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
+                    lr_warmup_mult_backbone = 1.5 - decay_progress * 0.5  # 1.5 -> 1.0
+                    cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0  # 0.0 -> 1.0
+                else:
+                    lr_warmup_mult_backbone = 1.0
+                    cryst_strength_warmup_mult = 1.0
+            
             if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
                 surp_val = float(surprise.item()) if surprise is not None else 0.0
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
@@ -1454,22 +1481,6 @@ def run_drone_simulation():
                     agent.crystal_level = float(max(0.0, min(1.0, agent.crystal_level)))
                 
                 agent.auto_hard_freeze_if_needed()
-                
-                # Warmup: эмоциональный разогрев после expansion
-                steps_since_expand = step - last_expansion_step
-                if steps_since_expand < WARMUP_STEPS:
-                    # Полный warmup: умеренная пластичность (снижено с 2.0 до 1.5 для стабильности)
-                    lr_warmup_mult_backbone = 1.5  # mid/late backbone учится быстрее (было 2.0)
-                    cryst_strength_warmup_mult = 0.0  # якорение полностью выключено
-                elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
-                    # Плавный возврат к нормальному режиму
-                    decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                    lr_warmup_mult_backbone = 1.5 - decay_progress * 0.5  # 1.5 -> 1.0
-                    cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0  # 0.0 -> 1.0
-                else:
-                    # Нормальный режим
-                    lr_warmup_mult_backbone = 1.0
-                    cryst_strength_warmup_mult = 1.0
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
@@ -1505,32 +1516,22 @@ def run_drone_simulation():
                 total_loss = total_loss + kl_loss
 
             # crystallization regularizer replaces old current_lambda * stability_loss
-            cryst_strength_warmup_mult = 1.0  # default если не в warmup
             if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
-                # Вычисляем warmup multiplier (должен быть уже вычислен выше, но на всякий случай)
-                if 'cryst_strength_warmup_mult' not in locals() or cryst_strength_warmup_mult == 1.0:
-                    steps_since_expand = step - last_expansion_step
-                    if steps_since_expand < WARMUP_STEPS:
-                        cryst_strength_warmup_mult = 0.0
-                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
-                        decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                        cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0
-                    else:
-                        cryst_strength_warmup_mult = 1.0
-                
                 cryst_reg = agent.crystallization_regularizer()
                 if cryst_reg != 0.0 and torch.isfinite(cryst_reg):
                     # crystal strength controlled by crystal_level and optionally pain (adaptive_lambda)
                     # base strength: crystal_level (ослаблено для лучшей пластичности)
                     base_strength = 300.0 * agent.crystal_level
 
-                    # optional: pain makes protection stronger when gradients conflict
-                    if adaptive_lambda is not None:
-                        # map adaptive_lambda [100..20000] to multiplier [0.5..1.5]
-                        mult = 0.5 + (min(20000.0, max(100.0, adaptive_lambda)) - 100.0) / (20000.0 - 100.0)
+                    # КРИТИЧНО: pain должен УМЕНЬШАТЬ защиту (больше пластичности при конфликте)
+                    # pain_value in [0..1], чем выше тем больше конфликт
+                    if adaptive_lambda is not None and pain_value > 0:
+                        # pain_value растёт с конфликтом, multiplier должен падать
+                        # mult = 1.0 -> 0.3 при pain_value = 0 -> 1
+                        mult = 1.0 - 0.7 * pain_value
                         base_strength = base_strength * mult
                     
-                    # Warmup multiplier
+                    # Warmup multiplier (уже вычислен выше)
                     base_strength = base_strength * cryst_strength_warmup_mult
                     reg_term = base_strength * cryst_reg
                     if torch.isfinite(reg_term):
@@ -1583,30 +1584,19 @@ def run_drone_simulation():
 
             # Scheduler step (ВАЖНО: после optimizer.step())
             if scheduler_phase2 is not None:
-                # КРИТИЧНО: сохраняем LR ДО scheduler.step() для правильного масштабирования
-                lr_before_scheduler = {}
-                for pg in optimizer_phase2.param_groups:
-                    if "lr_base" in pg:
-                        lr_before_scheduler[id(pg)] = pg["lr"]
-                
                 scheduler_phase2.step()
                 
-                # LR scaling применяется ПОСЛЕ scheduler (чтобы не перетиралось)
-                # ВАЖНО: масштабируем от scheduler значения, а не итеративно умножаем
+                # КРИТИЧНО: LR scaling применяется ПОСЛЕ scheduler
+                # Используем get_last_lr() чтобы получить "чистое" scheduler значение
+                # и применяем наши множители к нему (не итеративно умножаем!)
                 if expansion_count > 0:
-                    steps_since_expand = step - last_expansion_step
-                    if steps_since_expand < WARMUP_STEPS:
-                        lr_warmup_mult_backbone = 1.5  # снижено с 2.0 для стабильности
-                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
-                        decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                        lr_warmup_mult_backbone = 1.5 - decay_progress * 0.5  # 1.5 -> 1.0
-                    else:
-                        lr_warmup_mult_backbone = 1.0
-                    
+                    # warmup_mult уже вычислен выше
+                    sched_lrs = scheduler_phase2.get_last_lr()
                     scales = agent.time_lr_scale()
-                    for pg in optimizer_phase2.param_groups:
+                    
+                    for pg, sched_lr in zip(optimizer_phase2.param_groups, sched_lrs):
                         tag = pg.get("tag", None)
-                        if tag in scales and "lr_base" in pg:
+                        if tag in scales:
                             base_scale = scales[tag]
                             # Warmup multiplier применяется только к backbone (mid/late)
                             if tag in ["mid", "late"]:
@@ -1614,12 +1604,8 @@ def run_drone_simulation():
                             else:
                                 warmup_mult = 1.0
                             
-                            # КРИТИЧНО: используем LR после scheduler.step() как базовое значение
-                            # scheduler уже изменил pg["lr"], это и есть текущее scheduler значение
-                            scheduler_lr = pg["lr"]  # это значение после scheduler.step()
-                            
-                            # Применяем наши множители к scheduler значению (не итеративно!)
-                            new_lr = scheduler_lr * base_scale * warmup_mult
+                            # Применяем множители к "чистому" scheduler LR
+                            new_lr = sched_lr * base_scale * warmup_mult
                             
                             # Проверка на разумность LR перед применением
                             if torch.isfinite(torch.tensor([new_lr])) and 1e-8 < new_lr < 1.0:
