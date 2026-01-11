@@ -1811,9 +1811,9 @@ class RecursiveAgent(nn.Module):
         """
         Выбирает действие (attention/patch selection) на основе текущего состояния и цели.
         
-        КРИТИЧНО: Автономное внимание через минимизацию слабости.
-        Если SelfModel сообщает о высокой Weakness, WorldModel проигрывает варианты действий
-        и выбирает то, которое приведет к наиболее четкому (низкоэнтропийному) признаку.
+        КРИТИЧНО: Осознанное автономное внимание через прогнозирование снижения Weakness.
+        WorldModel спрашивает у SelfModel: "Какой патч (Zoom) даст мне больше информации,
+        чтобы снизить мою текущую Weakness?" и выбирает действие, которое максимально снижает неуверенность.
         
         Args:
             features: [B, feature_dim] - текущие features
@@ -1829,42 +1829,61 @@ class RecursiveAgent(nn.Module):
             B = features.size(0)
             return torch.randint(0, 4, (B,), device=features.device), None
         
-        # КРИТИЧНО: Автономное внимание - проигрываем варианты действий
-        if weakness_signal is not None and self.use_world_model:
-            # Если высокая слабость, проигрываем все возможные действия и выбираем лучшее
+        # КРИТИЧНО: Осознанное автономное внимание - прогнозируем снижение Weakness
+        if self.use_self_model and self.use_world_model:
             B = features.size(0)
             device = features.device
             
-            # Проигрываем все 4 возможных действия
-            best_actions = []
-            best_entropies = []
-            
-            for patch_idx in range(4):
-                # Создаём one-hot для этого действия
-                action_onehot = torch.zeros(B, 4, device=device)
-                action_onehot[:, patch_idx] = 1.0
-                
-                # Предсказываем следующее состояние для этого действия
-                next_features_pred, _, _, _, _ = self.world_model.predict_next(features, action_onehot)
-                
-                if next_features_pred is not None:
-                    # Оцениваем "четкость" через энтропию предсказаний
-                    # Используем простую энтропию features как proxy для неопределенности
-                    # Низкая энтропия = более четкое представление
-                    feature_entropy = -(torch.softmax(next_features_pred, dim=-1) * 
-                                       torch.log_softmax(next_features_pred, dim=-1) + 1e-9).sum(dim=-1).mean()
-                    best_entropies.append(feature_entropy.item())
+            # 1. Получаем текущую Weakness от SelfModel
+            current_weakness = None
+            if weakness_signal is not None:
+                if isinstance(weakness_signal, torch.Tensor):
+                    current_weakness = weakness_signal.mean().item() if weakness_signal.numel() > 0 else 0.0
                 else:
-                    best_entropies.append(float('inf'))
+                    current_weakness = float(weakness_signal)
+            else:
+                # Если weakness_signal не передан, получаем его от SelfModel
+                current_weakness_pred = self.self_model.detect_weakness(features)
+                current_weakness = current_weakness_pred.mean().item() if current_weakness_pred.numel() > 0 else 0.0
             
-            # Выбираем действие с минимальной энтропией (наиболее четкое)
-            if best_entropies and min(best_entropies) < float('inf'):
-                best_idx = np.argmin(best_entropies)
-                action_idx = torch.full((B,), best_idx, device=device, dtype=torch.long)
-                # Создаём action_logits (выбранное действие имеет высокий score)
-                action_logits = torch.zeros(B, 4, device=device)
-                action_logits[:, best_idx] = 1.0
-                return action_idx, action_logits
+            # 2. Если высокая слабость (>0.5), проигрываем все возможные действия
+            if current_weakness > 0.5:
+                weakness_reductions = []  # насколько снизится Weakness для каждого действия
+                
+                for patch_idx in range(4):
+                    # Создаём one-hot для этого действия
+                    action_onehot = torch.zeros(B, 4, device=device)
+                    action_onehot[:, patch_idx] = 1.0
+                    
+                    # Предсказываем следующее состояние для этого действия
+                    next_features_pred, _, _, _, _ = self.world_model.predict_next(features, action_onehot)
+                    
+                    if next_features_pred is not None:
+                        # КРИТИЧНО: Прогнозируем Weakness после применения этого действия
+                        # SelfModel оценивает, насколько уверенной станет модель после этого Zoom
+                        predicted_weakness = self.self_model.detect_weakness(next_features_pred)
+                        predicted_weakness_mean = predicted_weakness.mean().item() if predicted_weakness.numel() > 0 else current_weakness
+                        
+                        # Вычисляем снижение Weakness (чем больше снижение, тем лучше)
+                        weakness_reduction = current_weakness - predicted_weakness_mean
+                        weakness_reductions.append(weakness_reduction)
+                    else:
+                        # Если предсказание не удалось, считаем что Weakness не изменится
+                        weakness_reductions.append(0.0)
+                
+                # 3. Выбираем действие с максимальным снижением Weakness
+                if weakness_reductions and max(weakness_reductions) > 0.01:  # минимум 0.01 снижения
+                    best_idx = np.argmax(weakness_reductions)
+                    action_idx = torch.full((B,), best_idx, device=device, dtype=torch.long)
+                    # Создаём action_logits (выбранное действие имеет высокий score)
+                    action_logits = torch.zeros(B, 4, device=device)
+                    action_logits[:, best_idx] = 1.0
+                    
+                    # Логирование для отладки (только для первого элемента батча)
+                    if B > 0 and current_weakness > 0.7:  # только для высокой слабости
+                        print(f"   [AUTONOMOUS ATTENTION] Weakness: {current_weakness:.3f} -> {current_weakness - weakness_reductions[best_idx]:.3f} (patch {best_idx}, reduction: {weakness_reductions[best_idx]:.3f})")
+                    
+                    return action_idx, action_logits
         
         # Fallback: обычный выбор через WorldModel
         action_logits = self.world_model.predict_best_action(features, goal_features)
