@@ -1074,6 +1074,8 @@ def run_drone_simulation():
             dreams = None
             if dream_B > 0 and use_vae_dreams and agent.vae_trained:
                 dreams = agent.sample_dreams(dream_B, device=device)
+                # Убеждаемся что dreams на правильном устройстве и формате
+                dreams = dreams.to(device=device, non_blocking=True)
                 dreams = dreams.to(memory_format=torch.channels_last)
                 data_mix = torch.cat([data_real, dreams], dim=0)
             else:
