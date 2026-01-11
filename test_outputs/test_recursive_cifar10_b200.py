@@ -3410,8 +3410,8 @@ def run_drone_simulation():
                 weakness_before = None
                 if agent.use_self_model and features_f32 is not None:
                     if agent.use_elegant_mode or len(agent.heads) > 0:
-                    weakness_pred = agent.self_model.detect_weakness(features_f32)
-                    weakness_before = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
+                        weakness_pred = agent.self_model.detect_weakness(features_f32)
+                        weakness_before = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
                 
                 new_head = agent.expand(
                     new_classes_indices=expansion_classes,
