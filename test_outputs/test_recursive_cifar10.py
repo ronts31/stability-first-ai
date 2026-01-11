@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
 import matplotlib.pyplot as plt
@@ -210,19 +211,29 @@ class RecursiveAgent(nn.Module):
 
     def freeze_past(self):
         print("[FREEZING] Memory (Crystallization)...")
-        # C) Замораживаем веса backbone, но BN оставляем в train для обновления running stats
+        # Замораживаем веса backbone (BN stats будут обновляться через recalibrate_bn)
         for param in self.shared_backbone.parameters():
             param.requires_grad = False
-        
-        # BN в train: обновляет running_mean/var, но gamma/beta не обучаются (requires_grad False)
-        for m in self.shared_backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.train()
         
         # Замораживаем все старые головы кроме последней
         for i in range(len(self.heads) - 1):
             for param in self.heads[i].parameters():
                 param.requires_grad = False
+    
+    def recalibrate_bn(self, loader, device, num_batches=20):
+        """Калибровка BN статистик на новых данных (без обучения весов)"""
+        was_training = self.training
+        self.train()  # Включаем train для обновления running stats
+        with torch.no_grad():
+            for i, (x, _) in enumerate(loader):
+                if i >= num_batches:
+                    break
+                x = x.to(device)
+                _ = self(x)  # Проход для обновления BN stats
+        if was_training:
+            self.train()
+        else:
+            self.eval()
 
     def expand(self, new_classes_indices):
         self.freeze_past()
@@ -500,6 +511,27 @@ def get_cifar_split():
             Subset(test_full, idx_test_A), Subset(test_full, idx_test_B),
             vehicles, animals)
 
+# --- Утилита для оценки с маскированием ---
+def eval_masked(agent, loader, allowed_classes, device, block_unknown=True):
+    """Оценка точности с маскированием классов и правильным eval режимом"""
+    was_training = agent.training
+    agent.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for d, t in loader:
+            d, t = d.to(device), t.to(device)
+            out = agent(d)
+            out_masked = out.clone()
+            out_masked[:, [i for i in range(10) if i not in allowed_classes]] = -float('inf')
+            if block_unknown:
+                out_masked[:, agent.unknown_class_idx] = -float('inf')
+            pred = out_masked.argmax(dim=1)
+            correct += (pred == t).sum().item()
+            total += t.size(0)
+    if was_training:
+        agent.train()
+    return 100.0 * correct / total
+
 # --- 3. ЗАПУСК ---
 def run_drone_simulation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -526,8 +558,9 @@ def run_drone_simulation():
     if use_curiosity:
         print("[INFO] Curiosity Module (CLIP) enabled - agent can query world knowledge!")
     
-    optimizer = optim.Adam(agent.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss()
+    # Улучшения для Phase1: AdamW + weight_decay для лучшего разделения Plane/Ship/Car/Truck
+    optimizer = optim.AdamW(agent.parameters(), lr=0.001, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # Label smoothing для стабильности
 
     acc_A_hist, acc_B_hist = [], []
     step = 0
@@ -535,8 +568,11 @@ def run_drone_simulation():
 
     print(f"\n--- PHASE 1: URBAN ENVIRONMENT (Learning Machines: {classes_A}) ---")
     
-    # Обучение Фаза 1 (увеличиваем эпохи для лучшего разделения классов)
-    for epoch in range(5): # Больше эпох для лучшего разделения Plane/Ship/Car/Truck
+    # Обучение Фаза 1 (больше эпох для лучшего разделения Plane/Ship/Car/Truck)
+    # Cosine LR schedule для стабильного обучения
+    scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-5)
+    
+    for epoch in range(15):  # Увеличено для лучшего разделения vehicles
         for batch_idx, (data, target) in enumerate(loader_A):
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
@@ -545,24 +581,14 @@ def run_drone_simulation():
             loss = criterion(logits[:, :10], target)
             loss.backward()
             optimizer.step()
+            scheduler.step()  # Cosine LR schedule
             
             agent.sensor.update(loss.item())
             if step == 50: agent.sensor.calibrate()
             
             if step % 50 == 0:
-                # Тест
-                correct = 0; total = 0
-                with torch.no_grad():
-                    for d, t in test_loader_A:
-                        d, t = d.to(device), t.to(device)
-                        out = agent(d)
-                        # Маскируем только классы техники
-                        out_masked = out.clone()
-                        out_masked[:, [i for i in range(10) if i not in classes_A]] = -float('inf')
-                        out_masked[:, agent.unknown_class_idx] = -float('inf')  # B3) Запрещаем unknown
-                        _, pred = torch.max(out_masked, 1)
-                        correct += (pred == t).sum().item(); total += t.size(0)
-                acc = 100 * correct / total
+                # Тест с правильным eval режимом
+                acc = eval_masked(agent, test_loader_A, classes_A, device, block_unknown=True)
                 acc_A_hist.append(acc); acc_B_hist.append(0)
                 print(f"Step {step}: Loss {loss.item():.2f} | Acc Machines: {acc:.1f}%")
             step += 1
@@ -578,7 +604,10 @@ def run_drone_simulation():
     MAX_LAYERS = 5               # Защита от переполнения памяти
     
     # Обучение Фаза 2 (увеличиваем эпохи для лучшего обучения животных)
-    for epoch in range(8): # Еще больше эпох для дифференциации животных
+    # Новый scheduler для Phase2
+    scheduler_phase2 = CosineAnnealingLR(optimizer, T_max=8, eta_min=1e-5)
+    
+    for epoch in range(8):  # Еще больше эпох для дифференциации животных
         for batch_idx, (data, target) in enumerate(loader_B):
             data, target = data.to(device), target.to(device)
             
@@ -635,6 +664,8 @@ def run_drone_simulation():
                             
                             # Расширяем сознание
                             new_params = agent.expand(new_classes_indices=classes_B)
+                            # Калибруем BN статистики на новых данных (Phase2)
+                            agent.recalibrate_bn(loader_B, device, num_batches=20)
                             # Увеличиваем LR для новой головы для быстрого обучения животных
                             optimizer = optim.Adam(new_params, lr=0.002)  # x2 для новой головы
                             expanded = True
@@ -710,42 +741,20 @@ def run_drone_simulation():
             agent.sensor.update(loss.item())
             
             if step % 50 == 0:
-                # Тест Памяти (Машины)
-                c_A = 0; t_A = 0
-                with torch.no_grad():
-                    for d, t in test_loader_A:
-                        d, t = d.to(device), t.to(device)
-                        out = agent(d)
-                        # Маскируем только классы техники
-                        out_masked = out.clone()
-                        out_masked[:, [i for i in range(10) if i not in classes_A]] = -float('inf')
-                        out_masked[:, agent.unknown_class_idx] = -float('inf')  # B3) Запрещаем unknown
-                        _, pred = torch.max(out_masked, 1)
-                        c_A += (pred == t).sum().item(); t_A += t.size(0)
-                acc_A = 100 * c_A / t_A
-                
-                # Тест Нового (Животные)
-                c_B = 0; t_B = 0
-                with torch.no_grad():
-                    for d, t in test_loader_B:
-                        d, t = d.to(device), t.to(device)
-                        out = agent(d)
-                        # Маскируем только классы животных
-                        out_masked = out.clone()
-                        out_masked[:, [i for i in range(10) if i not in classes_B]] = -float('inf')
-                        out_masked[:, agent.unknown_class_idx] = -float('inf')  # B3) Запрещаем unknown
-                        _, pred = torch.max(out_masked, 1)
-                        c_B += (pred == t).sum().item(); t_B += t.size(0)
-                acc_B = 100 * c_B / t_B
+                # Тест Памяти (Машины) и Нового (Животные) с правильным eval режимом
+                acc_A = eval_masked(agent, test_loader_A, classes_A, device, block_unknown=True)
+                acc_B = eval_masked(agent, test_loader_B, classes_B, device, block_unknown=True)
                 
                 acc_A_hist.append(acc_A); acc_B_hist.append(acc_B)
                 
-                # (3) Лог unknown rate (чтобы понимать, что пороги адекватны)
+                # E) Unknown Rate (синхронизировано с новыми порогами в forward)
                 with torch.no_grad():
-                    pk = torch.softmax(outputs[:, :10], dim=1)
-                    ent = -torch.sum(pk * torch.log(pk + 1e-9), dim=1)
-                    mp, _ = pk.max(dim=1)
-                    unk_rate = ((ent > 2.0) & (mp < 0.3)).float().mean().item()
+                    test_out = agent(data)
+                    probs_test = torch.softmax(test_out[:, :10], dim=1)
+                    ent = -torch.sum(probs_test * torch.log(probs_test + 1e-9), dim=1)
+                    mp, _ = torch.max(probs_test, dim=1)
+                    # Синхронизировано с forward(): (max_prob < 0.2) | (entropy > 1.8)
+                    unk_rate = ((mp < 0.2) | (ent > 1.8)).float().mean().item()
                 
                 print(f"Step {step}: Loss {loss.item():.2f} | Mem (Machines): {acc_A:.1f}% | New (Animals): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}%")
             step += 1
