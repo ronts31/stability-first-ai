@@ -1702,31 +1702,9 @@ def run_drone_simulation():
             current_opt = optimizer_phase2 if optimizer_phase2 is not None else optimizer
             current_opt.zero_grad(set_to_none=True)
 
-            # КРИТИЧНО: Complexity Controller - предварительное вычисление для первого прохода
-            # Используем приближение surprise из предыдущего шага (или entropy_test)
-            # КРИТИЧНО: работаем даже после sleep (когда expansion_count может быть 0, но есть heads)
-            complexity = 0.0
-            actions = None
-            # Complexity Controller работает если есть хотя бы один head (включая после sleep)
-            if len(agent.heads) > 0:
-                # Для первого прохода используем приближение: surprise ≈ 0.5 * entropy_test
-                surp_approx = 0.5 * entropy_test if entropy_test > 0 else 0.0
-                complexity = agent.complexity_controller.compute_complexity(
-                    surprise=surp_approx,
-                    pain=pain_value,  # будет обновлён позже в pain-блоке
-                    entropy=entropy_test,
-                    unknown_rate=unknown_rate_test
-                )
-                
-                # Получаем действия от контроллера
-                has_expansion_budget = agent.growth_budget >= agent.growth_cost_per_expansion
-                actions = agent.complexity_controller.get_actions(
-                    complexity=complexity,
-                    has_expansion_budget=has_expansion_budget,
-                    cooldown_ok=can_expand
-                )
-                
-                # КРИТИЧНО: применяем gate_temperature к routing gate
+            # КРИТИЧНО: complexity и actions уже вычислены ДО блока expansion decision
+            # Здесь применяем gate_temperature к routing gate (если actions доступен)
+            # КРИТИЧНО: применяем gate_temperature к routing gate
                 if agent.use_soft_routing and agent.routing_gate is not None:
                     agent.routing_gate.set_temperature(actions["gate_temperature"])
             
