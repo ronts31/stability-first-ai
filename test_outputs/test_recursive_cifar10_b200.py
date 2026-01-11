@@ -1714,32 +1714,31 @@ def run_drone_simulation():
                         break
                     
                     # PassN: повторный прогноз с дополнительным replay
-                    # Добавляем replay к data_mix для рекурсивного прохода
-                    if x_replay is not None:
-                        # Смешиваем текущий батч с replay
-                        mix_ratio = 0.7  # 70% текущий, 30% replay
-                        n_replay_mix = min(x_replay.size(0), int(real_B * (1 - mix_ratio)))
-                        if n_replay_mix > 0:
-                            data_mix_recursive = torch.cat([
-                                data_real[:int(real_B * mix_ratio)],
-                                x_replay[:n_replay_mix]
-                            ], dim=0)
-                        else:
-                            data_mix_recursive = data_mix
-                    else:
-                        data_mix_recursive = data_mix
+                    # КРИТИЧНО: используем тот же data_mix для консистентности размеров
+                    # (replay уже добавлен в data_mix через Memory Scheduler)
+                    data_mix_recursive = data_mix  # используем тот же батч для всех проходов
                     
                     outputs_pass, features_pass = agent(data_mix_recursive, return_features=True)
                     all_outputs.append(outputs_pass)
                     all_features.append(features_pass)
                     
                     # Вычисляем surprise для этого прохода
+                    # КРИТИЧНО: используем только real_B для surprise (первые real_B элементов)
                     surprise_pass = None
                     if use_subjective_time and agent.ref_backbone is not None:
-                        pred_ps_pass = agent.critic(features_pass[:real_B].detach())
-                        real_ps_pass = criterion_none(outputs_pass[:real_B, :10], target_real)
-                        surprise_pass = SubjectiveTimeCritic.surprise(pred_ps_pass, real_ps_pass)
-                        all_surprises.append(float(surprise_pass.item()))
+                        # Берём только real данные для surprise (первые real_B элементов)
+                        if outputs_pass.size(0) >= real_B:
+                            pred_ps_pass = agent.critic(features_pass[:real_B].detach())
+                            real_ps_pass = criterion_none(outputs_pass[:real_B, :10], target_real)
+                            surprise_pass = SubjectiveTimeCritic.surprise(pred_ps_pass, real_ps_pass)
+                            all_surprises.append(float(surprise_pass.item()))
+                        else:
+                            # Fallback: если батч меньше real_B, используем весь батч
+                            n_available = outputs_pass.size(0)
+                            pred_ps_pass = agent.critic(features_pass[:n_available].detach())
+                            real_ps_pass = criterion_none(outputs_pass[:n_available, :10], target_real[:n_available])
+                            surprise_pass = SubjectiveTimeCritic.surprise(pred_ps_pass, real_ps_pass)
+                            all_surprises.append(float(surprise_pass.item()))
                     else:
                         all_surprises.append(0.0)
                     
