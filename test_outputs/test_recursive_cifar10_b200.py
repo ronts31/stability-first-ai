@@ -2561,11 +2561,16 @@ def run_drone_simulation():
                 agent.dream_and_compress(num_dreams=1500, dream_batch_size=100, device=device)
                 
                 # Перезагружаем optimizer после консолидации
-                if optimizer_phase2 is not None:
-                    optimizer_phase2 = build_phase2_optimizer(agent.heads[-1] if len(agent.heads) > 0 else None)
+                # После SLEEP остаётся только один head, создаём новый optimizer
+                if len(agent.heads) > 0:
+                    # Используем существующую функцию build_phase2_optimizer
+                    optimizer_phase2 = build_phase2_optimizer(agent.heads[0])  # После SLEEP только один head
                     for pg in optimizer_phase2.param_groups:
                         pg["lr_base"] = pg["lr"]
                         pg["scheduler_factor"] = 1.0
+                    # Обновляем scheduler
+                    remaining_steps = max(1000, total_steps_phase2 - step)  # минимум 1000 шагов
+                    scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
                 
                 # Сбрасываем состояние
                 last_sleep_step = step
