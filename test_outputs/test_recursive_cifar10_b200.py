@@ -3646,7 +3646,9 @@ def run_drone_simulation():
                 remaining = COOLDOWN_STEPS - (step - last_expansion_step)
                 print(f"[COOLDOWN] Shock detected but refractory period ({remaining} steps)")
             elif is_shock and not has_budget:
-                print(f"\n[CRITICAL] Head Limit ({MAX_LAYERS}) reached. Consider SLEEP here (disabled in this file).")
+                # В элегантном режиме expansion не используется, поэтому не нужно проверять лимит
+                if not agent.use_elegant_mode:
+                    print(f"\n[CRITICAL] Head Limit ({MAX_LAYERS}) reached. Consider SLEEP here (disabled in this file).")
 
             # Intelligent sleep: консолидация знаний из нескольких heads в один
             steps_since_sleep = step - last_sleep_step
@@ -4666,7 +4668,8 @@ def run_drone_simulation():
                 
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} ({loss_components}) | Mem(M): {acc_A:.1f}% | "
-                    f"New(A): {acc_B:.1f}% | Global: {acc_global:.1f}% | η: {cognitive_efficiency:.2f} | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
+                    num_heads_display = len(agent.heads) if not agent.use_elegant_mode else 1  # В элегантном режиме показываем 1 (единый блок)
+                    f"New(A): {acc_B:.1f}% | Global: {acc_global:.1f}% | η: {cognitive_efficiency:.2f} | Heads: {num_heads_display} | UnknownRate: {unk_rate*100:.1f}% | "
                     f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}{complexity_info}"
                 )
 
