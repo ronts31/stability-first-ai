@@ -1548,24 +1548,11 @@ def run_drone_simulation():
                         print(f"[RECURSIVE EMERGENCE] New concepts trigger expansion for structural growth")
                         should_expand = True
                         expansion_reason = f"NEW CONCEPTS DETECTED ({len(new_concepts)} concepts: {sorted(new_concepts)})"
-                        # КРИТИЧНО: сохраняем оригинальные classes_B и используем новые концепты для нового head
-                        # Это будет обработано в блоке expansion ниже
+                        # КРИТИЧНО: сохраняем новые концепты для создания нового head
                         expansion_new_classes = list(new_concepts)  # новые классы для expansion
                         print(f"[EXPANSION] Will create new head for classes: {expansion_new_classes}")
                     else:
                         expansion_new_classes = None
-                    
-                    # КРИТИЧНО: проверяем новые концепты для рекурсивной эмергенции
-                    if new_concepts and len(new_concepts) >= 2:  # минимум 2 новых концепта для expansion
-                        print(f"[NEW CONCEPTS] CLIP detected {len(new_concepts)} new concepts: {sorted(new_concepts)}")
-                        print(f"[RECURSIVE EMERGENCE] New concepts trigger expansion for structural growth")
-                        should_expand = True
-                        expansion_reason = f"NEW CONCEPTS DETECTED ({len(new_concepts)} concepts: {sorted(new_concepts)})"
-                        # КРИТИЧНО: используем новые концепты как целевые классы для нового head
-                        # Сохраняем оригинальные classes_B для fallback
-                        original_classes_B = classes_B.copy()
-                        classes_B = list(new_concepts)  # расширяемся на новые концепты
-                        print(f"[EXPANSION] Creating new head for classes: {classes_B}")
                     
                     if not is_diverse and not should_expand:
                         print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
