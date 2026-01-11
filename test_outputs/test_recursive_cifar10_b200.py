@@ -500,9 +500,16 @@ class AutobiographicalMemory:
         if query_norm == 0:
             return []
         
+        # КРИТИЧНО: определяем device из query_features
+        query_device = query_features.device if torch.is_tensor(query_features) else torch.device("cpu")
+        
         for mem in self.memories:
             if torch.is_tensor(mem["state"]):
                 state = mem["state"]
+                # КРИТИЧНО: перемещаем state на тот же device, что и query_features
+                if state.device != query_device:
+                    state = state.to(query_device)
+                
                 if state.numel() == query_features.numel():
                     state_flat = state.flatten()
                     query_flat = query_features.flatten()
