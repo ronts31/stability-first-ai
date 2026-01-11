@@ -3531,10 +3531,10 @@ def run_drone_simulation():
                     with torch.no_grad():
                         _, features_f32, _ = agent.elegant_core(x[:1], max_steps=1)
                 elif len(agent.heads) > 0:
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
-                    if features_temp is not None:
-                        features_f32 = features_temp[:min(64, real_B)].float()  # конвертируем в float32
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
+                        if features_temp is not None:
+                            features_f32 = features_temp[:min(64, real_B)].float()  # конвертируем в float32
             
             # ---- forward (BF16) с рекурсией ----
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
