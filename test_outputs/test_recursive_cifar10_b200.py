@@ -370,9 +370,28 @@ class RecursiveAgent(nn.Module):
         self.crystal_level = effective_momentum * self.crystal_level + (1 - effective_momentum) * target_crystal
         self.crystal_level = float(max(0.0, min(1.0, self.crystal_level)))
 
+    def _alpha_by_group(self, group: str):
+        """
+        Динамические веса защиты в зависимости от crystal_level и группы слоя.
+        Late кристаллизуется быстрее, early остается жидким дольше.
+        """
+        c = float(self.crystal_level)  # 0..1
+
+        # late кристаллизуется быстрее: уже при c~0.3-0.5 заметно растёт
+        if group == "late":
+            return 0.10 + 0.90 * (c ** 1.0)
+
+        # mid умеренно
+        if group == "mid":
+            return 0.05 + 0.60 * (c ** 1.5)
+
+        # early — остаётся жидким дольше: растёт медленно и поздно
+        # при c<0.5 почти не мешает учиться новым текстурам
+        return 0.02 + 0.30 * (c ** 3.0)
+
     def crystallization_regularizer(self):
         """
-        Пер-слойная защита (EWC-lite): ||W - W_ref||^2 с весом = crystal_level * fractal_alpha
+        Пер-слойная защита (EWC-lite): ||W - W_ref||^2 с динамическим весом в зависимости от crystal_level.
         Требует наличия self.ref_backbone (снимок).
         Нормализовано через mean() для сопоставимости между слоями.
         """
@@ -385,7 +404,8 @@ class RecursiveAgent(nn.Module):
             if not p.requires_grad:
                 continue
             group = self._layer_group(name)
-            alpha = self.fractal_alpha.get(group, 0.15)
+            # Динамический alpha в зависимости от crystal_level и группы
+            alpha = self._alpha_by_group(group)
             # Нормализация через mean() для сопоставимости между слоями
             reg = reg + (alpha * (p - p_ref).pow(2).mean())
             cnt += 1
@@ -955,6 +975,16 @@ def run_drone_simulation():
     print(f"\n--- PHASE 2: WILDERNESS (Reality Shift to Animals: {classes_B}) ---")
     phase_transition_step.append(len(acc_A_hist))
     
+    # Создаём teacher-снимок для distillation на dreams (сон с удержанием структуры)
+    teacher = None
+    if use_vae_dreams and agent.vae_trained:
+        print("[SLEEP] Creating teacher snapshot for dream distillation...")
+        teacher = copy.deepcopy(agent)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        print("[SLEEP] Teacher ready for dream supervision")
+    
     # Вычисляем фиксированные веса классов для class-balanced loss (один раз по датасету)
     class_weights_phase2 = None
     if use_subjective_time:  # только если будем использовать в Phase2
@@ -1032,13 +1062,30 @@ def run_drone_simulation():
     for epoch in range(8):
         agent.train()
         for data, target in loader_B:
-            data = data.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-            target = target.to(device, non_blocking=True)
+            # Подмешивание dreams (20% батча) для "сна" с distillation
+            W_dream = 0.2
+            B = data.size(0)
+            dream_B = int(B * W_dream)
+            real_B = B - dream_B
 
-            # 1) shock check (no grad)
+            data_real = data[:real_B]
+            target_real = target[:real_B]
+
+            dreams = None
+            if dream_B > 0 and use_vae_dreams and agent.vae_trained:
+                dreams = agent.sample_dreams(dream_B, device=device)
+                dreams = dreams.to(memory_format=torch.channels_last)
+                data_mix = torch.cat([data_real, dreams], dim=0)
+            else:
+                data_mix = data_real
+
+            data_mix = data_mix.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            target_real = target_real.to(device, non_blocking=True)
+
+            # 1) shock check (no grad) - используем только real данные
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
-                test_out = agent(data)
-                test_loss = criterion_train(test_out[:, :10], target)
+                test_out = agent(data_real)
+                test_loss = criterion_train(test_out[:, :10], target_real)
 
             is_shock = agent.sensor.is_shock(float(test_loss.item()))
             can_expand = (step - last_expansion_step) > COOLDOWN_STEPS
@@ -1143,7 +1190,7 @@ def run_drone_simulation():
 
             # ---- forward (BF16) ----
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                outputs, features = agent(data, return_features=True)
+                outputs, features = agent(data_mix, return_features=True)
                 
                 # Проверка outputs на inf/nan
                 if not torch.isfinite(outputs).all():
@@ -1154,49 +1201,49 @@ def run_drone_simulation():
                         print(f"[ERROR] Cannot fix outputs, skipping step {step}")
                         continue
 
-                # Class-balanced loss для Phase2 (борьба с доминированием одного класса, например Frog)
-                # ВРЕМЕННО отключаем class_balanced_loss - используем обычный loss для стабильности
-                # if expansion_count > 0 and class_weights_phase2 is not None:
-                #     # Используем class-balanced loss с фиксированными весами (вычисленными по датасету)
-                #     # Проверка на валидность весов
-                #     if torch.isfinite(class_weights_phase2).all() and (class_weights_phase2 > 0).all():
-                #         loss_new = class_balanced_loss(outputs[:, :10], target, class_weights_phase2, num_classes=10)
-                #     else:
-                #         # Fallback на обычный loss если веса проблемные
-                #         loss_new = criterion_train(outputs[:, :10], target)
-                # else:
-                #     # Phase1 или если веса не вычислены - используем обычный loss
-                #     loss_new = criterion_train(outputs[:, :10], target)
+                # Supervised loss на real данных
+                loss_new = criterion_train(outputs[:real_B, :10], target_real)
                 
-                # Используем обычный loss для стабильности (class_balanced_loss временно отключен)
-                loss_new = criterion_train(outputs[:, :10], target)
+                # Distillation loss на dreams (сон с удержанием структуры)
+                loss_dream = 0.0
+                if dreams is not None and dream_B > 0 and teacher is not None:
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        t_out = teacher(dreams)[:, :10]
+                        t_p = torch.softmax(t_out / 2.0, dim=1)  # T=2.0 для мягких вероятностей
+
+                    s_out = outputs[real_B:, :10]
+                    s_logp = torch.log_softmax(s_out / 2.0, dim=1)  # T=2.0
+
+                    # KL(student || teacher) - студент должен следовать учителю
+                    loss_dream = F.kl_div(s_logp, t_p, reduction="batchmean") * (2.0 * 2.0)  # T^2 для масштабирования
                 
-                # Усиленная pair margin loss для cat/dog в Phase2 (животные)
+                # Усиленная pair margin loss для cat/dog в Phase2 (животные) - только на real данных
                 if expansion_count > 0:
-                    pm_catdog = pair_margin_loss(outputs[:, :10], target, pairs=((3, 5),), margin=0.20)
+                    pm_catdog = pair_margin_loss(outputs[:real_B, :10], target_real, pairs=((3, 5),), margin=0.20)
                     loss_new = loss_new + 0.12 * pm_catdog
                     # Остальные пары (plane/ship, car/truck) слабее
-                    pm_other = pair_margin_loss(outputs[:, :10], target, pairs=((0, 8), (1, 9)), margin=0.15)
+                    pm_other = pair_margin_loss(outputs[:real_B, :10], target_real, pairs=((0, 8), (1, 9)), margin=0.15)
                     loss_new = loss_new + 0.05 * pm_other
 
-                # replay loss
+                # replay loss (только на real данных для consistency)
                 replay_loss = 0.0
                 if x_replay is not None:
                     out_rep = agent(x_replay)
                     replay_loss = criterion_train(out_rep[:, :10], y_replay)
 
                 # ---- subjective time critic (per-sample, inside autocast) ----
+                # Используем только real данные для critic
                 surprise = None
                 critic_loss = None
                 if use_subjective_time and agent.ref_backbone is not None:
-                    pred_ps = agent.critic(features.detach())          # [B]
-                    real_ps = criterion_none(outputs[:, :10], target)  # [B]
+                    pred_ps = agent.critic(features[:real_B].detach())          # [real_B]
+                    real_ps = criterion_none(outputs[:real_B, :10], target_real)  # [real_B]
                     surprise = SubjectiveTimeCritic.surprise(pred_ps, real_ps)
                     critic_loss = F.mse_loss(pred_ps, real_ps.detach())
 
-            # entropy (no grad)
+            # entropy (no grad) - только на real данных
             with torch.no_grad():
-                probs_m = torch.softmax(outputs[:, :10], dim=1)
+                probs_m = torch.softmax(outputs[:real_B, :10], dim=1)
                 ent_batch = (-(probs_m * torch.log(probs_m + 1e-9)).sum(dim=1)).mean().item()
 
             # ---- adaptive pain (MUST be computed BEFORE crystallization update) ----
@@ -1248,9 +1295,10 @@ def run_drone_simulation():
                                 print(f"[WARNING] Gradient computation failed: {e}")
 
             # ---- CLIP KL (unchanged, but computed AFTER forward) ----
+            # Используем только real данные для CLIP KL
             kl_loss = 0.0
             if agent.use_curiosity:
-                probs_model = torch.softmax(outputs[:, :10], dim=1)
+                probs_model = torch.softmax(outputs[:real_B, :10], dim=1)
                 ent = -torch.sum(probs_model * torch.log(probs_model + 1e-9), dim=1)
                 hi = ent > 1.5
                 if hi.any():
@@ -1258,7 +1306,7 @@ def run_drone_simulation():
                     MAX_UNCERTAIN = 16
                     if idx.numel() > MAX_UNCERTAIN:
                         idx = idx[:MAX_UNCERTAIN]
-                    clip_targets = agent.get_clip_soft_targets(data[idx])
+                    clip_targets = agent.get_clip_soft_targets(data_real[idx])
                     if clip_targets is not None:
                         clip_conf, _ = clip_targets.max(dim=1)
                         mask_ok = clip_conf > 0.8
@@ -1324,12 +1372,16 @@ def run_drone_simulation():
                     print(f"  - outputs min/max: {outputs.min().item():.3f}/{outputs.max().item():.3f}")
                     print(f"  - outputs contains inf: {torch.isinf(outputs).any().item()}")
                     print(f"  - outputs contains nan: {torch.isnan(outputs).any().item()}")
-                    print(f"  - target range: {target.min().item()} to {target.max().item()}")
+                    print(f"  - target range: {target_real.min().item()} to {target_real.max().item()}")
                     if expansion_count > 0 and class_weights_phase2 is not None:
                         print(f"  - class_weights min/max: {class_weights_phase2.min().item():.3f}/{class_weights_phase2.max().item():.3f}")
                 # Пропускаем шаг
                 current_opt.zero_grad(set_to_none=True)
                 continue
+
+            # Добавляем dream distillation loss (сон с удержанием структуры)
+            if loss_dream != 0.0 and torch.isfinite(loss_dream):
+                total_loss = total_loss + 0.2 * loss_dream  # вес для dreams
 
             if x_replay is not None:
                 replay_term = 0.25 * replay_loss
@@ -1454,13 +1506,13 @@ def run_drone_simulation():
 
             agent.sensor.update(float(total_loss.item()))
 
-            # error counter
+            # error counter (только на real данных)
             if expansion_count > 0:
                 with torch.no_grad():
                     agent.eval()
-                    out = agent(data)
+                    out = agent(data_real)
                     pred = out[:, :10].argmax(dim=1)
-                    error_count_phase2 += int((pred != target).sum().item())
+                    error_count_phase2 += int((pred != target_real).sum().item())
                     agent.train()
 
             if step % 50 == 0:
@@ -1470,7 +1522,7 @@ def run_drone_simulation():
                 acc_B_hist.append(acc_B)
 
                 with torch.no_grad():
-                    out = agent(data)
+                    out = agent(data_real)
                     p = torch.softmax(out[:, :10], dim=1)
                     ent = -torch.sum(p * torch.log(p + 1e-9), dim=1)
                     mp, _ = p.max(dim=1)
@@ -1588,6 +1640,74 @@ def run_drone_simulation():
     if expansion_count > 0:
         print("\n--- VISUALIZING LATENT SPACE (Post Phase2) ---")
         visualize_latent_space(agent, test_loader_B, device, title_suffix="Post Phase2 Animals")
+
+    # ----------------------------
+    # Generative Quality Check: Car ⊕ Cat (структурная связность)
+    # ----------------------------
+    @torch.no_grad()
+    def dream_hybrid_check(agent, loader_all, device, cls_a=1, cls_b=3, n_a=64, n_b=64):
+        """
+        Проверка качества VAE через гибридные образы.
+        Делает среднее в латенте VAE (μ) между классами и декодирует.
+        Если получается структурный гибрид - VAE научился связному латенту.
+        """
+        if not (agent.use_vae_dreams and agent.vae_trained):
+            print("[HYBRID] VAE not ready, skipping hybrid check")
+            return
+
+        agent.dream_vae.eval()
+
+        xa, xb = [], []
+        for x, y in loader_all:
+            for i in range(x.size(0)):
+                if int(y[i]) == cls_a and len(xa) < n_a:
+                    xa.append(x[i:i+1])
+                if int(y[i]) == cls_b and len(xb) < n_b:
+                    xb.append(x[i:i+1])
+            if len(xa) >= n_a and len(xb) >= n_b:
+                break
+
+        if len(xa) < n_a or len(xb) < n_b:
+            print(f"[HYBRID] Not enough samples: Car={len(xa)}, Cat={len(xb)}")
+            return
+
+        xa = torch.cat(xa, dim=0).to(device)
+        xb = torch.cat(xb, dim=0).to(device)
+
+        mu_a, lv_a = agent.dream_vae.encode(xa)
+        mu_b, lv_b = agent.dream_vae.encode(xb)
+
+        # Среднее в латенте (не по пикселям!)
+        mu_mix = 0.5 * mu_a.mean(dim=0, keepdim=True) + 0.5 * mu_b.mean(dim=0, keepdim=True)
+        x_mix = agent.dream_vae.decode(mu_mix)
+        x_mix = torch.clamp(x_mix, -1, 1)
+
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        out_path = os.path.join(project_root, "test_outputs", "hybrid_car_cat.png")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+        # Сохранить как картинку
+        try:
+            import torchvision
+            grid = torchvision.utils.make_grid((x_mix * 0.5 + 0.5).cpu(), nrow=1)
+            torchvision.utils.save_image(grid, out_path)
+            print(f"[HYBRID] Saved hybrid Car⊕Cat image to {out_path}")
+            print(f"[HYBRID] If image shows structural hybrid (not gray noise), VAE learned coherent latent space")
+        except ImportError:
+            print(f"[HYBRID] torchvision not available, cannot save image")
+
+    # Выполняем проверку качества VAE
+    if use_vae_dreams and agent.vae_trained:
+        print("\n--- GENERATIVE QUALITY CHECK (Car ⊕ Cat) ---")
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        data_path = os.path.join(project_root, "data")
+        test_full_temp = datasets.CIFAR10(data_path, train=False, download=True, transform=transform)
+        test_loader_all_temp = DataLoader(test_full_temp, batch_size=500, shuffle=False, num_workers=4, pin_memory=True)
+        dream_hybrid_check(agent, test_loader_all_temp, device, cls_a=1, cls_b=3, n_a=64, n_b=64)
 
     # ----------------------------
     # Final test on all classes (fixed unknown counting)
