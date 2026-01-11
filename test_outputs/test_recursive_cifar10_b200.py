@@ -2291,9 +2291,6 @@ class RecursiveAgent(nn.Module):
         
         print("☀️ WAKING UP: Lazarus Consolidation Complete.")
         
-        # КРИТИЧНО: Возвращаем изменение бюджета для "Когнитивного Кэшбека"
-        return budget_change
-        
         # КРИТИЧНО: Визуализация снов - сохраняем примеры снов для анализа
         if self.use_vae_dreams and self.vae_trained:
             try:
