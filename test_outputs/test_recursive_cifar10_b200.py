@@ -1072,6 +1072,11 @@ def run_drone_simulation():
     print(f"\n--- PHASE 2: WILDERNESS (Reality Shift to Animals: {classes_B}) ---")
     phase_transition_step.append(len(acc_A_hist))
     
+    # КРИТИЧНО: рекалибруем сенсор для Phase2 (baseline другой, loss масштаб другой)
+    print("[SENSOR] Recalibrating sensor for Phase2 (new baseline)...")
+    agent.sensor = ComplexitySensor(sensitivity=2.5)  # новый сенсор для Phase2
+    sensor_recalibrated = False
+    
     # Создаём teacher-снимок для distillation на dreams (сон с удержанием структуры)
     teacher = None
     if use_vae_dreams and agent.vae_trained:
@@ -1081,6 +1086,11 @@ def run_drone_simulation():
         for p in teacher.parameters():
             p.requires_grad = False
         print("[SLEEP] Teacher ready for dream supervision")
+        
+        # КРИТИЧНО: переобучаем VAE на Phase2 данных для более релевантных dreams
+        print("[VAE] Fine-tuning dream generator on Phase2 data (animals)...")
+        agent.train_vae_on_data(loader_B, device, epochs=3, lr=5e-4)  # меньше эпох, меньший LR
+        print("[VAE] Dream generator fine-tuned for Phase2")
     
     # Вычисляем фиксированные веса классов для class-balanced loss (один раз по датасету)
     # КРИТИЧНО: train_B содержит только классы 2..7 (animals), поэтому нужно считать веса
@@ -1098,6 +1108,11 @@ def run_drone_simulation():
     CLIP_TRUST_THRESHOLD = 0.6
     CLIP_MIN_DIVERSITY = 3  # минимум разных концептов для expansion
     MAX_LAYERS = 5
+    
+    # КРИТИЧНО: fallback механизм для expansion
+    FORCE_EXPANSION_STEPS = 500  # принудительный expansion после N шагов без expansion
+    FALLBACK_EXPANSION_THRESHOLD = 0.40  # если accuracy < 40% и loss > 2.0, расширяемся без CLIP
+    fallback_expansion_attempted = False
 
     SLEEP_TRIGGER_STEPS = 500
     SLEEP_TRIGGER_ERRORS = 100
@@ -1189,12 +1204,49 @@ def run_drone_simulation():
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
                 test_out = agent(data_real)
                 test_loss = criterion_train(test_out[:, :10], target_real)
+                
+                # Вычисляем accuracy для fallback механизма
+                test_pred = test_out[:, :10].argmax(dim=1)
+                test_acc = float((test_pred == target_real).float().mean().item())
+
+            # КРИТИЧНО: рекалибруем сенсор после первых 50 шагов Phase2
+            if not sensor_recalibrated and step >= 50:
+                agent.sensor.calibrate()
+                sensor_recalibrated = True
+                print(f"[SENSOR] Phase2 baseline set. Mean={agent.sensor.mean:.3f}, Std={agent.sensor.std:.3f}")
 
             is_shock = agent.sensor.is_shock(float(test_loss.item()))
             can_expand = (step - last_expansion_step) > COOLDOWN_STEPS
             has_budget = len(agent.heads) < MAX_LAYERS
+            
+            # КРИТИЧНО: fallback условия для expansion
+            # 1) Принудительный expansion после FORCE_EXPANSION_STEPS без expansion
+            force_expansion = (expansion_count == 0 and step >= FORCE_EXPANSION_STEPS and has_budget)
+            # 2) Fallback expansion: низкая accuracy + высокий loss (без CLIP diversity check)
+            fallback_expansion = (
+                not fallback_expansion_attempted and 
+                can_expand and 
+                has_budget and 
+                test_acc < FALLBACK_EXPANSION_THRESHOLD and 
+                float(test_loss.item()) > 2.0
+            )
 
-            if is_shock and can_expand and has_budget:
+            # КРИТИЧНО: триггеры для expansion (shock, fallback, или принудительный)
+            should_expand = False
+            expansion_reason = ""
+            detected_classes = set()
+            
+            if force_expansion:
+                should_expand = True
+                expansion_reason = f"FORCED (no expansion after {FORCE_EXPANSION_STEPS} steps)"
+                print(f"\n[FORCE EXPANSION] {expansion_reason}")
+            elif fallback_expansion:
+                should_expand = True
+                expansion_reason = f"FALLBACK (acc={test_acc*100:.1f}% < {FALLBACK_EXPANSION_THRESHOLD*100:.0f}%, loss={float(test_loss.item()):.2f} > 2.0)"
+                fallback_expansion_attempted = True
+                print(f"\n[FALLBACK EXPANSION] {expansion_reason}")
+                print(f"[SAFETY] Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
+            elif is_shock and can_expand and has_budget:
                 print(f"\n[VISUAL CORTEX SHOCK] Loss {float(test_loss.item()):.2f} detected (High Surprise).")
                 print(f"[SAFETY] Cooldown OK, Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
 
@@ -1210,71 +1262,88 @@ def run_drone_simulation():
                     
                     if not is_diverse:
                         print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
-                        print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts. Skipping expansion (but continuing training).")
-                        # КРИТИЧНО: не продолжаем к expansion, если diversity check не пройден
-                        # Обучение продолжается, но expansion пропускается
+                        print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts.")
+                        # КРИТИЧНО: если CLIP не сработал, но условия fallback выполнены - расширяемся
+                        if test_acc < FALLBACK_EXPANSION_THRESHOLD and float(test_loss.item()) > 2.0:
+                            should_expand = True
+                            expansion_reason = f"FALLBACK after CLIP failure (acc={test_acc*100:.1f}%, loss={float(test_loss.item()):.2f})"
+                            fallback_expansion_attempted = True
+                            print(f"[FALLBACK EXPANSION] {expansion_reason}")
+                        else:
+                            print(f"[DIVERSITY CHECK] Skipping expansion (but continuing training).")
                     else:
                         print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
-                        
-                        # Берем первый уверенный ответ для логирования
-                        # КРИТИЧНО: используем data_real вместо data (уже на GPU)
-                        best_idx, best_label, conf = agent.curiosity.what_is_this(data_real[0:1])
-                        if best_idx is not None and conf > CLIP_TRUST_THRESHOLD:
-                            print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}' (one of {len(detected_classes)} detected)")
-                            print(f"[ADAPTATION] Triggering Phase Transition with diverse concepts: {sorted(detected_classes)}...")
+                        should_expand = True
+                        expansion_reason = f"SHOCK + CLIP diversity ({len(detected_classes)} concepts)"
+                else:
+                    # Если CLIP недоступен, используем fallback
+                    if test_acc < FALLBACK_EXPANSION_THRESHOLD and float(test_loss.item()) > 2.0:
+                        should_expand = True
+                        expansion_reason = f"FALLBACK (CLIP unavailable, acc={test_acc*100:.1f}%, loss={float(test_loss.item()):.2f})"
+                        fallback_expansion_attempted = True
+                        print(f"[FALLBACK EXPANSION] {expansion_reason}")
+            
+            if should_expand and has_budget:
+                # Берем первый уверенный ответ для логирования (если CLIP доступен)
+                best_idx, best_label, conf = None, "unknown", 0.0
+                if agent.use_curiosity and len(detected_classes) > 0:
+                    best_idx, best_label, conf = agent.curiosity.what_is_this(data_real[0:1])
+                    if best_idx is not None:
+                        print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}' (one of {len(detected_classes)} detected)")
+                
+                print(f"[ADAPTATION] Triggering Phase Transition: {expansion_reason}...")
 
-                            with torch.no_grad():
-                                agent.eval()
-                                # Используем data_real (уже на device)
-                                mo = agent(data_real[0:1])
-                                agent.train()
-                                mp = torch.softmax(mo[:, :10], dim=1)
-                                model_conf, model_pred = mp.max(dim=1)
-                                model_entropy = float((-torch.sum(mp * torch.log(mp + 1e-9), dim=1)).item())
-                                print(f"[LOG] Model confidence: {float(model_conf.item()):.3f}, Entropy: {model_entropy:.3f}")
+                with torch.no_grad():
+                    agent.eval()
+                    mo = agent(data_real[0:1])
+                    agent.train()
+                    mp = torch.softmax(mo[:, :10], dim=1)
+                    model_conf, model_pred = mp.max(dim=1)
+                    model_entropy = float((-torch.sum(mp * torch.log(mp + 1e-9), dim=1)).item())
+                    print(f"[LOG] Model confidence: {float(model_conf.item()):.3f}, Entropy: {model_entropy:.3f}")
 
-                                agent.record_conflict(
-                                    confidence_model=float(model_conf.item()),
-                                    entropy_model=model_entropy,
-                                    clip_class=best_idx,
-                                    clip_label=best_label,
-                                    clip_conf=conf,
-                                    image=data_real[0:1],
-                                    true_label=int(target_real[0].item()) if target_real.numel() > 0 else None,
-                                )
+                    if best_idx is not None:
+                        agent.record_conflict(
+                            confidence_model=float(model_conf.item()),
+                            entropy_model=model_entropy,
+                            clip_class=best_idx,
+                            clip_label=best_label,
+                            clip_conf=conf,
+                            image=data_real[0:1],
+                            true_label=int(target_real[0].item()) if target_real.numel() > 0 else None,
+                        )
 
-                            new_head = agent.expand(
-                                new_classes_indices=classes_B,
-                                use_fractal_time=use_fractal_time,
-                                train_late_backbone=train_late_backbone,
-                            )
-                            # КРИТИЧНО: применяем fractal-freeze после expand()
-                            agent.freeze_past(use_fractal_time=use_fractal_time, train_late_backbone=train_late_backbone)
-                            agent.recalibrate_bn(loader_B, device, num_batches=20)
+                new_head = agent.expand(
+                    new_classes_indices=classes_B,
+                    use_fractal_time=use_fractal_time,
+                    train_late_backbone=train_late_backbone,
+                )
+                # КРИТИЧНО: применяем fractal-freeze после expand()
+                agent.freeze_past(use_fractal_time=use_fractal_time, train_late_backbone=train_late_backbone)
+                agent.recalibrate_bn(loader_B, device, num_batches=20)
 
-                            optimizer_phase2 = build_phase2_optimizer(new_head)
-                            
-                            # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
-                            for pg in optimizer_phase2.param_groups:
-                                pg["lr_base"] = pg["lr"]
-                                # Сохраняем scheduler_factor для правильного масштабирования
-                                pg["scheduler_factor"] = 1.0  # начальное значение
+                optimizer_phase2 = build_phase2_optimizer(new_head)
+                
+                # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
+                for pg in optimizer_phase2.param_groups:
+                    pg["lr_base"] = pg["lr"]
+                    pg["scheduler_factor"] = 1.0
 
-                            steps_already_done = 0
-                            remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
-                            scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
+                steps_already_done = 0
+                remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
+                scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
 
-                            expansion_count += 1
-                            last_expansion_step = step
-                            # Сохраняем фактическое разнообразие (может быть > CLIP_MIN_DIVERSITY)
-                            clip_diversity_at_expansion = len(detected_classes)
-                            # ref_backbone уже создан в agent.expand()
-                        else:
-                            print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
+                expansion_count += 1
+                last_expansion_step = step
+                # Сохраняем фактическое разнообразие (если было обнаружено CLIP)
+                if len(detected_classes) > 0:
+                    clip_diversity_at_expansion = len(detected_classes)
+                else:
+                    clip_diversity_at_expansion = len(classes_B)  # fallback: используем все целевые классы
+                # ref_backbone уже создан в agent.expand()
             elif is_shock and not can_expand and (step % 50 == 0):
                 remaining = COOLDOWN_STEPS - (step - last_expansion_step)
                 print(f"[COOLDOWN] Shock detected but refractory period ({remaining} steps)")
-
             elif is_shock and not has_budget:
                 print(f"\n[CRITICAL] Head Limit ({MAX_LAYERS}) reached. Consider SLEEP here (disabled in this file).")
 
@@ -1737,7 +1806,9 @@ def run_drone_simulation():
             for data, target in loader:
                 data = data.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                 _, features = agent(data, return_features=True)
-                features_list.append(features.cpu().numpy())
+                # КРИТИЧНО: конвертируем BFloat16 в float32 перед numpy (numpy не поддерживает BFloat16)
+                features_float = features.float() if features.dtype == torch.bfloat16 else features
+                features_list.append(features_float.cpu().numpy())
                 labels_list.append(target.numpy())
                 if len(features_list) * data.size(0) >= 2000:  # ограничиваем для скорости
                     break
