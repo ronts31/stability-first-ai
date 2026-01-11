@@ -1491,7 +1491,8 @@ def run_drone_simulation():
             EXPANSION_THRESHOLD = 0.5  # порог для expansion
             
             # Fallback условия (для обратной совместимости)
-            force_expansion = (expansion_count == 0 and step >= FORCE_EXPANSION_STEPS and has_budget)
+            # КРИТИЧНО: FORCE_EXPANSION использует phase2_steps, а не глобальный step
+            force_expansion = (expansion_count == 0 and phase2_steps >= FORCE_EXPANSION_STEPS and has_budget)
             fallback_expansion = (
                 not fallback_expansion_attempted and 
                 can_expand and 
@@ -1576,6 +1577,20 @@ def run_drone_simulation():
                         expansion_reason = f"FALLBACK (CLIP unavailable, acc={test_acc*100:.1f}%, loss={float(test_loss.item()):.2f})"
                         fallback_expansion_attempted = True
                         print(f"[FALLBACK EXPANSION] {expansion_reason}")
+            
+            # КРИТИЧНО: проверяем дублирующий scope перед expansion
+            def scope_already_exists(agent, new_scope):
+                """Проверяет, существует ли уже head с таким же scope"""
+                s = set(new_scope)
+                return any(set(v) == s for v in agent.active_classes_per_column.values())
+            
+            # КРИТИЧНО: запрещаем создание head с дублирующим scope
+            if should_expand and has_budget:
+                expansion_classes = expansion_new_classes if expansion_new_classes is not None else classes_B
+                if scope_already_exists(agent, expansion_classes):
+                    should_expand = False
+                    if step % 50 == 0:
+                        print(f"[EXPANSION] Skipped: identical scope {expansion_classes} already exists")
             
             if should_expand and has_budget:
                 # Берем первый уверенный ответ для логирования (если CLIP доступен)
@@ -1838,28 +1853,47 @@ def run_drone_simulation():
                         continue
 
                 # Supervised loss на real данных
-                # Используем class-balanced loss если веса вычислены (только в Phase2 после expansion)
-                if expansion_count > 0 and class_weights_phase2 is not None:
-                    # КРИТИЧНО: проверяем только веса активных классов (неактивные = 0)
+                # КРИТИЧНО: Phase2 loss только по активным классам (2..7), не по всем 10
+                # Это предотвращает конкуренцию с неактивными классами (0,1,8,9) и mode collapse
+                if len(agent.heads) > 1:  # Phase2 после expansion
+                    # Локальный softmax только по активным классам
+                    classes_B_t = torch.tensor(classes_B, device=device, dtype=torch.long)  # [6]
+                    logits10 = outputs[:real_B, :10]
+                    logitsB = logits10.index_select(1, classes_B_t)  # [B, 6] - только активные классы
+                    
+                    # Глобальные -> локальные targets
+                    g2l = {c: i for i, c in enumerate(classes_B)}
+                    targetB = torch.tensor([g2l[int(t.item())] for t in target_real], 
+                                         device=device, dtype=torch.long)
+                    
+                    # Cross-entropy с label smoothing только по активным классам
+                    loss_new = F.cross_entropy(logitsB, targetB, label_smoothing=0.05)
+                elif expansion_count > 0 and class_weights_phase2 is not None:
+                    # Fallback: class-balanced loss если веса вычислены
                     active_w = class_weights_phase2[torch.tensor(classes_B, device=device)]
                     if torch.isfinite(active_w).all() and (active_w > 0).all():
                         loss_new = class_balanced_loss(outputs[:real_B, :10], target_real, class_weights_phase2, num_classes=10)
                     else:
-                        # Fallback на обычный loss если веса проблемные
                         loss_new = criterion_train(outputs[:real_B, :10], target_real)
                 else:
                     # Phase1 или если веса не вычислены - используем обычный loss
                     loss_new = criterion_train(outputs[:real_B, :10], target_real)
                 
+                # КРИТИЧНО: Unknown-margin на ID данных - Unknown должен быть НИЖЕ known на реальных CIFAR-10
+                # Это предотвращает доминирование Unknown (10000 предсказаний)
+                loss_unk_id = torch.zeros((), device=device, dtype=torch.float32)
+                if len(agent.heads) > 1:  # только в Phase2
+                    logits10 = outputs[:real_B, :10]
+                    unk = outputs[:real_B, agent.unknown_class_idx]
+                    max_known = logits10.max(dim=1).values  # максимальный логит среди known классов
+                    
+                    unk_margin = 1.0  # Unknown должен быть на margin ниже max_known
+                    loss_unk_id = F.relu(unk - max_known + unk_margin).mean()
+                
                 # КРИТИЧНО: Outlier Exposure ОТКЛЮЧЕН для рекурсивной эмергенции
                 # Неизвестное должно триггерить expansion новых heads, а не обучаться как отдельный класс.
-                # Система будет расширяться структурно при встрече с новыми концептами через:
-                # 1. unknown_rate в Complexity Controller (триггерит expansion)
-                # 2. CLIP обнаружение новых концептов (триггерит expansion)
-                # 3. High entropy + shock (триггерит expansion)
                 loss_unknown = torch.zeros((), device=device, dtype=torch.float32)
                 agent.unknown_trained = True  # помечаем что unknown не обучается как класс, а триггерит expansion
-                # Outlier Exposure код удалён - неизвестное выносится в новые heads через expansion
                 
                 # Distillation loss на dreams (сон с удержанием структуры)
                 loss_dream = 0.0
@@ -2056,10 +2090,15 @@ def run_drone_simulation():
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
-            
-            # Добавляем loss для Unknown класса (Outlier Exposure)
-            if isinstance(loss_unknown, torch.Tensor) and loss_unknown.item() != 0.0 and torch.isfinite(loss_unknown):
-                total_loss = total_loss + 0.1 * loss_unknown  # небольшой вес для стабильности
+
+            # КРИТИЧНО: Unknown-margin на ID данных - Unknown должен быть НИЖЕ known на реальных CIFAR-10
+            # Это предотвращает доминирование Unknown (10000 предсказаний)
+            if isinstance(loss_unk_id, torch.Tensor) and loss_unk_id.item() != 0.0 and torch.isfinite(loss_unk_id):
+                total_loss = total_loss + 0.2 * loss_unk_id  # вес 0.1..0.3 для margin loss
+
+            # Добавляем loss для Unknown класса (Outlier Exposure) - отключено для рекурсивной эмергенции
+            # if isinstance(loss_unknown, torch.Tensor) and loss_unknown.item() != 0.0 and torch.isfinite(loss_unknown):
+            #     total_loss = total_loss + 0.02 * loss_unknown  # уменьшен с 0.1 до 0.02
             
             # Добавляем entropy penalty для routing gates
             if isinstance(routing_entropy_loss, torch.Tensor) and routing_entropy_loss.item() != 0.0 and torch.isfinite(routing_entropy_loss):
@@ -2083,6 +2122,7 @@ def run_drone_simulation():
             # КРИТИЧНО: сохраняем компоненты loss для диагностики
             loss_new_val = float(loss_new.item())
             unknown_val = float(loss_unknown.item()) if isinstance(loss_unknown, torch.Tensor) and torch.isfinite(loss_unknown) else 0.0
+            unk_id_val = float(loss_unk_id.item()) if isinstance(loss_unk_id, torch.Tensor) and torch.isfinite(loss_unk_id) else 0.0
             
             # Добавляем dream distillation loss (сон с удержанием структуры)
             dream_val = 0.0
@@ -2279,7 +2319,7 @@ def run_drone_simulation():
                 pred_info = f" | Pred: {top3_str}" if expansion_count > 0 else ""
                 
                 # КРИТИЧНО: диагностика компонентов loss для выявления источника взрыва
-                loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} U:{unknown_val:.3f} Reg:{reg_val:.2f}"
+                loss_components = f"Lnew:{loss_new_val:.2f} R:{replay_val:.2f} KL:{kl_val:.3f} D:{dream_val:.2f} U:{unknown_val:.3f} Uid:{unk_id_val:.3f} Reg:{reg_val:.2f}"
                 
                 # КРИТИЧНО: Complexity Controller статус
                 # Показываем даже после sleep (когда expansion_count может быть 0, но есть heads)
