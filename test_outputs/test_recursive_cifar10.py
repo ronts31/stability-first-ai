@@ -838,7 +838,7 @@ def run_drone_simulation():
     axes[1].set_ylabel("Accuracy %")
     axes[1].set_xlabel("Class")
     axes[1].set_xticks(range(10))
-    axes[1].set_xticklabels([f"{i}\n{name}" for i, name in enumerate(class_names)], rotation=45, ha='right')
+    axes[1].set_xticklabels([f"{i}\n{name}" for i, name in enumerate(class_names[:10])], rotation=45, ha='right')
     axes[1].grid(True, alpha=0.3, axis='y')
     axes[1].set_ylim(0, 100)
     
