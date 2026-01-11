@@ -374,17 +374,23 @@ class RecursiveAgent(nn.Module):
         """
         Пер-слойная защита (EWC-lite): ||W - W_ref||^2 с весом = crystal_level * fractal_alpha
         Требует наличия self.ref_backbone (снимок).
+        Нормализовано через mean() для сопоставимости между слоями.
         """
         if (not self.use_subjective_time) or (self.ref_backbone is None):
             return 0.0
 
         reg = 0.0
+        cnt = 0
         for (name, p), (_, p_ref) in zip(self.shared_backbone.named_parameters(), self.ref_backbone.named_parameters()):
             if not p.requires_grad:
                 continue
             group = self._layer_group(name)
             alpha = self.fractal_alpha.get(group, 0.15)
-            reg = reg + (alpha * (p - p_ref).pow(2).sum())
+            # Нормализация через mean() для сопоставимости между слоями
+            reg = reg + (alpha * (p - p_ref).pow(2).mean())
+            cnt += 1
+        if cnt > 0:
+            reg = reg / cnt  # среднее по всем слоям
         return reg
 
     def auto_hard_freeze_if_needed(self):
@@ -716,36 +722,51 @@ def pair_margin_loss(logits10, targets, pairs=((0, 8), (1, 9), (3, 5)), margin=0
     return loss
 
 
-def class_balanced_loss(logits, targets, num_classes=10, beta=0.9999):
+def compute_class_weights_from_dataset(dataset, num_classes=10, beta=0.9999):
     """
-    Class-balanced loss для борьбы с доминированием одного класса (например, Frog).
-    Динамически уменьшает вес хорошо изученных классов.
+    Вычисляет веса классов на основе глобальных counts по датасету (не по батчу).
+    Возвращает фиксированные веса для использования в loss.
+    """
+    # Подсчитываем количество примеров каждого класса в датасете
+    class_counts = torch.zeros(num_classes, dtype=torch.float32)
+    for i in range(len(dataset)):
+        target = dataset[i][1]  # (image, target)
+        if isinstance(target, torch.Tensor):
+            target = target.item()
+        class_counts[target] += 1.0
+    
+    # Правильная формула Class-Balanced Loss (Cui et al.)
+    # effective_num = 1 - beta^n
+    # weight = (1 - beta) / (1 - beta^n)
+    beta_tensor = torch.tensor(beta, dtype=torch.float32)
+    effective_num = 1.0 - torch.pow(beta_tensor, class_counts)
+    weights = (1.0 - beta) / (effective_num + 1e-8)
+    
+    # Нормализация: средний вес = 1.0
+    weights = weights / weights.mean()
+    
+    return weights
+
+
+def class_balanced_loss(logits, targets, class_weights, num_classes=10):
+    """
+    Class-balanced loss с фиксированными весами (вычисленными по датасету).
     
     Args:
         logits: [B, num_classes]
         targets: [B]
+        class_weights: [num_classes] - фиксированные веса классов
         num_classes: количество классов
-        beta: гиперпараметр балансировки (0.9999 = сильная балансировка)
     
     Returns:
         weighted_loss: scalar
     """
-    # Вычисляем эффективное число примеров для каждого класса в батче
-    class_counts = torch.zeros(num_classes, device=logits.device)
-    for c in range(num_classes):
-        class_counts[c] = (targets == c).sum().float()
-    
-    # Эффективное число: (1 - beta^n) / (1 - beta)
-    # Для малых классов вес больше
-    effective_num = (1.0 - beta) / (1.0 - beta ** (class_counts + 1e-6))
-    effective_num = effective_num / effective_num.sum() * num_classes  # нормализация
-    
-    # Веса для каждого класса в батче
-    class_weights = effective_num[targets]  # [B]
+    # Веса для каждого примера в батче
+    sample_weights = class_weights[targets]  # [B]
     
     # Стандартный cross-entropy с весами
     ce_loss = F.cross_entropy(logits, targets, reduction='none')  # [B]
-    weighted_loss = (ce_loss * class_weights).mean()
+    weighted_loss = (ce_loss * sample_weights).mean()
     
     return weighted_loss
 
@@ -933,6 +954,14 @@ def run_drone_simulation():
 
     print(f"\n--- PHASE 2: WILDERNESS (Reality Shift to Animals: {classes_B}) ---")
     phase_transition_step.append(len(acc_A_hist))
+    
+    # Вычисляем фиксированные веса классов для class-balanced loss (один раз по датасету)
+    class_weights_phase2 = None
+    if use_subjective_time:  # только если будем использовать в Phase2
+        print("[PHASE2] Computing class weights for balanced loss...")
+        class_weights_phase2 = compute_class_weights_from_dataset(train_B.dataset, num_classes=10, beta=0.9999)
+        class_weights_phase2 = class_weights_phase2.to(device)
+        print(f"[PHASE2] Class weights: {class_weights_phase2.cpu().numpy()}")
 
     expansion_count = 0
     last_expansion_step = -1000
@@ -1030,8 +1059,8 @@ def run_drone_simulation():
                     
                     if not is_diverse:
                         print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
-                        print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts. Skipping expansion.")
-                        continue
+                        print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts. Skipping expansion (but continuing training).")
+                        # НЕ делаем continue - обучение продолжается, просто без expansion
                     
                     print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
                     
@@ -1079,7 +1108,8 @@ def run_drone_simulation():
 
                         expansion_count += 1
                         last_expansion_step = step
-                        clip_diversity_at_expansion = len(detected_classes)  # сохраняем разнообразие
+                        # Сохраняем фактическое разнообразие (может быть > CLIP_MIN_DIVERSITY)
+                        clip_diversity_at_expansion = len(detected_classes)
                         # ref_backbone уже создан в agent.expand()
                     else:
                         print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
@@ -1116,11 +1146,11 @@ def run_drone_simulation():
                 outputs, features = agent(data, return_features=True)
 
                 # Class-balanced loss для Phase2 (борьба с доминированием одного класса, например Frog)
-                if expansion_count > 0:
-                    # Используем class-balanced loss для лучшей балансировки классов
-                    loss_new = class_balanced_loss(outputs[:, :10], target, num_classes=10, beta=0.9999)
+                if expansion_count > 0 and class_weights_phase2 is not None:
+                    # Используем class-balanced loss с фиксированными весами (вычисленными по датасету)
+                    loss_new = class_balanced_loss(outputs[:, :10], target, class_weights_phase2, num_classes=10)
                 else:
-                    # Phase1 использует обычный loss
+                    # Phase1 или если веса не вычислены - используем обычный loss
                     loss_new = criterion_train(outputs[:, :10], target)
                 
                 # Усиленная pair margin loss для cat/dog в Phase2 (животные)
@@ -1157,13 +1187,16 @@ def run_drone_simulation():
             if use_adaptive_pain and (x_replay is not None):
                 backbone_params = [p for p in agent.shared_backbone.parameters() if p.requires_grad]
                 if len(backbone_params) > 0:
-                    # fp32 grads
+                    # fp32 grads (без unknown-эвристики для чистоты градиентов)
                     with torch.amp.autocast("cuda", enabled=False):
-                        out_new_fp32 = agent(data.float())
-                        ln = criterion_train(out_new_fp32[:, :10], target)
+                        # Используем только backbone + head для чистоты (без unknown логики)
+                        feats_new = agent.shared_backbone(data.float())
+                        logits_new = agent.heads[-1](feats_new, [])[0]  # последняя голова
+                        ln = criterion_train(logits_new[:, :10], target)
 
-                        out_old_fp32 = agent(x_replay.float())
-                        lo = criterion_train(out_old_fp32[:, :10], y_replay)
+                        feats_old = agent.shared_backbone(x_replay.float())
+                        logits_old = agent.heads[-1](feats_old, [])[0]
+                        lo = criterion_train(logits_old[:, :10], y_replay)
 
                     g_new = torch.autograd.grad(ln, backbone_params, retain_graph=True, allow_unused=True)
                     g_old = torch.autograd.grad(lo, backbone_params, retain_graph=True, allow_unused=True)
@@ -1218,46 +1251,33 @@ def run_drone_simulation():
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
                 
                 # Корректировка crystal_level на основе разнообразия CLIP
-                # Если CLIP видит мало разных концептов, кристаллизация должна быть мягче
+                # Используем фактическое разнообразие относительно максимального возможного
                 if clip_diversity_at_expansion > 0:
-                    # Нормализуем разнообразие: 3 концепта = 1.0, больше = бонус
-                    diversity_factor = min(1.0, clip_diversity_at_expansion / CLIP_MIN_DIVERSITY)
-                    # Если разнообразие низкое, снижаем crystal_level
-                    if diversity_factor < 1.0:
-                        agent.crystal_level = agent.crystal_level * (0.5 + 0.5 * diversity_factor)
-                        agent.crystal_level = float(max(0.0, min(1.0, agent.crystal_level)))
+                    # diversity_ratio: 0..1 (сколько классов из целевых обнаружено)
+                    max_possible = len(classes_B)  # максимальное возможное разнообразие
+                    diversity_ratio = clip_diversity_at_expansion / max(1, max_possible)
+                    # При низком разнообразии снижаем crystal_level (больше пластичности)
+                    # При высоком - оставляем как есть или немного повышаем
+                    agent.crystal_level = agent.crystal_level * (0.7 + 0.3 * diversity_ratio)
+                    agent.crystal_level = float(max(0.0, min(1.0, agent.crystal_level)))
                 
                 agent.auto_hard_freeze_if_needed()
                 
                 # Warmup: эмоциональный разогрев после expansion
                 steps_since_expand = step - last_expansion_step
                 if steps_since_expand < WARMUP_STEPS:
-                    # Полный warmup: повышенная пластичность
+                    # Полный warmup: повышенная пластичность, якорение ВЫКЛЮЧЕНО
                     lr_warmup_mult_backbone = 2.0  # mid/late backbone учится быстрее
-                    cryst_strength_warmup_mult = 0.2  # якорение ослаблено
+                    cryst_strength_warmup_mult = 0.0  # якорение полностью выключено
                 elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
                     # Плавный возврат к нормальному режиму
                     decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
                     lr_warmup_mult_backbone = 2.0 - decay_progress * 1.0  # 2.0 -> 1.0
-                    cryst_strength_warmup_mult = 0.2 + decay_progress * 0.8  # 0.2 -> 1.0
+                    cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0  # 0.0 -> 1.0
                 else:
                     # Нормальный режим
                     lr_warmup_mult_backbone = 1.0
                     cryst_strength_warmup_mult = 1.0
-                
-                # Apply LR scaling based on crystal_level + warmup
-                if optimizer_phase2 is not None:
-                    scales = agent.time_lr_scale()
-                    for pg in optimizer_phase2.param_groups:
-                        tag = pg.get("tag", None)
-                        if tag in scales and "lr_base" in pg:
-                            base_scale = scales[tag]
-                            # Warmup multiplier применяется только к backbone (mid/late)
-                            if tag in ["mid", "late"]:
-                                warmup_mult = lr_warmup_mult_backbone
-                            else:
-                                warmup_mult = 1.0
-                            pg["lr"] = pg["lr_base"] * base_scale * warmup_mult
 
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
@@ -1282,16 +1302,7 @@ def run_drone_simulation():
                         mult = 0.5 + (min(20000.0, max(100.0, adaptive_lambda)) - 100.0) / (20000.0 - 100.0)
                         base_strength = base_strength * mult
                     
-                    # Warmup: ослабляем якорение в первые шаги после expansion
-                    steps_since_expand = step - last_expansion_step
-                    if steps_since_expand < WARMUP_STEPS:
-                        cryst_strength_warmup_mult = 0.2
-                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
-                        decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                        cryst_strength_warmup_mult = 0.2 + decay_progress * 0.8
-                    else:
-                        cryst_strength_warmup_mult = 1.0
-                    
+                    # Warmup multiplier уже вычислен выше
                     base_strength = base_strength * cryst_strength_warmup_mult
                     total_loss = total_loss + base_strength * cryst_reg
 
@@ -1306,8 +1317,32 @@ def run_drone_simulation():
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
             current_opt.step()
 
+            # Scheduler step (ВАЖНО: после optimizer.step())
             if scheduler_phase2 is not None:
                 scheduler_phase2.step()
+                # LR scaling применяется ПОСЛЕ scheduler (чтобы не перетиралось)
+                if expansion_count > 0:
+                    steps_since_expand = step - last_expansion_step
+                    if steps_since_expand < WARMUP_STEPS:
+                        lr_warmup_mult_backbone = 2.0
+                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                        decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
+                        lr_warmup_mult_backbone = 2.0 - decay_progress * 1.0
+                    else:
+                        lr_warmup_mult_backbone = 1.0
+                    
+                    scales = agent.time_lr_scale()
+                    for pg in optimizer_phase2.param_groups:
+                        tag = pg.get("tag", None)
+                        if tag in scales and "lr_base" in pg:
+                            base_scale = scales[tag]
+                            # Warmup multiplier применяется только к backbone (mid/late)
+                            if tag in ["mid", "late"]:
+                                warmup_mult = lr_warmup_mult_backbone
+                            else:
+                                warmup_mult = 1.0
+                            # Применяем к текущему LR (после scheduler)
+                            pg["lr"] = pg["lr"] * base_scale * warmup_mult
             elif optimizer_phase2 is None:
                 scheduler.step()
 
@@ -1334,6 +1369,19 @@ def run_drone_simulation():
                     ent = -torch.sum(p * torch.log(p + 1e-9), dim=1)
                     mp, _ = p.max(dim=1)
                     unk_rate = ((mp < 0.2) | (ent > 1.8)).float().mean().item()
+                    
+                    # Диагностика "frog collapse": распределение предсказаний по животным
+                    preds = out[:, :10].argmax(dim=1)
+                    # Фильтруем только целевые классы животных
+                    animal_mask = torch.isin(preds, torch.tensor(classes_B, device=preds.device))
+                    if animal_mask.any():
+                        animal_preds = preds[animal_mask]
+                        uniq, cnt = animal_preds.unique(return_counts=True)
+                        top3 = sorted(zip(uniq.cpu().tolist(), cnt.cpu().tolist()), key=lambda x: -x[1])[:3]
+                        class_names_short = ["Pl", "Car", "Bd", "Ct", "Dr", "Dg", "Fg", "Hs", "Sh", "Tk"]
+                        top3_str = ", ".join([f"{class_names_short[c]}:{cnt}" for c, cnt in top3])
+                    else:
+                        top3_str = "none"
 
                 s = f"{float(surprise.item()):.4f}" if surprise is not None else "n/a"
                 cryst_info = f" | Crystal: {agent.crystal_level:.3f}" if expansion_count > 0 else ""
@@ -1347,10 +1395,12 @@ def run_drone_simulation():
                     elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
                         warmup_info = f" | WARMUP-DECAY({steps_since_expand - WARMUP_STEPS}/{WARMUP_DECAY_STEPS})"
                 
+                pred_info = f" | Pred: {top3_str}" if expansion_count > 0 else ""
+                
                 print(
                     f"Step {step}: Loss {float(total_loss.item()):.2f} | Mem(M): {acc_A:.1f}% | "
                     f"New(A): {acc_B:.1f}% | Heads: {len(agent.heads)} | UnknownRate: {unk_rate*100:.1f}% | "
-                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}"
+                    f"Errors: {error_count_phase2} | Surprise: {s}{cryst_info}{warmup_info}{pred_info}"
                 )
 
             step += 1
