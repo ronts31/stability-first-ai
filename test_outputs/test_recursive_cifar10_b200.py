@@ -1144,19 +1144,32 @@ def run_drone_simulation():
             # ---- forward (BF16) ----
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 outputs, features = agent(data, return_features=True)
+                
+                # Проверка outputs на inf/nan
+                if not torch.isfinite(outputs).all():
+                    print(f"[ERROR] outputs contains inf/nan at step {step}")
+                    # Попытка исправить: заменить inf/nan на 0
+                    outputs = torch.where(torch.isfinite(outputs), outputs, torch.zeros_like(outputs))
+                    if not torch.isfinite(outputs).all():
+                        print(f"[ERROR] Cannot fix outputs, skipping step {step}")
+                        continue
 
                 # Class-balanced loss для Phase2 (борьба с доминированием одного класса, например Frog)
-                if expansion_count > 0 and class_weights_phase2 is not None:
-                    # Используем class-balanced loss с фиксированными весами (вычисленными по датасету)
-                    # Проверка на валидность весов
-                    if torch.isfinite(class_weights_phase2).all() and (class_weights_phase2 > 0).all():
-                        loss_new = class_balanced_loss(outputs[:, :10], target, class_weights_phase2, num_classes=10)
-                    else:
-                        # Fallback на обычный loss если веса проблемные
-                        loss_new = criterion_train(outputs[:, :10], target)
-                else:
-                    # Phase1 или если веса не вычислены - используем обычный loss
-                    loss_new = criterion_train(outputs[:, :10], target)
+                # ВРЕМЕННО отключаем class_balanced_loss - используем обычный loss для стабильности
+                # if expansion_count > 0 and class_weights_phase2 is not None:
+                #     # Используем class-balanced loss с фиксированными весами (вычисленными по датасету)
+                #     # Проверка на валидность весов
+                #     if torch.isfinite(class_weights_phase2).all() and (class_weights_phase2 > 0).all():
+                #         loss_new = class_balanced_loss(outputs[:, :10], target, class_weights_phase2, num_classes=10)
+                #     else:
+                #         # Fallback на обычный loss если веса проблемные
+                #         loss_new = criterion_train(outputs[:, :10], target)
+                # else:
+                #     # Phase1 или если веса не вычислены - используем обычный loss
+                #     loss_new = criterion_train(outputs[:, :10], target)
+                
+                # Используем обычный loss для стабильности (class_balanced_loss временно отключен)
+                loss_new = criterion_train(outputs[:, :10], target)
                 
                 # Усиленная pair margin loss для cat/dog в Phase2 (животные)
                 if expansion_count > 0:
@@ -1287,13 +1300,13 @@ def run_drone_simulation():
                 # Warmup: эмоциональный разогрев после expansion
                 steps_since_expand = step - last_expansion_step
                 if steps_since_expand < WARMUP_STEPS:
-                    # Полный warmup: повышенная пластичность, якорение ВЫКЛЮЧЕНО
-                    lr_warmup_mult_backbone = 2.0  # mid/late backbone учится быстрее
+                    # Полный warmup: умеренная пластичность (снижено с 2.0 до 1.5 для стабильности)
+                    lr_warmup_mult_backbone = 1.5  # mid/late backbone учится быстрее (было 2.0)
                     cryst_strength_warmup_mult = 0.0  # якорение полностью выключено
                 elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
                     # Плавный возврат к нормальному режиму
                     decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                    lr_warmup_mult_backbone = 2.0 - decay_progress * 1.0  # 2.0 -> 1.0
+                    lr_warmup_mult_backbone = 1.5 - decay_progress * 0.5  # 1.5 -> 1.0
                     cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0  # 0.0 -> 1.0
                 else:
                     # Нормальный режим
@@ -1303,9 +1316,19 @@ def run_drone_simulation():
             # ---- assemble total loss (single protection mechanism) ----
             total_loss = loss_new
             
-            # Проверка на NaN/inf в loss_new
+            # Проверка на NaN/inf в loss_new с детальной диагностикой
             if not torch.isfinite(loss_new):
                 print(f"[ERROR] loss_new is NaN/inf at step {step}")
+                # Детальная диагностика
+                with torch.no_grad():
+                    print(f"  - outputs min/max: {outputs.min().item():.3f}/{outputs.max().item():.3f}")
+                    print(f"  - outputs contains inf: {torch.isinf(outputs).any().item()}")
+                    print(f"  - outputs contains nan: {torch.isnan(outputs).any().item()}")
+                    print(f"  - target range: {target.min().item()} to {target.max().item()}")
+                    if expansion_count > 0 and class_weights_phase2 is not None:
+                        print(f"  - class_weights min/max: {class_weights_phase2.min().item():.3f}/{class_weights_phase2.max().item():.3f}")
+                # Пропускаем шаг
+                current_opt.zero_grad(set_to_none=True)
                 continue
 
             if x_replay is not None:
@@ -1322,15 +1345,16 @@ def run_drone_simulation():
             # crystallization regularizer replaces old current_lambda * stability_loss
             cryst_strength_warmup_mult = 1.0  # default если не в warmup
             if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
-                # Вычисляем warmup multiplier если еще не вычислен
-                steps_since_expand = step - last_expansion_step
-                if steps_since_expand < WARMUP_STEPS:
-                    cryst_strength_warmup_mult = 0.0
-                elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
-                    decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                    cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0
-                else:
-                    cryst_strength_warmup_mult = 1.0
+                # Вычисляем warmup multiplier (должен быть уже вычислен выше, но на всякий случай)
+                if 'cryst_strength_warmup_mult' not in locals() or cryst_strength_warmup_mult == 1.0:
+                    steps_since_expand = step - last_expansion_step
+                    if steps_since_expand < WARMUP_STEPS:
+                        cryst_strength_warmup_mult = 0.0
+                    elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
+                        decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
+                        cryst_strength_warmup_mult = 0.0 + decay_progress * 1.0
+                    else:
+                        cryst_strength_warmup_mult = 1.0
                 
                 cryst_reg = agent.crystallization_regularizer()
                 if cryst_reg != 0.0 and torch.isfinite(cryst_reg):
@@ -1402,10 +1426,10 @@ def run_drone_simulation():
                 if expansion_count > 0:
                     steps_since_expand = step - last_expansion_step
                     if steps_since_expand < WARMUP_STEPS:
-                        lr_warmup_mult_backbone = 2.0
+                        lr_warmup_mult_backbone = 1.5  # снижено с 2.0 для стабильности
                     elif steps_since_expand < (WARMUP_STEPS + WARMUP_DECAY_STEPS):
                         decay_progress = (steps_since_expand - WARMUP_STEPS) / WARMUP_DECAY_STEPS
-                        lr_warmup_mult_backbone = 2.0 - decay_progress * 1.0
+                        lr_warmup_mult_backbone = 1.5 - decay_progress * 0.5  # 1.5 -> 1.0
                     else:
                         lr_warmup_mult_backbone = 1.0
                     
@@ -1420,7 +1444,11 @@ def run_drone_simulation():
                             else:
                                 warmup_mult = 1.0
                             # Применяем к текущему LR (после scheduler)
-                            pg["lr"] = pg["lr"] * base_scale * warmup_mult
+                            # Проверка на разумность LR перед применением
+                            new_lr = pg["lr"] * base_scale * warmup_mult
+                            if torch.isfinite(torch.tensor([new_lr])) and 1e-8 < new_lr < 1.0:
+                                pg["lr"] = new_lr
+                            # Иначе оставляем LR от scheduler
             elif optimizer_phase2 is None:
                 scheduler.step()
 
