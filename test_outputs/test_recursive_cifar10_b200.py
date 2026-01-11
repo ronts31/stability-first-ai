@@ -3132,6 +3132,11 @@ def run_drone_simulation():
             data_real = data[:real_B]
             target_real = target[:real_B]
             
+            # КРИТИЧНО: Инициализируем features_f32 для элегантного режима (если еще не инициализирована)
+            # В стандартном режиме она будет инициализирована позже
+            if agent.use_elegant_mode and 'features_f32' not in locals():
+                features_f32 = None
+            
             # КРИТИЧНО: В элегантном режиме получаем features_f32 из data_real (если еще не получены)
             if agent.use_elegant_mode and features_f32 is None:
                 with torch.no_grad():
