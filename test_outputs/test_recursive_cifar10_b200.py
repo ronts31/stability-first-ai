@@ -506,7 +506,20 @@ class RecursiveAgent(nn.Module):
 
         self.active_classes_per_column[len(self.heads) - 1] = new_classes_indices
         self.sensor = ComplexitySensor()
-        print(f"[EMERGENCE] Head {len(self.heads)} created (shared backbone). Scope: {new_classes_indices}")
+        
+        # Проверка: убеждаемся что mid/late backbone trainable (для warmup)
+        if train_late_backbone:
+            mid_late_params = []
+            for name, p in self.shared_backbone.named_parameters():
+                g = self._layer_group(name)
+                if g in ["mid", "late"]:
+                    mid_late_params.append((name, p.requires_grad))
+            trainable_count = sum(1 for _, req in mid_late_params if req)
+            print(f"[EMERGENCE] Head {len(self.heads)} created (shared backbone). Scope: {new_classes_indices}")
+            print(f"[EMERGENCE] Mid/Late backbone trainable: {trainable_count}/{len(mid_late_params)} params")
+        else:
+            print(f"[EMERGENCE] Head {len(self.heads)} created (shared backbone). Scope: {new_classes_indices}")
+        
         print(f"[CRYSTALLIZATION] Automatic time crystallization enabled (crystal_level will adapt dynamically)")
         return new_head
 
