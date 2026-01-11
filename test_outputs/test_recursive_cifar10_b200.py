@@ -1917,14 +1917,36 @@ class RecursiveAgent(nn.Module):
                                     current_weakness_step = predicted_weakness_mean
                                     
                                     # КРИТИЧНО: Решаем, нужно ли смотреть еще ближе или переключиться на другой патч
-                                    # Если weakness все еще высокая, пробуем соседний патч для поиска более информативной области
+                                    # Если weakness все еще высокая, пробуем ВСЕ патчи и выбираем лучший для следующего шага
                                     if current_weakness_step > 0.3 and imagination_step < max_imagination_steps - 1:
-                                        # КРИТИЧНО: Пробуем соседние патчи для поиска более информативных областей
-                                        # Например, если начали с patch 0, пробуем patch 1 или 2
-                                        current_patch = action_chain[-1]
-                                        # Пробуем соседние патчи (циклически)
-                                        next_patch = (current_patch + 1) % 4  # следующий патч
-                                        action_chain.append(next_patch)
+                                        # КРИТИЧНО: Пробуем все 4 патча и выбираем лучший для следующего шага
+                                        # Это позволяет системе "исследовать" разные области (уши -> нос -> глаза)
+                                        best_next_patch = action_chain[-1]  # по умолчанию остаемся на том же
+                                        best_next_score = 0.0
+                                        
+                                        for candidate_patch in range(4):
+                                            # Быстрая оценка каждого патча
+                                            action_candidate = torch.full((B,), candidate_patch, device=device, dtype=torch.long)
+                                            image_candidate = self.attention_action.apply_action(current_image, action_candidate, class_hint)
+                                            
+                                            with torch.no_grad():
+                                                features_candidate = self.shared_backbone(image_candidate)
+                                                weakness_candidate = self.self_model.detect_weakness(features_candidate).mean().item()
+                                                confidence_candidate = self.self_model.estimate_confidence(features_candidate).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
+                                                
+                                                # Быстрая оценка (только weakness и confidence для скорости)
+                                                candidate_score = (current_weakness_step - weakness_candidate) + 0.5 * (confidence_candidate - current_confidence_step)
+                                                
+                                                if candidate_score > best_next_score:
+                                                    best_next_score = candidate_score
+                                                    best_next_patch = candidate_patch
+                                        
+                                        # Если лучший патч дает значительное улучшение, переключаемся
+                                        if best_next_score > min_improvement_per_step:
+                                            action_chain.append(best_next_patch)
+                                        else:
+                                            # Улучшение недостаточное, останавливаемся
+                                            break
                                     else:
                                         # Достаточно улучшения, останавливаемся
                                         break
