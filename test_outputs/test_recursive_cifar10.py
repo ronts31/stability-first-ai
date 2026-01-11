@@ -210,10 +210,15 @@ class RecursiveAgent(nn.Module):
 
     def freeze_past(self):
         print("[FREEZING] Memory (Crystallization)...")
-        # C) Замораживаем backbone и старые головы
-        self.shared_backbone.eval()
+        # C) Замораживаем веса backbone, но BN оставляем в train для обновления running stats
         for param in self.shared_backbone.parameters():
             param.requires_grad = False
+        
+        # BN в train: обновляет running_mean/var, но gamma/beta не обучаются (requires_grad False)
+        for m in self.shared_backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.train()
+        
         # Замораживаем все старые головы кроме последней
         for i in range(len(self.heads) - 1):
             for param in self.heads[i].parameters():
@@ -329,9 +334,10 @@ class RecursiveAgent(nn.Module):
         # 1. Создаем "Студента" - одну компактную сеть
         # Она должна быть такой же мощной, как сумма всех прошлых голов
         # C) Используем общий backbone, создаем только новую голову
-        student_head = ExpandableHead(self.hidden_size * 2, self.output_size).to(device)
+        # Фикс: hidden_size, а не hidden_size * 2 (backbone выдает 512, не 1024)
+        student_head = ExpandableHead(self.hidden_size, self.output_size).to(device)
         # Для обратной совместимости создаем полную колонку
-        student = TemporalColumn(0, self.hidden_size * 2, self.output_size).to(device)
+        student = TemporalColumn(0, self.hidden_size, self.output_size).to(device)
         optimizer = optim.Adam(student_head.parameters(), lr=0.001)
         
         # 2. Генерируем сны (Псевдо-данные)
@@ -416,10 +422,10 @@ class RecursiveAgent(nn.Module):
         entropy = -torch.sum(probs_known * torch.log(probs_known + 1e-9), dim=1)
         max_prob_known, _ = torch.max(probs_known, dim=1)
         
-        # E) Адаптивные пороги на основе распределения уверенности
-        # Если энтропия высокая И максимальная вероятность низкая -> "не знаю"
-        # Пороги: entropy > 2.0 (высокая неопределенность) И max_prob < 0.3 (низкая уверенность)
-        unknown_mask = (entropy > 2.0) & (max_prob_known < 0.3)
+        # E) Адаптивные пороги (смягченные для более практичного использования)
+        # Для 10 классов max entropy ~ ln(10)=2.302. Используем более мягкие пороги:
+        # max_prob < 0.2 (более чувствительно) ИЛИ entropy > 1.8 (высокая неопределенность)
+        unknown_mask = (max_prob_known < 0.2) | (entropy > 1.8)
         
         # E) Unknown logit относительный (устойчивее) + защита от пустого mask
         if unknown_mask.any():
