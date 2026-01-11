@@ -77,15 +77,66 @@ class ComplexitySensor:
 # AGI Components: World Model, Goals, Concepts, Autobiographical Memory, Self-Model
 # ----------------------------
 
+# ----------------------------
+# Action Space: Attention/Patch Selection Actions
+# ----------------------------
+class AttentionAction(nn.Module):
+    """
+    Действие как выбор attention/patch/view.
+    Для CIFAR: действие = выбор области изображения для фокуса (crop, zoom, rotate).
+    """
+    def __init__(self, num_patches=4, patch_size=16):
+        super().__init__()
+        self.num_patches = num_patches  # 2x2 grid = 4 patches
+        self.patch_size = patch_size
+    
+    def apply_action(self, x, action_idx):
+        """
+        Применяет действие к изображению: выбирает patch для фокуса.
+        
+        Args:
+            x: [B, 3, 32, 32] - исходное изображение
+            action_idx: [B] - индекс выбранного patch (0..3)
+        
+        Returns:
+            x_next: [B, 3, 32, 32] - изображение с применённым действием (crop+zoom выбранного patch)
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        
+        # Разбиваем на patches (2x2 grid)
+        patch_h, patch_w = H // 2, W // 2
+        
+        # Создаём маску для выбранного patch
+        x_next = x.clone()
+        for b in range(B):
+            idx = int(action_idx[b].item())
+            row = idx // 2
+            col = idx % 2
+            
+            # Извлекаем выбранный patch
+            patch = x[b:b+1, :, row*patch_h:(row+1)*patch_h, col*patch_w:(col+1)*patch_w]
+            
+            # Zoom: интерполируем patch обратно до полного размера
+            patch_zoomed = F.interpolate(patch, size=(H, W), mode='bilinear', align_corners=False)
+            
+            # Смешиваем: 70% zoomed patch + 30% оригинал (для плавности)
+            x_next[b] = 0.7 * patch_zoomed[0] + 0.3 * x[b]
+        
+        return x_next
+
+
 class WorldModel(nn.Module):
     """
     World Model: предсказывает будущие состояния и причинно-следственные связи.
     Использует latent space для предсказания следующего состояния на основе текущего состояния и действия.
+    
+    КРИТИЧНО: action теперь это реальное действие (attention/patch selection), а не class logits.
     """
-    def __init__(self, feature_dim=512, action_dim=10, hidden_dim=256, latent_dim=128):
+    def __init__(self, feature_dim=512, action_dim=4, hidden_dim=256, latent_dim=128):
         super().__init__()
         self.feature_dim = feature_dim
-        self.action_dim = action_dim
+        self.action_dim = action_dim  # 4 patches для CIFAR
         self.latent_dim = latent_dim
         
         # Encoder: features -> latent
@@ -109,11 +160,11 @@ class WorldModel(nn.Module):
             nn.Linear(hidden_dim, feature_dim)
         )
         
-        # Causality predictor: предсказывает последствия действий
-        self.causality_head = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim // 2),
+        # Action predictor: предсказывает лучшее действие для достижения цели
+        self.action_predictor = nn.Sequential(
+            nn.Linear(latent_dim + feature_dim, hidden_dim // 2),  # latent + goal_features
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, action_dim)  # предсказывает "результат" действия
+            nn.Linear(hidden_dim // 2, action_dim)
         )
     
     def encode(self, features):
@@ -134,11 +185,11 @@ class WorldModel(nn.Module):
         
         Args:
             features: [B, feature_dim] - текущие features
-            action_onehot: [B, action_dim] - действие (one-hot или soft)
+            action_onehot: [B, action_dim] - действие (one-hot для выбора patch)
         
         Returns:
             next_features_pred: [B, feature_dim] - предсказанные features следующего состояния
-            causality_pred: [B, action_dim] - предсказанные последствия действия
+            z_mean, z_logvar, next_z_mean, next_z_logvar - для KL loss
         """
         # Encode current state
         z_mean, z_logvar = self.encode(features)
@@ -153,16 +204,37 @@ class WorldModel(nn.Module):
         # Decode to features
         next_features_pred = self.decoder(next_z)
         
-        # Predict causality (consequences)
-        causality_pred = self.causality_head(next_z)
+        return next_features_pred, z_mean, z_logvar, next_z_mean, next_z_logvar
+    
+    def predict_best_action(self, features, goal_features=None):
+        """
+        Предсказывает лучшее действие для достижения цели.
         
-        return next_features_pred, causality_pred, z_mean, z_logvar, next_z_mean, next_z_logvar
+        Args:
+            features: [B, feature_dim] - текущие features
+            goal_features: [B, feature_dim] - целевые features (опционально)
+        
+        Returns:
+            action_logits: [B, action_dim] - логиты действий
+        """
+        z_mean, z_logvar = self.encode(features)
+        z = self.reparameterize(z_mean, z_logvar)
+        
+        if goal_features is not None:
+            z_goal = torch.cat([z, goal_features], dim=-1)
+        else:
+            z_goal = z
+        
+        action_logits = self.action_predictor(z_goal)
+        return action_logits
 
 
 class InternalGoals(nn.Module):
     """
     Внутренние цели: система целей, независимая от внешних наград.
     Генерирует собственные цели на основе curiosity, novelty, и внутренней мотивации.
+    
+    КРИТИЧНО: Цели теперь влияют на policy через goal-conditioned control.
     """
     def __init__(self, feature_dim=512, goal_dim=64, hidden_dim=256):
         super().__init__()
@@ -181,6 +253,15 @@ class InternalGoals(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()  # [0..1] - насколько цель достигнута
+        )
+        
+        # Goal-conditioned policy: (features, goal) -> policy_modifier
+        # Влияет на recursion depth, replay ratio, gate temperature
+        self.goal_policy = nn.Sequential(
+            nn.Linear(feature_dim + goal_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 3),  # [recursion_boost, replay_boost, temperature_mod]
+            nn.Tanh()  # [-1..1] для модификации
         )
         
         # Curiosity signal: novelty detector
@@ -219,6 +300,18 @@ class InternalGoals(nn.Module):
         goal_feat = torch.cat([features, goal], dim=-1)
         achievement = self.goal_evaluator(goal_feat)
         return achievement
+    
+    def get_goal_policy_modifier(self, features, goal):
+        """
+        Получает модификатор policy на основе цели.
+        
+        Returns:
+            policy_mod: [B, 3] - [recursion_boost, replay_boost, temperature_mod]
+                где значения в [-1..1] для модификации базовых параметров
+        """
+        goal_feat = torch.cat([features, goal], dim=-1)
+        policy_mod = self.goal_policy(goal_feat)
+        return policy_mod
     
     def compute_novelty(self, features):
         """
@@ -274,6 +367,22 @@ class OwnConcepts(nn.Module):
         concept_activations = torch.sigmoid(self.concept_encoder(features))  # [B, num_concepts]
         concept_importance = self.importance_net(features)  # [B, num_concepts]
         return concept_activations, concept_importance
+    
+    def get_concept_based_routing(self, concept_activations, concept_importance):
+        """
+        Генерирует routing weights на основе концептов.
+        
+        Args:
+            concept_activations: [B, num_concepts]
+            concept_importance: [B, num_concepts]
+        
+        Returns:
+            routing_signal: [B] - сигнал для модификации routing/recursion
+        """
+        # Используем важность концептов как сигнал для routing
+        # Высокая важность = больше внимания нужно
+        routing_signal = concept_importance.sum(dim=-1)  # [B]
+        return routing_signal
     
     def reconstruct_from_concepts(self, concept_activations):
         """
@@ -369,6 +478,57 @@ class AutobiographicalMemory:
         similarities.sort(key=lambda x: x[0], reverse=True)
         return [mem for _, mem in similarities[:k]]
     
+    def get_recall_policy_modifier(self, similar_memories):
+        """
+        Генерирует модификатор policy на основе вспомненных эпизодов.
+        
+        Args:
+            similar_memories: list - список похожих эпизодов
+        
+        Returns:
+            policy_mod: dict - модификаторы для routing/recursion/replay
+                - routing_boost: float - изменение routing weights
+                - recursion_boost: float - изменение recursion depth
+                - replay_boost: float - изменение replay ratio
+        """
+        if len(similar_memories) == 0:
+            return {"routing_boost": 0.0, "recursion_boost": 0.0, "replay_boost": 0.0}
+        
+        # Анализируем исходы похожих эпизодов
+        # Если исходы были хорошие (низкий loss/surprise), увеличиваем уверенность
+        # Если исходы были плохие, увеличиваем осторожность (больше recursion/replay)
+        
+        good_outcomes = 0
+        total_outcomes = 0
+        
+        for mem in similar_memories[:5]:  # берём топ-5
+            if "outcome" in mem and isinstance(mem["outcome"], dict):
+                if "loss" in mem["outcome"]:
+                    loss = mem["outcome"]["loss"]
+                    if loss < 1.0:  # хороший исход
+                        good_outcomes += 1
+                    total_outcomes += 1
+        
+        if total_outcomes == 0:
+            return {"routing_boost": 0.0, "recursion_boost": 0.0, "replay_boost": 0.0}
+        
+        success_rate = good_outcomes / total_outcomes
+        
+        # Если успешные эпизоды - увеличиваем уверенность (меньше recursion)
+        # Если неуспешные - увеличиваем осторожность (больше recursion/replay)
+        if success_rate > 0.7:
+            recursion_boost = -0.2  # меньше recursion
+            replay_boost = -0.1  # меньше replay
+        else:
+            recursion_boost = 0.3  # больше recursion
+            replay_boost = 0.2  # больше replay
+        
+        return {
+            "routing_boost": 0.0,  # пока не используем
+            "recursion_boost": recursion_boost,
+            "replay_boost": replay_boost
+        }
+    
     def get_statistics(self):
         """Возвращает статистику по памяти"""
         return {
@@ -382,6 +542,8 @@ class SelfModel(nn.Module):
     """
     Явный self-model: модель самого себя и своих способностей.
     Отвечает на вопросы: "Что я умею?", "Насколько я уверен?", "Где мои слабые места?"
+    
+    КРИТИЧНО: Обучается на внутренних метриках (self-supervised) и влияет на управление.
     """
     def __init__(self, feature_dim=512, num_heads=5, hidden_dim=256):
         super().__init__()
@@ -416,6 +578,12 @@ class SelfModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 3)  # [capability, confidence, weakness]
         )
+        
+        # EMA для внутренних метрик (targets для обучения)
+        self.ema_capabilities = torch.zeros(num_heads)  # будет обновляться в training loop
+        self.ema_confidence = 0.0
+        self.ema_weakness = 0.0
+        self.ema_momentum = 0.99
     
     def predict_capabilities(self, features):
         """
@@ -454,6 +622,36 @@ class SelfModel(nn.Module):
         feat_cap = torch.cat([features, head_capabilities], dim=-1)
         assessment = self.self_awareness(feat_cap)
         return assessment
+    
+    def update_ema_targets(self, actual_capabilities, actual_confidence, actual_weakness):
+        """
+        Обновляет EMA targets для self-supervised обучения.
+        
+        Args:
+            actual_capabilities: [num_heads] - реальные способности (например, accuracy по head)
+            actual_confidence: float - реальная уверенность (калибровка)
+            actual_weakness: float - реальная слабость (surprise + pain + entropy)
+        """
+        self.ema_capabilities = (
+            self.ema_momentum * self.ema_capabilities + 
+            (1 - self.ema_momentum) * actual_capabilities
+        )
+        self.ema_confidence = (
+            self.ema_momentum * self.ema_confidence + 
+            (1 - self.ema_momentum) * actual_confidence
+        )
+        self.ema_weakness = (
+            self.ema_momentum * self.ema_weakness + 
+            (1 - self.ema_momentum) * actual_weakness
+        )
+    
+    def get_targets(self):
+        """Возвращает текущие targets для обучения"""
+        return {
+            "capabilities": self.ema_capabilities.clone(),
+            "confidence": self.ema_confidence,
+            "weakness": self.ema_weakness
+        }
 
 
 # ----------------------------
@@ -875,7 +1073,9 @@ class RecursiveAgent(nn.Module):
         # --- AGI COMPONENTS ---
         self.use_world_model = bool(use_world_model)
         if self.use_world_model:
-            self.world_model = WorldModel(feature_dim=self.hidden_size, action_dim=self.output_size)
+            # КРИТИЧНО: action_dim = 4 (patches), а не output_size (классы)
+            self.world_model = WorldModel(feature_dim=self.hidden_size, action_dim=4)
+            self.attention_action = AttentionAction(num_patches=4, patch_size=16)
         
         self.use_internal_goals = bool(use_internal_goals)
         if self.use_internal_goals:
@@ -1308,29 +1508,56 @@ class RecursiveAgent(nn.Module):
             return logits_sum, feats
         return logits_sum
     
-    def use_world_model_prediction(self, features, action_logits):
+    def select_action(self, features, goal_features=None):
         """
-        Использует World Model для предсказания следующего состояния.
+        Выбирает действие (attention/patch selection) на основе текущего состояния и цели.
         
         Args:
             features: [B, feature_dim] - текущие features
-            action_logits: [B, output_size] - логиты действий (предсказания)
+            goal_features: [B, feature_dim] - целевые features (опционально)
+        
+        Returns:
+            action_idx: [B] - индекс выбранного patch (0..3)
+            action_logits: [B, 4] - логиты действий
+        """
+        if not self.use_world_model:
+            # Fallback: случайный выбор
+            B = features.size(0)
+            return torch.randint(0, 4, (B,), device=features.device), None
+        
+        action_logits = self.world_model.predict_best_action(features, goal_features)
+        action_idx = torch.argmax(action_logits, dim=-1)  # [B]
+        return action_idx, action_logits
+    
+    def apply_action_to_image(self, x, action_idx):
+        """Применяет действие к изображению"""
+        if not self.use_world_model:
+            return x
+        return self.attention_action.apply_action(x, action_idx)
+    
+    def predict_next_state(self, features, action_idx):
+        """
+        Предсказывает следующее состояние на основе действия.
+        
+        Args:
+            features: [B, feature_dim] - текущие features
+            action_idx: [B] - индекс действия (0..3)
         
         Returns:
             next_features_pred: [B, feature_dim] - предсказанные features
-            causality_pred: [B, output_size] - предсказанные последствия
+            z_mean, z_logvar, next_z_mean, next_z_logvar - для KL loss
         """
         if not self.use_world_model:
-            return None, None
+            return None, None, None, None, None
         
-        # Конвертируем логиты в one-hot/soft action
-        action_probs = torch.softmax(action_logits, dim=-1)
+        # Конвертируем action_idx в one-hot
+        action_onehot = F.one_hot(action_idx, num_classes=4).float()  # [B, 4]
         
         # Предсказываем следующее состояние
-        next_features_pred, causality_pred, _, _, _, _ = self.world_model.predict_next(
-            features, action_probs
+        next_features_pred, z_mean, z_logvar, next_z_mean, next_z_logvar = self.world_model.predict_next(
+            features, action_onehot
         )
-        return next_features_pred, causality_pred
+        return next_features_pred, z_mean, z_logvar, next_z_mean, next_z_logvar
     
     def generate_internal_goal(self, features):
         """Генерирует внутреннюю цель на основе текущего состояния"""
