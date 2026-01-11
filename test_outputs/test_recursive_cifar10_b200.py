@@ -716,6 +716,66 @@ def pair_margin_loss(logits10, targets, pairs=((0, 8), (1, 9), (3, 5)), margin=0
     return loss
 
 
+def class_balanced_loss(logits, targets, num_classes=10, beta=0.9999):
+    """
+    Class-balanced loss для борьбы с доминированием одного класса (например, Frog).
+    Динамически уменьшает вес хорошо изученных классов.
+    
+    Args:
+        logits: [B, num_classes]
+        targets: [B]
+        num_classes: количество классов
+        beta: гиперпараметр балансировки (0.9999 = сильная балансировка)
+    
+    Returns:
+        weighted_loss: scalar
+    """
+    # Вычисляем эффективное число примеров для каждого класса в батче
+    class_counts = torch.zeros(num_classes, device=logits.device)
+    for c in range(num_classes):
+        class_counts[c] = (targets == c).sum().float()
+    
+    # Эффективное число: (1 - beta^n) / (1 - beta)
+    # Для малых классов вес больше
+    effective_num = (1.0 - beta) / (1.0 - beta ** (class_counts + 1e-6))
+    effective_num = effective_num / effective_num.sum() * num_classes  # нормализация
+    
+    # Веса для каждого класса в батче
+    class_weights = effective_num[targets]  # [B]
+    
+    # Стандартный cross-entropy с весами
+    ce_loss = F.cross_entropy(logits, targets, reduction='none')  # [B]
+    weighted_loss = (ce_loss * class_weights).mean()
+    
+    return weighted_loss
+
+
+def check_clip_diversity(agent, data_batch, target_classes, min_diversity=3, confidence_threshold=0.6):
+    """
+    Проверяет разнообразие CLIP ответов перед expansion.
+    Требует минимум min_diversity разных концептов с confidence > threshold.
+    
+    Returns:
+        (is_diverse, detected_classes, diversity_info)
+    """
+    if not agent.use_curiosity:
+        return True, set(), "CLIP not available"
+    
+    detected_classes = set()
+    sample_size = min(32, data_batch.size(0))  # проверяем первые N образцов
+    
+    for i in range(sample_size):
+        best_idx, best_label, conf = agent.curiosity.what_is_this(data_batch[i:i+1])
+        if best_idx is not None and conf > confidence_threshold:
+            if best_idx in target_classes:  # только целевые классы
+                detected_classes.add(best_idx)
+    
+    is_diverse = len(detected_classes) >= min_diversity
+    diversity_info = f"Detected {len(detected_classes)}/{min_diversity} diverse concepts: {sorted(detected_classes)}"
+    
+    return is_diverse, detected_classes, diversity_info
+
+
 @torch.no_grad()
 def eval_masked(agent, loader, allowed_classes, device, block_unknown=True):
     was_training = agent.training
@@ -876,8 +936,10 @@ def run_drone_simulation():
 
     expansion_count = 0
     last_expansion_step = -1000
+    clip_diversity_at_expansion = 0  # сохраняем разнообразие CLIP при expansion
     COOLDOWN_STEPS = 200
     CLIP_TRUST_THRESHOLD = 0.6
+    CLIP_MIN_DIVERSITY = 3  # минимум разных концептов для expansion
     MAX_LAYERS = 5
 
     SLEEP_TRIGGER_STEPS = 500
@@ -959,53 +1021,68 @@ def run_drone_simulation():
 
                 if agent.use_curiosity:
                     print("[CURIOSITY] Querying Oracle (CLIP)...")
+                    # CLIP Diversity Check: требуем минимум 3 разных концепта
+                    is_diverse, detected_classes, diversity_info = check_clip_diversity(
+                        agent, data, classes_B, 
+                        min_diversity=CLIP_MIN_DIVERSITY, 
+                        confidence_threshold=CLIP_TRUST_THRESHOLD
+                    )
+                    
+                    if not is_diverse:
+                        print(f"[DIVERSITY CHECK] FAILED: {diversity_info}")
+                        print(f"[DIVERSITY CHECK] Need at least {CLIP_MIN_DIVERSITY} diverse concepts. Skipping expansion.")
+                        continue
+                    
+                    print(f"[DIVERSITY CHECK] PASSED: {diversity_info}")
+                    
+                    # Берем первый уверенный ответ для логирования
                     best_idx, best_label, conf = agent.curiosity.what_is_this(data[0:1])
-                    if best_idx is not None:
-                        if conf > CLIP_TRUST_THRESHOLD:
-                            print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}'")
-                            print(f"[ADAPTATION] Triggering Phase Transition for concept: {best_label}...")
+                    if best_idx is not None and conf > CLIP_TRUST_THRESHOLD:
+                        print(f"[EUREKA] CLIP confident ({conf*100:.1f}%): '{best_label}' (one of {len(detected_classes)} detected)")
+                        print(f"[ADAPTATION] Triggering Phase Transition with diverse concepts: {sorted(detected_classes)}...")
 
-                            with torch.no_grad():
-                                agent.eval()
-                                mo = agent(data[0:1])
-                                agent.train()
-                                mp = torch.softmax(mo[:, :10], dim=1)
-                                model_conf, model_pred = mp.max(dim=1)
-                                model_entropy = float((-torch.sum(mp * torch.log(mp + 1e-9), dim=1)).item())
-                                print(f"[LOG] Model confidence: {float(model_conf.item()):.3f}, Entropy: {model_entropy:.3f}")
+                        with torch.no_grad():
+                            agent.eval()
+                            mo = agent(data[0:1])
+                            agent.train()
+                            mp = torch.softmax(mo[:, :10], dim=1)
+                            model_conf, model_pred = mp.max(dim=1)
+                            model_entropy = float((-torch.sum(mp * torch.log(mp + 1e-9), dim=1)).item())
+                            print(f"[LOG] Model confidence: {float(model_conf.item()):.3f}, Entropy: {model_entropy:.3f}")
 
-                                agent.record_conflict(
-                                    confidence_model=float(model_conf.item()),
-                                    entropy_model=model_entropy,
-                                    clip_class=best_idx,
-                                    clip_label=best_label,
-                                    clip_conf=conf,
-                                    image=data[0:1],
-                                    true_label=int(target[0].item()) if target.numel() > 0 else None,
-                                )
-
-                            new_head = agent.expand(
-                                new_classes_indices=classes_B,
-                                use_fractal_time=use_fractal_time,
-                                train_late_backbone=train_late_backbone,
+                            agent.record_conflict(
+                                confidence_model=float(model_conf.item()),
+                                entropy_model=model_entropy,
+                                clip_class=best_idx,
+                                clip_label=best_label,
+                                clip_conf=conf,
+                                image=data[0:1],
+                                true_label=int(target[0].item()) if target.numel() > 0 else None,
                             )
-                            agent.recalibrate_bn(loader_B, device, num_batches=20)
 
-                            optimizer_phase2 = build_phase2_optimizer(new_head)
-                            
-                            # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
-                            for pg in optimizer_phase2.param_groups:
-                                pg["lr_base"] = pg["lr"]
+                        new_head = agent.expand(
+                            new_classes_indices=classes_B,
+                            use_fractal_time=use_fractal_time,
+                            train_late_backbone=train_late_backbone,
+                        )
+                        agent.recalibrate_bn(loader_B, device, num_batches=20)
 
-                            steps_already_done = 0
-                            remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
-                            scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
+                        optimizer_phase2 = build_phase2_optimizer(new_head)
+                        
+                        # Сохраняем lr_base для каждого param group (для LR scaling кристаллом)
+                        for pg in optimizer_phase2.param_groups:
+                            pg["lr_base"] = pg["lr"]
 
-                            expansion_count += 1
-                            last_expansion_step = step
-                            # ref_backbone уже создан в agent.expand()
-                        else:
-                            print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
+                        steps_already_done = 0
+                        remaining_steps = max(total_steps_phase2 - steps_already_done, steps_per_epoch_B)
+                        scheduler_phase2 = CosineAnnealingLR(optimizer_phase2, T_max=remaining_steps, eta_min=1e-5)
+
+                        expansion_count += 1
+                        last_expansion_step = step
+                        clip_diversity_at_expansion = len(detected_classes)  # сохраняем разнообразие
+                        # ref_backbone уже создан в agent.expand()
+                    else:
+                        print(f"[IGNORE] CLIP unsure ({conf*100:.1f}% < {CLIP_TRUST_THRESHOLD*100:.0f}%). Skip expansion.")
             elif is_shock and not can_expand and (step % 50 == 0):
                 remaining = COOLDOWN_STEPS - (step - last_expansion_step)
                 print(f"[COOLDOWN] Shock detected but refractory period ({remaining} steps)")
@@ -1038,14 +1115,21 @@ def run_drone_simulation():
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 outputs, features = agent(data, return_features=True)
 
-                # base loss (new task)
-                loss_new = criterion_train(outputs[:, :10], target)
+                # Class-balanced loss для Phase2 (борьба с доминированием одного класса, например Frog)
+                if expansion_count > 0:
+                    # Используем class-balanced loss для лучшей балансировки классов
+                    loss_new = class_balanced_loss(outputs[:, :10], target, num_classes=10, beta=0.9999)
+                else:
+                    # Phase1 использует обычный loss
+                    loss_new = criterion_train(outputs[:, :10], target)
+                
                 # Усиленная pair margin loss для cat/dog в Phase2 (животные)
-                pm_catdog = pair_margin_loss(outputs[:, :10], target, pairs=((3, 5),), margin=0.20)
-                loss_new = loss_new + 0.12 * pm_catdog
-                # Остальные пары (plane/ship, car/truck) слабее
-                pm_other = pair_margin_loss(outputs[:, :10], target, pairs=((0, 8), (1, 9)), margin=0.15)
-                loss_new = loss_new + 0.05 * pm_other
+                if expansion_count > 0:
+                    pm_catdog = pair_margin_loss(outputs[:, :10], target, pairs=((3, 5),), margin=0.20)
+                    loss_new = loss_new + 0.12 * pm_catdog
+                    # Остальные пары (plane/ship, car/truck) слабее
+                    pm_other = pair_margin_loss(outputs[:, :10], target, pairs=((0, 8), (1, 9)), margin=0.15)
+                    loss_new = loss_new + 0.05 * pm_other
 
                 # replay loss
                 replay_loss = 0.0
@@ -1132,6 +1216,17 @@ def run_drone_simulation():
             if expansion_count > 0 and use_subjective_time and agent.ref_backbone is not None:
                 surp_val = float(surprise.item()) if surprise is not None else 0.0
                 agent.update_time_crystallization(surp_val, pain_value, ent_batch)
+                
+                # Корректировка crystal_level на основе разнообразия CLIP
+                # Если CLIP видит мало разных концептов, кристаллизация должна быть мягче
+                if clip_diversity_at_expansion > 0:
+                    # Нормализуем разнообразие: 3 концепта = 1.0, больше = бонус
+                    diversity_factor = min(1.0, clip_diversity_at_expansion / CLIP_MIN_DIVERSITY)
+                    # Если разнообразие низкое, снижаем crystal_level
+                    if diversity_factor < 1.0:
+                        agent.crystal_level = agent.crystal_level * (0.5 + 0.5 * diversity_factor)
+                        agent.crystal_level = float(max(0.0, min(1.0, agent.crystal_level)))
+                
                 agent.auto_hard_freeze_if_needed()
                 
                 # Warmup: эмоциональный разогрев после expansion
