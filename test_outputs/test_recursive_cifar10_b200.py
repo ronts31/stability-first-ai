@@ -256,14 +256,14 @@ class ComplexityController:
         
         # Complexity Budget (закон сохранения сложности)
         self.complexity_budget = 1.0  # [0..1]
-        self.budget_recovery_rate = 0.002  # восстановление за шаг
+        self.budget_recovery_rate = 0.01  # восстановление за шаг (увеличено для баланса)
         self.budget_decay_rate = 0.998  # медленное затухание
         
-        # Стоимости действий
-        self.cost_recursion = 0.05  # за один рекурсивный проход
-        self.cost_replay = 0.01  # за единицу replay_ratio
-        self.cost_kl = 0.02  # за KL distillation
-        self.cost_expansion = 0.30  # за expansion
+        # Стоимости действий (уменьшены для баланса с recovery_rate)
+        self.cost_recursion = 0.02  # за один рекурсивный проход (было 0.05)
+        self.cost_replay = 0.005  # за единицу replay_ratio (было 0.01)
+        self.cost_kl = 0.01  # за KL distillation (было 0.02)
+        self.cost_expansion = 0.30  # за expansion (оставляем высоким, т.к. это редкое событие)
         
         # История для стабилизации
         self.complexity_history = []
