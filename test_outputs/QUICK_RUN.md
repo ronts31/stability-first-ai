@@ -6,11 +6,13 @@
 cd /workspace && git clone https://github.com/vitali-sialedchyk/stability-first-ai.git 2>/dev/null || (cd stability-first-ai && git pull) && cd stability-first-ai/test_outputs && pip install -q git+https://github.com/openai/CLIP.git matplotlib numpy pillow torch torchvision && python test_recursive_cifar10_b200.py
 ```
 
-## Одна команда для запуска (стандартная версия):
+## Одна команда для запуска (стандартная версия, БЕЗ Complexity Controller):
 
 ```bash
 cd /workspace && git clone https://github.com/vitali-sialedchyk/stability-first-ai.git 2>/dev/null || (cd stability-first-ai && git pull) && cd stability-first-ai/test_outputs && pip install -q git+https://github.com/openai/CLIP.git matplotlib numpy pillow torch torchvision && python test_recursive_cifar10.py
 ```
+
+**⚠️ ВАЖНО:** Для использования Complexity Controller (управление временем и рекурсией) используйте `test_recursive_cifar10_b200.py`!
 
 ## Или по шагам:
 
@@ -31,6 +33,12 @@ python test_recursive_cifar10.py
 
 ## Что интегрировано (максимальная интеграция всех механизмов):
 
+### В `test_recursive_cifar10_b200.py` (РЕКОМЕНДУЕТСЯ):
+- ✅ **Complexity Controller** - единый метаконтроллер для управления временем и рекурсией
+- ✅ **Внутренняя рекурсия** - динамический compute loop (Pass0..PassN)
+- ✅ **Complexity Budget Accounting** - закон сохранения сложности
+- ✅ **Gate Temperature Control** - управление routing через сложность
+- ✅ **Memory Scheduler** - управление replay через сложность
 - ✅ **Subjective Time Critic** - автоматическая регуляция пластичности на основе Surprise
 - ✅ **Fractal Time** - разные уровни защиты для разных слоев backbone
 - ✅ **Adaptive Time/Pain** - динамический lambda на основе конфликта градиентов
@@ -42,6 +50,9 @@ python test_recursive_cifar10.py
 - ✅ **Аугментации данных** (RandomCrop, RandomHorizontalFlip)
 - ✅ **Батчевый CLIP teacher** (быстрее и эффективнее)
 - ✅ **Улучшенные промпты** ("a photo of..." вместо "a...")
+
+### В `test_recursive_cifar10.py` (старая версия):
+- ✅ Все вышеперечисленное, **КРОМЕ Complexity Controller**
 
 ## Ожидаемые результаты:
 
