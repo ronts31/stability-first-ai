@@ -1023,11 +1023,14 @@ class ComplexityController:
             # Проверяем историю: если после expansion weakness не падал, стратегия неэффективна
             recent_expansions = expansion_history.get("recent", [])
             if len(recent_expansions) > 0:
-                avg_weakness_after = sum(e.get("weakness_after", 1.0) for e in recent_expansions) / len(recent_expansions)
-                avg_weakness_before = sum(e.get("weakness_before", 1.0) for e in recent_expansions) / len(recent_expansions)
-                # Если weakness не снизился после expansion, стратегия неэффективна
-                if avg_weakness_after >= avg_weakness_before * 0.95:  # менее 5% улучшения
-                    expansion_effective = False
+                # КРИТИЧНО: фильтруем только записи с полными данными (weakness_after не None)
+                complete_expansions = [e for e in recent_expansions if e.get("weakness_after") is not None and e.get("weakness_before") is not None]
+                if len(complete_expansions) > 0:
+                    avg_weakness_after = sum(e.get("weakness_after", 1.0) for e in complete_expansions) / len(complete_expansions)
+                    avg_weakness_before = sum(e.get("weakness_before", 1.0) for e in complete_expansions) / len(complete_expansions)
+                    # Если weakness не снизился после expansion, стратегия неэффективна
+                    if avg_weakness_after >= avg_weakness_before * 0.95:  # менее 5% улучшения
+                        expansion_effective = False
         
         # КРИТИЧНО: если expansion неэффективен, увеличиваем рекурсию вместо expansion
         if not expansion_effective and weakness_signal is not None and weakness_signal > 0.5:
