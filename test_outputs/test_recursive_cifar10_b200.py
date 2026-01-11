@@ -1466,6 +1466,10 @@ class RecursiveAgent(nn.Module):
             for p in self.memory_weights.parameters():
                 p.requires_grad = False
             self.ema_decay = 0.999  # медленное обновление памяти
+            # КРИТИЧНО: Заглушка для совместимости - в элегантном режиме expansion не нужен
+            self.heads = nn.ModuleList()  # пустой список для совместимости с кодом
+            self.shared_backbone = None  # не используется в элегантном режиме
+            self.columns = nn.ModuleList()  # не используется в элегантном режиме
         else:
             # Стандартный режим с модульностью
             self.shared_backbone = SharedBackbone()
@@ -1679,6 +1683,10 @@ class RecursiveAgent(nn.Module):
         Требует наличия self.ref_backbone (снимок).
         Нормализовано через mean() для сопоставимости между слоями.
         """
+        # В элегантном режиме используем elegant_stability_loss вместо этого
+        if self.use_elegant_mode:
+            return 0.0  # stability loss уже добавлен через elegant_stability_loss
+        
         if (not self.use_subjective_time) or (self.ref_backbone is None):
             return 0.0
 
@@ -1686,6 +1694,8 @@ class RecursiveAgent(nn.Module):
         cnt = 0
         # КРИТИЧНО: матчим параметры по имени, а не через zip (более надежно)
         ref_params = dict(self.ref_backbone.named_parameters())
+        if self.shared_backbone is None:
+            return 0.0
         for name, p in self.shared_backbone.named_parameters():
             if not p.requires_grad:
                 continue
@@ -1707,6 +1717,10 @@ class RecursiveAgent(nn.Module):
         Опционально: если crystal_level долго высокий — замораживаем ранние слои автоматически.
         Если упал — размораживаем.
         """
+        # В элегантном режиме заморозка не нужна (используется EMA)
+        if self.use_elegant_mode:
+            return
+        
         # lock/unlock ранних слоёв
         if self.crystal_level >= self.crystal_lock_threshold:
             self.crystal_lock_steps += 1
@@ -1715,6 +1729,8 @@ class RecursiveAgent(nn.Module):
 
         # LOCK
         if self.crystal_lock_steps >= self.crystal_lock_patience:
+            if self.shared_backbone is None:
+                return
             for name, p in self.shared_backbone.named_parameters():
                 if self._layer_group(name) == "early":
                     if p.requires_grad:  # только если еще не заморожен
@@ -1723,6 +1739,8 @@ class RecursiveAgent(nn.Module):
 
         # UNLOCK (если мир снова нестабилен)
         if self.crystal_level <= self.crystal_unlock_threshold and len(self.hard_frozen_layers) > 0:
+            if self.shared_backbone is None:
+                return
             for name, p in self.shared_backbone.named_parameters():
                 if name in self.hard_frozen_layers:
                     p.requires_grad = True
@@ -1797,7 +1815,10 @@ class RecursiveAgent(nn.Module):
                     break
                 # КРИТИЧНО: используем memory_format для консистентности с тренировкой
                 x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-                _ = self.shared_backbone(x)
+                if self.use_elegant_mode:
+                    _ = self.elegant_core(x, max_steps=1)  # в элегантном режиме используем elegant_core
+                elif self.shared_backbone is not None:
+                    _ = self.shared_backbone(x)
         self._set_bn_train(False)
         if was_training:
             self.train()
@@ -2280,7 +2301,10 @@ class RecursiveAgent(nn.Module):
                             
                             # Получаем features после Zoom
                             with torch.no_grad():
-                                features_after_zoom = self.shared_backbone(image_zoomed)
+                                if self.use_elegant_mode:
+                                    _, features_after_zoom, _ = self.elegant_core(image_zoomed, max_steps=1)
+                                else:
+                                    features_after_zoom = self.shared_backbone(image_zoomed)
                                 
                                 # Оцениваем улучшение
                                 predicted_weakness = self.self_model.detect_weakness(features_after_zoom)
@@ -2295,7 +2319,10 @@ class RecursiveAgent(nn.Module):
                                 # Entropy reduction и контрастивное воображение
                                 entropy_reduction_step = 0.0
                                 contrastive_score = 0.0  # КРИТИЧНО: разница между топ-2 классами
-                                if len(self.heads) > 0:
+                                if self.use_elegant_mode:
+                                    logits_after, _, _ = self.elegant_core(image_zoomed, max_steps=1)
+                                    logits_current_step, _, _ = self.elegant_core(current_image, max_steps=1)
+                                elif len(self.heads) > 0:
                                     logits_after, _ = self.heads[0](features_after_zoom, prev_hiddens=[])
                                     logits_current_step, _ = self.heads[0](current_features, prev_hiddens=[])
                                     if logits_after is not None and logits_current_step is not None and logits_after.size(1) >= 10:
@@ -2348,7 +2375,10 @@ class RecursiveAgent(nn.Module):
                                             image_candidate = self.attention_action.apply_action(current_image, action_candidate, class_hint)
                                             
                                             with torch.no_grad():
-                                                features_candidate = self.shared_backbone(image_candidate)
+                                                if self.use_elegant_mode:
+                                                    _, features_candidate, _ = self.elegant_core(image_candidate, max_steps=1)
+                                                else:
+                                                    features_candidate = self.shared_backbone(image_candidate)
                                                 weakness_candidate = self.self_model.detect_weakness(features_candidate).mean().item()
                                                 confidence_candidate = self.self_model.estimate_confidence(features_candidate).mean().item() if hasattr(self.self_model, 'estimate_confidence') else 0.0
                                                 
@@ -3157,7 +3187,8 @@ def run_drone_simulation():
             # КРИТИЧНО: формализованный контроллер expansion вместо эвристик
             is_shock = agent.sensor.is_shock(float(test_loss.item()))
             can_expand = (step - last_expansion_step) > COOLDOWN_STEPS
-            has_budget = len(agent.heads) < MAX_LAYERS
+            # В элегантном режиме expansion не нужен (единый рекурсивный блок)
+            has_budget = False if agent.use_elegant_mode else (len(agent.heads) < MAX_LAYERS)
             
             # КРИТИЧНО: growth_budget растёт без decay (простое накопление)
             agent.growth_budget = min(1.0, agent.growth_budget + 0.001)
@@ -3166,7 +3197,11 @@ def run_drone_simulation():
             # КРИТИЧНО: получаем features_f32 для AGI компонентов (нужно для expansion decision)
             # Делаем это раньше, чтобы использовать в блоке expansion
             features_f32 = None
-            if len(agent.heads) > 0:
+            if agent.use_elegant_mode:
+                # В элегантном режиме features получаем из elegant_core
+                with torch.no_grad():
+                    _, features_f32, _ = agent.elegant_core(x[:1], max_steps=1)  # пример для получения features
+            elif len(agent.heads) > 0 and agent.shared_backbone is not None:
                 # Получаем features из текущего батча для AGI компонентов
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
                     _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
@@ -3207,7 +3242,24 @@ def run_drone_simulation():
             # Используем приближение surprise из entropy_test для первого прохода
             complexity = 0.0
             actions = None
-            if len(agent.heads) > 0:
+            if agent.use_elegant_mode:
+                # В элегантном режиме используем reconstruction_error как surprise
+                with torch.no_grad():
+                    _, _, reconstruction_error = agent.elegant_core(x[:1], max_steps=3)
+                    surp_approx = min(2.0, reconstruction_error * 10.0)  # масштабируем reconstruction_error
+                complexity = agent.complexity_controller.compute_complexity(
+                    surprise=surp_approx,
+                    pain=pain_value,
+                    entropy=entropy_test,
+                    unknown_rate=unknown_rate_test
+                )
+                actions = agent.complexity_controller.get_actions(
+                    complexity=complexity,
+                    has_expansion_budget=False,  # в элегантном режиме expansion не нужен
+                    cooldown_ok=False,
+                    weakness_signal=None
+                )
+            elif len(agent.heads) > 0:
                 # Для первого прохода используем приближение: surprise ≈ 0.5 * entropy_test
                 surp_approx = 0.5 * entropy_test if entropy_test > 0 else 0.0
                 complexity = agent.complexity_controller.compute_complexity(
@@ -3240,7 +3292,7 @@ def run_drone_simulation():
                 fallback_expansion_attempted = True
                 print(f"\n[FALLBACK EXPANSION] {expansion_reason}")
                 print(f"[SAFETY] Budget OK ({len(agent.heads)}/{MAX_LAYERS} heads)")
-            elif len(agent.heads) > 0 and actions is not None and actions["expand_allowed"]:
+            elif not agent.use_elegant_mode and len(agent.heads) > 0 and actions is not None and actions["expand_allowed"]:
                 # КРИТИЧНО: Complexity Controller разрешает expansion (работает даже после sleep)
                 should_expand = True
                 expansion_reason = f"COMPLEXITY CONTROLLER (C={complexity:.3f} > 0.7, budget={agent.complexity_controller.complexity_budget:.3f})"
@@ -3351,7 +3403,8 @@ def run_drone_simulation():
                 
                 # КРИТИЧНО: Записываем weakness ДО expansion для мета-регуляции
                 weakness_before = None
-                if agent.use_self_model and len(agent.heads) > 0 and features_f32 is not None:
+                if agent.use_self_model and features_f32 is not None:
+                    if agent.use_elegant_mode or len(agent.heads) > 0:
                     weakness_pred = agent.self_model.detect_weakness(features_f32)
                     weakness_before = weakness_pred.mean().item() if weakness_pred.numel() > 0 else 0.0
                 
@@ -3420,7 +3473,10 @@ def run_drone_simulation():
                 
                 # Перезагружаем optimizer после консолидации
                 # После SLEEP остаётся только один head, создаём новый optimizer
-                if len(agent.heads) > 0:
+                if agent.use_elegant_mode:
+                    # В элегантном режиме создаем optimizer для elegant_core
+                    optimizer_phase2 = torch.optim.AdamW(agent.elegant_core.parameters(), lr=2e-3)
+                elif len(agent.heads) > 0:
                     # Используем существующую функцию build_phase2_optimizer
                     optimizer_phase2 = build_phase2_optimizer(agent.heads[0])  # После SLEEP только один head
                     for pg in optimizer_phase2.param_groups:
@@ -3465,7 +3521,11 @@ def run_drone_simulation():
             all_surprises = []
             
             # КРИТИЧНО: получаем features_f32 для AGI компонентов (если еще не получены)
-            if features_f32 is None and len(agent.heads) > 0:
+            if features_f32 is None:
+                if agent.use_elegant_mode:
+                    with torch.no_grad():
+                        _, features_f32, _ = agent.elegant_core(x[:1], max_steps=1)
+                elif len(agent.heads) > 0:
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
                     _, features_temp = agent(data_real[:min(64, real_B)], return_features=True)
                     if features_temp is not None:
@@ -3572,8 +3632,9 @@ def run_drone_simulation():
                 # КРИТИЧНО: Warm-up для Active Imagination - необученная WorldModel это генератор галлюцинаций
                 # Сначала "насмотренность" (обучение на данных), затем "аналитика" (активное воображение)
                 # Проверяем weakness или счетчик шагов перед использованием WorldModel для управления вниманием
+                # В элегантном режиме WorldModel не используется (единый рекурсивный блок)
                 world_model_ready = False
-                if agent.use_world_model and len(agent.heads) > 0:
+                if agent.use_world_model and not agent.use_elegant_mode and len(agent.heads) > 0:
                     # Проверка 1: Weakness threshold (WorldModel должна быть достаточно обучена)
                     if agent.use_self_model:
                         weakness_pred = agent.self_model.detect_weakness(features_f32)
