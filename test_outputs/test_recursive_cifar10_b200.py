@@ -2543,6 +2543,9 @@ def run_drone_simulation():
                         surprise = None
                 
                 # --- AGI COMPONENTS INTEGRATION ---
+                # КРИТИЧНО: конвертируем features в float32 для AGI компонентов (они не в autocast)
+                features_f32 = features[:real_B].float() if features.dtype == torch.bfloat16 else features[:real_B]
+                
                 # 1. World Model: предсказание следующего состояния и обучение
                 loss_world_model = torch.zeros((), device=device, dtype=torch.float32)
                 wm_error_signal = 0.0
@@ -2551,12 +2554,12 @@ def run_drone_simulation():
                     # Генерируем цель (если включены goals)
                     goal_features = None
                     if agent.use_internal_goals:
-                        goal = agent.generate_internal_goal(features[:real_B])
+                        goal = agent.generate_internal_goal(features_f32)
                         # Конвертируем goal в goal_features (используем goal как features для simplicity)
-                        goal_features = agent.internal_goals.goal_generator(features[:real_B])
+                        goal_features = agent.internal_goals.goal_generator(features_f32)
                     
                     # Выбираем действие
-                    action_idx, action_logits = agent.select_action(features[:real_B], goal_features)
+                    action_idx, action_logits = agent.select_action(features_f32, goal_features)
                     
                     # Применяем действие к изображению
                     x_next = agent.apply_action_to_image(data_real, action_idx)
@@ -2565,7 +2568,7 @@ def run_drone_simulation():
                     
                     # Предсказываем следующее состояние
                     next_features_pred, z_mean, z_logvar, next_z_mean, next_z_logvar = agent.predict_next_state(
-                        features[:real_B], action_idx
+                        features_f32, action_idx
                     )
                     
                     if next_features_pred is not None:
@@ -2580,8 +2583,8 @@ def run_drone_simulation():
                 
                 # 2. Goal-conditioned Policy: модифицируем actions на основе целей
                 if agent.use_internal_goals and actions is not None and len(agent.heads) > 0:
-                    goal = agent.generate_internal_goal(features[:real_B])
-                    policy_mod = agent.internal_goals.get_goal_policy_modifier(features[:real_B], goal)
+                    goal = agent.generate_internal_goal(features_f32)
+                    policy_mod = agent.internal_goals.get_goal_policy_modifier(features_f32, goal)
                     
                     # Модифицируем actions
                     policy_mod_mean = policy_mod.mean(dim=0)  # [3] - [recursion_boost, replay_boost, temperature_mod]
@@ -2591,7 +2594,8 @@ def run_drone_simulation():
                 
                 # 3. Memory → Decision: вспоминаем похожие эпизоды и модифицируем policy
                 if agent.use_autobiographical_memory and len(agent.heads) > 0 and complexity > 0.5:
-                    similar_memories = agent.recall_similar_experiences(features[0] if features.size(0) > 0 else features.mean(dim=0), k=5)
+                    query_feat = features_f32[0] if features_f32.size(0) > 0 else features_f32.mean(dim=0)
+                    similar_memories = agent.recall_similar_experiences(query_feat, k=5)
                     if similar_memories and actions is not None:
                         memory_mod = agent.autobiographical_memory.get_recall_policy_modifier(similar_memories)
                         actions["n_recursions"] = max(1, min(3, int(actions["n_recursions"] + memory_mod["recursion_boost"])))
@@ -2600,7 +2604,7 @@ def run_drone_simulation():
                 # 4. Concepts в управлении: модифицируем routing на основе концептов
                 loss_concept_recon = torch.zeros((), device=device, dtype=torch.float32)
                 if agent.use_own_concepts and len(agent.heads) > 0:
-                    concept_activations, concept_importance = agent.extract_own_concepts(features[:real_B])
+                    concept_activations, concept_importance = agent.extract_own_concepts(features_f32)
                     routing_signal = agent.own_concepts.get_concept_based_routing(concept_activations, concept_importance)
                     
                     # Модифицируем routing gate temperature на основе концептов
@@ -2610,13 +2614,14 @@ def run_drone_simulation():
                     
                     # Concept reconstruction loss
                     reconstructed = agent.own_concepts.reconstruct_from_concepts(concept_activations)
-                    loss_concept_recon = F.mse_loss(reconstructed, features[:real_B].detach())
+                    loss_concept_recon = F.mse_loss(reconstructed, features_f32.detach())
                 
                 # 5. Self-Model Supervision: обучаем на внутренних метриках
                 loss_self_model = torch.zeros((), device=device, dtype=torch.float32)
                 if agent.use_self_model and len(agent.heads) > 0:
                     # Вычисляем реальные метрики (упрощённо)
-                    capabilities_real = torch.ones(len(agent.heads), device=device) * 0.8  # placeholder
+                    # КРИТИЧНО: используем float32 для capabilities_real
+                    capabilities_real = torch.ones(len(agent.heads), device=device, dtype=torch.float32) * 0.8  # placeholder
                     confidence_real = max(0.0, min(1.0, 1.0 - float(loss_new.item()) / 2.0)) if 'loss_new' in locals() else 0.5
                     weakness_real = min(1.0, (float(surprise.item()) if surprise is not None else 0.0) + pain_value + entropy_test / 2.3)
                     
@@ -3028,9 +3033,11 @@ def run_drone_simulation():
                 )
                 
                 # Self-Model Loss
-                capabilities_pred = agent.self_model.predict_capabilities(features[:real_B])
-                confidence_pred = agent.self_model.estimate_confidence(features[:real_B])
-                weakness_pred = agent.self_model.detect_weakness(features[:real_B])
+                # КРИТИЧНО: конвертируем features в float32 для self_model
+                features_f32_self = features[:real_B].float() if features.dtype == torch.bfloat16 else features[:real_B]
+                capabilities_pred = agent.self_model.predict_capabilities(features_f32_self)
+                confidence_pred = agent.self_model.estimate_confidence(features_f32_self)
+                weakness_pred = agent.self_model.detect_weakness(features_f32_self)
                 
                 ema_targets = agent.self_model.get_targets()
                 loss_self_model = torch.zeros((), device=device, dtype=torch.float32)
@@ -3054,9 +3061,11 @@ def run_drone_simulation():
             
             # Записываем эпизод в автобиографическую память
             if agent.use_autobiographical_memory and len(agent.heads) > 0:
+                # КРИТИЧНО: используем float32 features для памяти
+                state_feat = features_f32[0] if features_f32.size(0) > 0 else features_f32.mean(dim=0)
                 agent.record_autobiographical_memory(
                     step=step,
-                    state_features=features[0] if features.size(0) > 0 else features.mean(dim=0),
+                    state_features=state_feat,
                     action=action_idx[0] if (agent.use_world_model and action_idx is not None and action_idx.size(0) > 0) else None,
                     outcome={"loss": float(loss_new.item()), "surprise": float(surprise.item()) if surprise is not None else 0.0},
                     reward_signal=max(0.0, min(1.0, 1.0 - float(loss_new.item()) / 2.0)),  # нормализованная награда
