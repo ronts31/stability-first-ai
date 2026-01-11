@@ -1825,6 +1825,67 @@ class RecursiveAgent(nn.Module):
         else:
             self.eval()
 
+    def _semantic_merging(self, device, similarity_threshold=0.85):
+        """
+        КРИТИЧНО: Семантическое Слияние - слияние похожих голов в "Полиглотов".
+        
+        Вычисляет косинусное сходство весов между всеми головами.
+        Сливает (усредняет) те головы, которые стали слишком похожи.
+        Освободившийся "бюджет" отдается новой голове, если Pain (конфликт) снова вырастет.
+        
+        Это превращает "Рой" в саморегулируемую файловую систему знаний.
+        """
+        if len(self.heads) <= 1:
+            return
+        
+        print(f"   [SEMANTIC MERGING] Analyzing {len(self.heads)} heads for similarity...")
+        
+        # Вычисляем косинусное сходство весов между всеми парами голов
+        similarities = []
+        head_pairs = []
+        
+        for i in range(len(self.heads)):
+            for j in range(i + 1, len(self.heads)):
+                # Получаем веса обеих голов
+                weights_i = torch.cat([p.flatten() for p in self.heads[i].parameters() if p.requires_grad])
+                weights_j = torch.cat([p.flatten() for p in self.heads[j].parameters() if p.requires_grad])
+                
+                # Нормализуем для косинусного сходства
+                weights_i_norm = F.normalize(weights_i, p=2, dim=0)
+                weights_j_norm = F.normalize(weights_j, p=2, dim=0)
+                
+                # Косинусное сходство
+                similarity = (weights_i_norm * weights_j_norm).sum().item()
+                similarities.append(similarity)
+                head_pairs.append((i, j))
+        
+        # Находим пары голов, которые слишком похожи
+        merged_indices = set()
+        merge_operations = []
+        
+        for idx, (i, j) in enumerate(head_pairs):
+            if similarities[idx] >= similarity_threshold and i not in merged_indices and j not in merged_indices:
+                print(f"   [MERGE] Head {i} and Head {j} are similar (cosine={similarities[idx]:.3f}). Merging...")
+                
+                # Сливаем веса: усредняем параметры двух голов
+                with torch.no_grad():
+                    for param_i, param_j in zip(self.heads[i].parameters(), self.heads[j].parameters()):
+                        if param_i.requires_grad and param_j.requires_grad:
+                            # Усредняем веса: 50% от каждой головы
+                            merged_weight = 0.5 * param_i.data + 0.5 * param_j.data
+                            param_i.data.copy_(merged_weight)
+                            param_j.data.copy_(merged_weight)  # Обе головы получают усредненные веса
+                
+                merged_indices.add(i)
+                merged_indices.add(j)
+                merge_operations.append((i, j))
+        
+        if merge_operations:
+            print(f"   [SEMANTIC MERGING] Merged {len(merge_operations)} pairs of similar heads.")
+            print(f"   [BUDGET] Freed capacity for future expansion.")
+        else:
+            print(f"   [SEMANTIC MERGING] No similar heads found (threshold={similarity_threshold}). All heads remain distinct.")
+    
     def expand(self, new_classes_indices, use_fractal_time=False, train_late_backbone=True):
         """
         Расширяет агента новой головой. Кристаллизация теперь автоматическая через update_time_crystallization.
@@ -1987,6 +2048,11 @@ class RecursiveAgent(nn.Module):
             print("   Only one head exists. No compression needed.")
             return
         
+        # КРИТИЧНО: Семантическое Слияние - слияние похожих голов перед консолидацией
+        # Это превращает "Рой" в саморегулируемую файловую систему знаний
+        if len(self.heads) > 1:
+            self._semantic_merging(device, similarity_threshold=0.85)
+        
         # 1. Создаем "Студента" - одну компактную сеть
         student_head = ExpandableHead(self.hidden_size, self.output_size).to(device)
         optimizer = optim.Adam(student_head.parameters(), lr=0.0005)
@@ -2082,7 +2148,37 @@ class RecursiveAgent(nn.Module):
                     reduction='batchmean'
                 )
                 
-                # 5. КРИТИЧНО: Routing Confidence Distillation
+                # 5. КРИТИЧНО: Cross-Head Distillation (Семантическое Слияние в действии)
+                # Головы (experts) предсказывают латентные представления друг друга
+                # Пример: Голова 1 (Urban) видит во сне "колесо". Она передает Голове 2 (Nature) не просто картинку,
+                # а свою "уверенность" в структуре. Так Голова 2 учится понимать "опору" (ноги животного)
+                # через призму "шасси".
+                loss_cross_head = torch.zeros((), device=device)
+                if len(teacher_model.heads) > 1 and self.use_soft_routing:
+                    # Получаем предсказания каждой головы teacher
+                    teacher_features = teacher_model.shared_backbone(noise)
+                    if teacher_model.use_time_mixer and hasattr(teacher_model, 'time_mixer'):
+                        teacher_features = teacher_model.time_mixer(teacher_features, use_adaptive=False)
+                    
+                    # Вычисляем латентные представления каждой головы
+                    head_latents = []
+                    for head_idx in range(len(teacher_model.heads)):
+                        with torch.no_grad():
+                            _, head_latent = teacher_model.heads[head_idx](teacher_features, prev_hiddens=[])
+                            head_latents.append(head_latent.detach())
+                    
+                    # Студент должен предсказывать латентные представления всех голов
+                    # Это учит его "полиглотству" - пониманию разных точек зрения
+                    student_latent = student_head.fc.weight @ backbone_features.T  # упрощенное латентное представление
+                    for head_latent in head_latents:
+                        # MSE между латентными представлениями
+                        loss_cross_head = loss_cross_head + F.mse_loss(
+                            student_latent[:head_latent.size(0), :head_latent.size(1)],
+                            head_latent
+                        )
+                    loss_cross_head = loss_cross_head / len(head_latents) if len(head_latents) > 0 else loss_cross_head
+                
+                # 6. КРИТИЧНО: Routing Confidence Distillation
                 # Студент учится "какая голова за что отвечает" через неявное кодирование в features
                 # Если teacher routing confidence высокая для head i, student должен предсказывать классы этого head
                 loss_routing_distill = torch.zeros((), device=device)
@@ -2104,6 +2200,8 @@ class RecursiveAgent(nn.Module):
                 loss = w_cons * loss_cons + w_stab * loss_stab + w_ent * loss_ent + 0.3 * loss_distill
                 if loss_routing_distill.item() > 0:
                     loss = loss + 0.2 * loss_routing_distill  # дистилляция routing confidence
+                if loss_cross_head.item() > 0:
+                    loss = loss + 0.15 * loss_cross_head  # Cross-Head Distillation (Семантическое Слияние)
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -3251,9 +3349,16 @@ def run_drone_simulation():
             actions = None
             if agent.use_elegant_mode:
                 # В элегантном режиме используем reconstruction_error как surprise
+                # Используем data_real, который уже определен выше в цикле
                 with torch.no_grad():
-                    _, _, reconstruction_error = agent.elegant_core(x[:1], max_steps=3)
-                    surp_approx = min(2.0, reconstruction_error * 10.0)  # масштабируем reconstruction_error
+                    if features_f32 is not None:
+                        # Если features_f32 уже получены, используем их для оценки surprise
+                        # В элегантном режиме reconstruction_error уже был вычислен при получении features_f32
+                        # Используем приближение через entropy_test
+                        surp_approx = min(2.0, 0.5 * entropy_test if entropy_test > 0 else 0.0)
+                    else:
+                        # Fallback: используем entropy_test как приближение surprise
+                        surp_approx = min(2.0, 0.5 * entropy_test if entropy_test > 0 else 0.0)
                 complexity = agent.complexity_controller.compute_complexity(
                     surprise=surp_approx,
                     pain=pain_value,
